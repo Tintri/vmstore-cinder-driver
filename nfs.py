@@ -21,6 +21,7 @@ import sys
 import uuid
 
 from os_brick.remotefs import remotefs
+from os_brick import encryptors
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import strutils
@@ -29,6 +30,7 @@ import six
 
 from cinder import coordination
 from cinder import context
+from cinder import db
 from cinder import exception
 from cinder.i18n import _
 from cinder.image import image_utils
@@ -301,7 +303,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         encrypted = volume.encryption_key_id is not None
 
         if encrypted:
-            encryption = volume_utils.check_encryption_provider(
+            encryption = self.check_encryption_provider(
                 volume,
                 volume.obj_context)
 
@@ -325,6 +327,34 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         volume.admin_metadata['format'] = self.format
         with volume.obj_as_admin():
             volume.save()
+
+    def check_encryption_provider(
+        self,
+        volume: 'objects.Volume',
+        context: context.RequestContext,
+    ) -> dict:
+        """Check that this is a LUKS encryption provider.
+
+        :returns: encryption dict
+        """
+
+        encryption = db.volume_encryption_metadata_get(context, volume.id)
+
+        if 'provider' not in encryption:
+            message = _("Invalid encryption spec.")
+            raise exception.VolumeDriverException(message=message)
+
+        provider = encryption['provider']
+        if provider in encryptors.LEGACY_PROVIDER_CLASS_TO_FORMAT_MAP:
+            provider = encryptors.LEGACY_PROVIDER_CLASS_TO_FORMAT_MAP[provider]
+            encryption['provider'] = provider
+
+        if 'cipher' not in encryption or 'key_size' not in encryption:
+            msg = _('encryption spec must contain "cipher" and '
+                    '"key_size"')
+            raise exception.VolumeDriverException(message=msg)
+
+        return encryption
 
     def delete_volume(self, volume):
         """Deletes a logical volume."""
@@ -400,7 +430,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
-        # share = self._get_volume_share(volume)
         share = volume.provider_location
         if isinstance(share, six.text_type):
             share = share.encode('utf-8')
@@ -586,6 +615,41 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         self.vmstore.vms.create(payload)
         volume.provider_location = self._find_share(volume)
         return {'provider_location': volume.provider_location}
+
+    def extend_volume(self, volume, new_size):
+        """Extend an existing volume to the new size."""
+        if self._is_volume_attached(volume):
+            # NOTE(kaisers): no attached extensions until #1870367 is fixed
+            msg = (_("Cannot extend volume %s while it is attached.")
+                   % volume['id'])
+            raise exception.ExtendVolumeError(msg)
+
+        LOG.info('Extending volume %s.', volume.id)
+        extend_by = int(new_size) - volume.size
+        if not self._is_share_eligible(volume.provider_location,
+                                       extend_by):
+            raise exception.ExtendVolumeError(reason='Insufficient space to'
+                                              ' extend volume %s to %sG'
+                                              % (volume.id, new_size))
+        # Use the active image file because this volume might have snapshot(s).
+        active_file = self.get_active_image_from_info(volume)
+        active_file_path = os.path.join(self._local_volume_dir(volume),
+                                        active_file)
+        LOG.info('Resizing file to %sG...', new_size)
+        file_format = None
+        admin_metadata = objects.Volume.get_by_id(
+            context.get_admin_context(), volume.id).admin_metadata
+
+        if admin_metadata and 'format' in admin_metadata:
+            file_format = admin_metadata['format']
+        image_utils.resize_image(
+            self._get_vol_extension(active_file_path), new_size,
+            run_as_root=self._execute_as_root,
+            file_format=file_format)
+        if file_format == 'qcow2' and not self._is_file_size_equal(
+                active_file_path, new_size):
+            raise exception.ExtendVolumeError(
+                reason='Resizing image file failed.')
 
     def get_volume_stats(self, refresh=False) -> dict:
         """Get volume stats.
