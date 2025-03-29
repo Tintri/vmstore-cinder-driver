@@ -1,12 +1,12 @@
-Vmstore Openstack cinder driver (NFS).
+# VMstore Openstack cinder driver (NFS).
 
-# Prerequisites
+## Prerequisites
 Install NFS client
 ```bash
 apt install nfs-common
 ```
 
-# Installation
+## Installation
 Clone Vmstore driver for the desired version:
 ```
 git clone -b <branch> https://github.com/Tintri/vmstore-cinder-driver.git
@@ -17,6 +17,46 @@ Create vmstore folder and copy the files
 mkdir -p /usr/lib/python2.7/dist-packages/cinder/volume/drivers/vmstore
 cp -r vmstore-cinder-driver/* /usr/lib/python2.7/dist-packages/cinder/volume/drivers/vmstore/
 ```
+
+Configure `/etc/cinder/cinder.conf` to use the Vmstore cinder driver.
+Example configuration:
+```conf
+[DEFAULT]
+default_volume_type = vmstore
+enabled_backends = vmstore
+
+[vmstore]
+volume_driver = cinder.volume.drivers.vmstore.nfs.VmstoreNfsDriver
+nas_host = 172.30.230.137
+nas_share_path = /tintri/cinder
+nfs_mount_options = vers=3
+vmstore_user = admin
+vmstore_password = tintri99
+vmstore_rest_address = ttvm937.tintri.com
+volume_backend_name = vmstore
+vmstore_qcow2_volumes = False
+```
+
+
+#### List of configuration Parameters
+
+| Configuration Option         | Type    | Default Value        | Required | Description                                                           |
+|------------------------------|---------|----------------------|----------|-----------------------------------------------------------------------|
+| `vmstore_rest_address`       | String  | -                    | yes      | IP address or hostname for management communication with Vmstore REST API interface. |
+| `vmstore_rest_protocol`      | String  | `https`               | no       | Vmstore RESTful API interface protocol.                                |
+| `vmstore_rest_port`          | Integer | `443`                 | no       | Vmstore RESTful API interface port.                                   |
+| `nas_host`                    | String  | -                    | yes      | Vmstore data IP for volume mount, IO operations.                      |
+| `vmstore_user`                | String  | `2240`                | yes      | Username to connect to Vmstore REST API interface.                    |
+| `vmstore_password`            | String  | -                    | yes      | User password to connect to Vmstore RESTful API interface.             |
+| `vmstore_rest_connect_timeout`| Float   | `30`                  | no       | Specifies the time limit (in seconds) to establish connection to Vmstore REST API interface. |
+| `vmstore_rest_read_timeout`   | Float   | `300`                 | no       | Specifies the time limit (in seconds) for Vmstore REST API interface to send a response. |
+| `vmstore_rest_backoff_factor` | Float   | `1`                   | no       | Specifies the backoff factor to apply between connection attempts to Vmstore REST API interface. |
+| `vmstore_rest_retry_count`    | Int     | `5`                   | no       | Specifies the number of times to repeat Vmstore REST API calls in case of connection errors or retriable errors. |
+| `vmstore_qcow2_volumes`       | Boolean | `False`               | no       | Use qcow2 volumes.                                                    |
+| `vmstore_mount_point_base`    | String  | `$state_path/mnt`     | no       | Base directory containing NFS share mount points.                      |
+| `vmstore_sparsed_volumes`     | Boolean | `True`                | no       | Defines whether the volumes need to be thin-provisioned.               |
+| `vmstore_dataset_description` | String  | -                    | no       | Human-readable description for the backend.                            |
+
 
 Restart Openstack Cinder service
 ```bash
