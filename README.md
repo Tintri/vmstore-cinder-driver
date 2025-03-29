@@ -58,7 +58,7 @@ vmstore_qcow2_volumes = False
 | `vmstore_dataset_description` | String  | -                    | no       | Human-readable description for the backend.                            |
 
 
-Restart Openstack Cinder service
+#### Restart Openstack Cinder service
 ```bash
 sudo systemctl restart openstack-cinder-volume.service
 ```
