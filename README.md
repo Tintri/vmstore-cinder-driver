@@ -31,7 +31,7 @@ nas_host = 172.30.230.137
 nas_share_path = /tintri/cinder
 nfs_mount_options = vers=3
 vmstore_user = admin
-vmstore_password = tintri99
+vmstore_password = secret
 vmstore_rest_address = ttvm937.tintri.com
 volume_backend_name = vmstore
 vmstore_qcow2_volumes = False
