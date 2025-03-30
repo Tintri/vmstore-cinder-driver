@@ -14,9 +14,10 @@ git clone -b <branch> https://github.com/Tintri/vmstore-cinder-driver.git
 
 Create vmstore folder and copy the files
 ```bash
-mkdir -p /usr/lib/python2.7/dist-packages/cinder/volume/drivers/vmstore
-cp -r vmstore-cinder-driver/* /usr/lib/python2.7/dist-packages/cinder/volume/drivers/vmstore/
+mkdir -p /usr/lib/python3/dist-packages/cinder/volume/drivers/vmstore
+cp -r vmstore-cinder-driver/* /usr/lib/python3/dist-packages/cinder/volume/drivers/vmstore/
 ```
+Note: the exact cinder location might differ depending on your installation.
 
 Configure `/etc/cinder/cinder.conf` to use the Vmstore cinder driver.
 Example configuration:
