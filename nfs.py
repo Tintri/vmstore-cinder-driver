@@ -17,7 +17,9 @@ import ipaddress
 import os
 import posixpath
 import re
+import six
 import sys
+import time
 import uuid
 
 from os_brick.remotefs import remotefs
@@ -26,7 +28,6 @@ from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import strutils
 from oslo_utils import units
-import six
 
 from cinder import coordination
 from cinder import context
@@ -40,12 +41,12 @@ from cinder.privsep import fs
 from cinder import utils as cinder_utils
 from cinder.volume.drivers.vmstore import api
 from cinder.volume.drivers.vmstore import options
+from cinder.volume.drivers.vmstore import utils
 from cinder.volume.drivers import nfs
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
 
 LOG = logging.getLogger(__name__)
-clones_dir = "cinder-clones"
 
 
 @interface.volumedriver
@@ -269,6 +270,18 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                           {'attempt': attempt, 'exc': e})
                 time.sleep(1)
 
+    def refresh_hypervisor(self, volume_path=None):
+        try:
+            hostname = utils.get_keystone_hostname()
+            payload = {
+                'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.OpenStackHostRefreshSpec',
+                'hostname': hostname,
+                'volumeFilePath': volume_path,
+            }
+            self.vmstore.cinder_refresh.create(payload)
+        except Exception as e:
+            LOG.warning("Failed to refresh hypervisor, error: %s", e)
+
     def create_volume(self, volume: objects.Volume) -> dict:
         """Creates a volume.
 
@@ -288,7 +301,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.info('casted to %s', volume.provider_location)
 
         self._do_create_volume(volume)
-        self.vmstore.hypervisor_config.refresh()
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        volume_path = os.path.join(vmstore_subdir, volume['name'])
+        self.refresh_hypervisor(volume_path)
         return {'provider_location': volume.provider_location}
 
     def _do_create_volume(self, volume: objects.Volume) -> None:
@@ -296,8 +311,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
-        volume_path = self._get_vol_extension(
-            self.local_path(volume))
+        volume_path = self.local_path(volume)
         volume_size = volume.size
 
         encrypted = volume.encryption_key_id is not None
@@ -377,9 +391,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         else:
             base_volume_path = self._local_path_volume(volume)
 
-        volume_path = self._get_vol_extension(base_volume_path)
+        volume_path = base_volume_path
         self._delete(volume_path)
-        self.vmstore.hypervisor_config.refresh()
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        vmstore_volume_path = os.path.join(vmstore_subdir, volume['name'])
+        self.refresh_hypervisor(vmstore_volume_path)
 
     def _get_share_path(self):
         nas_host = self.configuration.nas_host
@@ -397,12 +413,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """
         LOG.debug('Initialize volume connection for %(volume)s',
                   {'volume': volume['name']})
-        volume_name = self._get_vol_extension(volume['name'])
+        volume_name = volume['name']
         volume_dir = self._local_volume_dir(volume)
         path_to_vol = os.path.join(volume_dir, volume_name)
         info = self._qemu_img_info(path_to_vol, volume_name)
 
-        # Test file for raw vs. qcow2 format
         if info.file_format not in ['raw', 'qcow2']:
             msg = _('nfs volume must be a valid raw or qcow2 image.')
             raise exception.InvalidVolume(reason=msg)
@@ -439,36 +454,40 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def _check_snapshot_support(self, setup_checking=False):
         return True
 
-    def _get_vol_extension(self, volume_name) -> str:
-        return "%s.img" % volume_name
-
     @coordination.synchronized('{self.vmstore.lock}')
     def create_snapshot(self, snapshot):
         """Creates a snapshot.
 
         :param snapshot: snapshot reference
         """
-        volume_name = self._get_vol_extension(snapshot['volume_name'])
-        vms = self.vmstore.vms.list()
-        uuid = ''
-        for vm in vms:
-            if volume_name == vm['vmware']['name']:
-                uuid = vm['uuid']['uuid']
-            if uuid:
-                break
-        if not uuid:
-            raise api.VmstoreException(
-                code='NotFound', message='Did not find vm %s' % volume_name)
+        volume_name = snapshot['volume_name']
+        vd = self.vmstore.virtual_disk.get(snapshot['volume_id'])
+        timeout = 60
+        current = 1
+        while len(vd) < 1:
+            if current < timeout:
+                LOG.info('VirtualDisk for %s not found, sleeping %d',
+                    snapshot['volume_id'], current)
+                time.sleep(current)
+                current += 2
+                vd = self.vmstore.virtual_disk.get(snapshot['volume_id'])
+            else:
+                raise api.VmstoreException(
+                    code='NotFound',
+                    message=('Could not find VirtualDisk for %s' %
+                        snapshot['volume_name']))
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
         payload = {
-            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.snapshot.SnapshotSpec',
-            'snapshotName': snapshot['name'],
-            'consistency': 'CRASH_CONSISTENT',
-            'sourceVmTintriUUID': uuid,
-            'replicaRetentionMinutes': 0,
-            'retentionMinutes': 0,
+            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderSnapshotSpec',
+            'file': os.path.join(vmstore_subdir, volume_name),
+            'vmName': vd[0]['vmName'],
+            'description': snapshot['name'],
+            'vmTintriUuid': vd[0]['vmUuid']['uuid'],
+            'instanceId': vd[0]['instanceUuid'],
+            'snapshotCreator': 'Vmstore cinder driver',
+            'deletionPolicy': 'DELETE_ON_EXPIRATION'
         }
         self.vmstore.snapshots.create(payload)
-        self.vmstore.hypervisor_config.refresh()
 
     @coordination.synchronized('{self.vmstore.lock}')
     def delete_snapshot(self, snapshot):
@@ -484,6 +503,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         if not uuid:
             LOG.info('Did not find snapshot %s,'
                      'this is ok for deletion.' % snapshot['name'])
+            return
         try:
             self.vmstore.snapshots.delete(uuid)
         except api.VmstoreException as e:
@@ -491,7 +511,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 LOG.warning(e)
             else:
                 raise
-        self.vmstore.hypervisor_config.refresh()
 
     @coordination.synchronized('{self.vmstore.lock}')
     def create_volume_from_snapshot(self, volume, snapshot):
@@ -505,38 +524,38 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         for vmstore_snapshot in snapshots:
             if snapshot['name'] == vmstore_snapshot['description']:
                 uuid = vmstore_snapshot['uuid']['uuid']
-        if not uuid:
-            msg = 'Did not find snapshot %s' % snapshot['name']
-            raise api.VmstoreException(code='NotFound', message=message)
-        tintri_subdir = self.nas_path.removeprefix('/tintri')
+        timeout = 30
+        current = 1
+        while not uuid:
+            if current < timeout:
+                snapshots = self.vmstore.snapshots.list()
+                for vmstore_snapshot in snapshots:
+                    if snapshot['name'] == vmstore_snapshot['description']:
+                        uuid = vmstore_snapshot['uuid']['uuid']
+            else:
+                msg = 'Did not find snapshot %s' % snapshot['name']
+                raise api.VmstoreException(code='NotFound', message=msg)
+        vmstore_subdir = self.nas_path.removeprefix('/tintri')
         clone_path = os.path.join(
-            tintri_subdir, clones_dir, volume['name'])
+            vmstore_subdir, snapshot['name'])
 
         payload = {
-            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.vm.VirtualMachineCloneSpec',
-            'snapshotId': uuid,
-            'simpleCloneVmName': clone_path,
-            'count': 1,
+            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderCloneSpec',
+            'tintriSnapshotUuid': uuid,
+            'destinationPaths': clone_path,
         }
-        self.vmstore.vms.create(payload)
-        self.vmstore.hypervisor_config.refresh()
+        self.vmstore.clones.create(payload)
         mount_dir = self._get_mount_point_for_share(self._get_share_path())
-        temp_clone_dir = os.path.join(mount_dir, clones_dir, volume['name'])
-        for root, dirs, files in os.walk(temp_clone_dir):
-            if root.removeprefix(clone_path) == tintri_subdir:
-                break
-
-        if not files:
-            raise api.VmstoreException(
-                code='NotFound',
-                message='Did not find clone file in %s' % root)
-
-        temp_clone_path = os.path.join(root, files[0])
+        temp_clone_dir =os.path.join(mount_dir, snapshot['name'])
+        temp_clone_path = os.path.join(temp_clone_dir, snapshot['volume_name'])
         clone_destination = os.path.join(
-            mount_dir, self._get_vol_extension(volume['name']))
+            mount_dir, volume['name'])
         os.rename(temp_clone_path, clone_destination)
+        os.rmdir(temp_clone_dir)
 
-        self.vmstore.hypervisor_config.refresh()
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        volume_path = os.path.join(vmstore_subdir, volume['name'])
+        self.refresh_hypervisor(volume_path)
         volume.provider_location = self._find_share(volume)
         return {'provider_location': volume.provider_location}
 
@@ -548,7 +567,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                              disable_sparse: bool = False) -> None:
         """Fetch the image from image_service and write it to the volume."""
 
-        volpath = self._get_vol_extension(self.local_path(volume))
+        volpath = self.local_path(volume)
         image_utils.fetch_to_raw(context,
                                  image_service,
                                  image_id,
@@ -576,7 +595,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                              image_service,
                              image_meta: dict) -> None:
         """Copy the volume to the specified image."""
-        volpath = self._get_vol_extension(self.local_path(volume))
+        volpath = self.local_path(volume)
         volume_utils.upload_volume(context,
                                    image_service,
                                    image_meta,
@@ -587,39 +606,80 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     @coordination.synchronized('{self.vmstore.lock}')
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume.
+        Create a snapshot with DELETE_ON_ZERO_CLONE_REFERENCES.
+        Create a cloned volume from that snapshot.
+        When the cloned volume is deleted, snapshot will get deleted from
+        Vmstore automatically due to deletionPolicy
 
         :param volume: new volume reference
         :param src_vref: source volume reference
         """
-        source_name = self._get_vol_extension(src_vref['name'])
-        vms = self.vmstore.vms.list()
-        uuid = ''
-        for vm in vms:
-            if source_name == vm['vmware']['name']:
-                uuid = vm['uuid']['uuid']
-            if uuid:
-                break
-        if not uuid:
-            raise api.VmstoreException(
-                code='NotFound', message='Did not find vm %s' % source_name)
+        src_name = src_vref['name']
+        src_id = src_vref['id']
+        vd = self.vmstore.virtual_disk.get(src_id)
+        timeout = 30
+        current = 1
+        while len(vd) < 1:
+            if current < timeout:
+                LOG.info('VirtualDisk for %s not found, sleeping %d',
+                    src_id, current)
+                time.sleep(current)
+                current += 2
+                vd = self.vmstore.virtual_disk.get(src_id)
+            else:
+                raise api.VmstoreException(
+                    code='NotFound',
+                    message=('Could not find VirtualDisk for %s' %
+                        src_name))
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        clone_name = 'clone-%s' % src_name
         payload = {
-           'typeId' : 'com.tintri.api.rest.v310.dto.domain.beans.vm.VirtualMachineCloneSpec',
-           'vmId' : uuid,
-           'consistency' : 'CRASH_CONSISTENT',
-           'count' : 1,
-           'vmware': {
-              'typeId' : 'com.tintri.api.rest.v310.dto.domain.beans.vm.VirtualMachineCloneSpec$VMwareCloneInfo',
-              'cloneVmName' : volume['name'],
-           }
+            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderSnapshotSpec',
+            'file': os.path.join(vmstore_subdir, src_name),
+            'vmName': vd[0]['vmName'],
+            'description': clone_name,
+            'vmTintriUuid': vd[0]['vmUuid']['uuid'],
+            'instanceId': vd[0]['instanceUuid'],
+            'snapshotCreator': 'Vmstore cinder driver',
+            'deletionPolicy': 'DELETE_ON_ZERO_CLONE_REFERENCES'
         }
-        self.vmstore.vms.create(payload)
+        self.vmstore.snapshots.create(payload)
+
+        snapshots = self.vmstore.snapshots.list()
+        uuid = ''
+        for vmstore_snapshot in snapshots:
+            if clone_name == vmstore_snapshot['description']:
+                uuid = vmstore_snapshot['uuid']['uuid']
+        if not uuid:
+            msg = 'Did not find snapshot %s' % clone_name
+            raise api.VmstoreException(code='NotFound', message=msg)
+        vmstore_subdir = self.nas_path.removeprefix('/tintri')
+        clone_path = os.path.join(
+            vmstore_subdir, clone_name)
+
+        payload = {
+            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderCloneSpec',
+            'tintriSnapshotUuid': uuid,
+            'destinationPaths': clone_path,
+        }
+        self.vmstore.clones.create(payload)
+        mount_dir = self._get_mount_point_for_share(self._get_share_path())
+        temp_clone_dir =os.path.join(mount_dir, clone_name)
+        temp_clone_path = os.path.join(temp_clone_dir, src_name)
+        clone_destination = os.path.join(
+            mount_dir, volume['name'])
+        os.rename(temp_clone_path, clone_destination)
+        os.rmdir(temp_clone_dir)
+
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        volume_path = os.path.join(vmstore_subdir, volume['name'])
+        self.refresh_hypervisor(volume_path)
         volume.provider_location = self._find_share(volume)
         return {'provider_location': volume.provider_location}
 
     def extend_volume(self, volume, new_size):
         """Extend an existing volume to the new size."""
         if self._is_volume_attached(volume):
-            # NOTE(kaisers): no attached extensions until #1870367 is fixed
             msg = (_("Cannot extend volume %s while it is attached.")
                    % volume['id'])
             raise exception.ExtendVolumeError(msg)
@@ -643,7 +703,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         if admin_metadata and 'format' in admin_metadata:
             file_format = admin_metadata['format']
         image_utils.resize_image(
-            self._get_vol_extension(active_file_path), new_size,
+            active_file_path, new_size,
             run_as_root=self._execute_as_root,
             file_format=file_format)
         if file_format == 'qcow2' and not self._is_file_size_equal(

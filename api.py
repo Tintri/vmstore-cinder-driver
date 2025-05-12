@@ -25,6 +25,7 @@ import six
 
 from cinder import exception
 from cinder.i18n import _
+from cinder.volume.drivers.vmstore import nfs
 
 LOG = logging.getLogger(__name__)
 
@@ -341,11 +342,21 @@ class VmstoreCollections(object):
             else:
                 raise
 
-class VmstoreVms(VmstoreCollections):
+class VmstoreClones(VmstoreCollections):
     def __init__(self, proxy):
-        super(VmstoreVms, self).__init__(proxy)
-        self.root = 'vm'
-        self.subj = 'VM'
+        super(VmstoreClones, self).__init__(proxy)
+        self.root = 'cinder/clone'
+        self.subj = 'Clones'
+
+class VmstoreVirtualDisks(VmstoreCollections):
+    def __init__(self, proxy):
+        super(VmstoreVirtualDisks, self).__init__(proxy)
+        self.root = 'virtualDisk'
+        self.subj = 'VirtualDisk'
+
+    def get(self, uuid):
+        path = '%s?uuid=%s' % (self.root, uuid)
+        return self.proxy.get(path)
 
 class VmstoreSnapshots(VmstoreCollections):
     def __init__(self, proxy):
@@ -353,36 +364,45 @@ class VmstoreSnapshots(VmstoreCollections):
         self.root = 'snapshot'
         self.subj = 'VolumeSnapshot'
 
+    def create(self, payload=None):
+        LOG.debug('Create %(subj)s: %(payload)s',
+                  {'subj': self.subj, 'payload': payload})
+        path = posixpath.join('cinder', self.root)
+        try:
+            return self.proxy.post(path, payload)
+        except VmstoreException as error:
+            if error.code != 'RESOURCE_EXIST':
+                raise
+
+
 class VmstoreAppliance(VmstoreCollections):
     def __init__(self, proxy):
         super(VmstoreAppliance, self).__init__(proxy)
         self.root = 'appliance'
         self.subj = 'appliance'
 
-class VmstoreHypervisorConfig(VmstoreCollections):
+class VmstoreCinderRefresh(VmstoreCollections):
     def __init__(self, proxy):
-        super(VmstoreHypervisorConfig, self).__init__(proxy)
-        self.root = 'datastore/default/hypervisorManagerConfig'
-        self.subj = 'hypervisorManagerConfig'
-
-    def refresh(self, payload=None):
-        LOG.debug('Refresh %(subj)s: %(payload)s',
-                  {'subj': self.subj, 'payload': payload})
-        path = '%s/csi/refresh' % self.root
-        return self.proxy.post(path, payload)
+        super(VmstoreCinderRefresh, self).__init__(proxy)
+        self.root = 'cinder/host/refresh'
+        self.subj = 'cinderRefresh'
 
 class VmstoreProxy(object):
     def __init__(
             self, proto, backend, conf):
-        self.vms = VmstoreVms(self)
+        self.clones = VmstoreClones(self)
+        self.virtual_disk = VmstoreVirtualDisks(self)
         self.snapshots = VmstoreSnapshots(self)
         self.appliance = VmstoreAppliance(self)
-        self.hypervisor_config = VmstoreHypervisorConfig(self)
+        self.cinder_refresh = VmstoreCinderRefresh(self)
         self.version = None
         self.lock = None
+        client_version = (
+            'Tintri-Cinder-Driver-%s' % nfs.VmstoreNfsDriver.VERSION)
         self.headers = {
             'Content-Type': 'application/json',
-            'X-XSS-Protection': '1'
+            'X-XSS-Protection': '1',
+            'Tintri-Api-Client': client_version
         }
         self.scheme = conf.vmstore_rest_protocol
         self.host = conf.vmstore_rest_address

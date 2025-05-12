@@ -28,12 +28,12 @@ enabled_backends = vmstore
 
 [vmstore]
 volume_driver = cinder.volume.drivers.vmstore.nfs.VmstoreNfsDriver
-nas_host = 172.30.230.137
-nas_share_path = /tintri/cinder
+nas_host = <VMstoreDataIP>
+nas_share_path = <VMstoreSharePath>  # example: /tintri/cinder
 nfs_mount_options = vers=3
-vmstore_user = admin
-vmstore_password = secret
-vmstore_rest_address = ttvm937.tintri.com
+vmstore_user = <VMstore_UserName>
+vmstore_password = <VMstore_Password>
+vmstore_rest_address = <VMstoreAdminIP, or FQDN>
 volume_backend_name = vmstore
 vmstore_qcow2_volumes = False
 ```
