@@ -57,7 +57,16 @@ VMSTORE_CONNECTION_OPTS = [
                default=5,
                help='Specifies the number of times to repeat Vmstore '
                     'RESTful API calls in case of connection errors '
-                    'or Vmstore appliance retriable errors.')
+                    'or Vmstore appliance retriable errors.'),
+    cfg.StrOpt('vmstore_refresh_openstack_region',
+               required=True,
+               default='RegionOne',
+               help='Openstack region for Vmstore hypervisor refresh call.'),
+    cfg.IntOpt('vmstore_refresh_retry_count',
+               default=1,
+               help='Specifies the number of times to repeat Vmstore RESTful '
+                    'API call to cinder/host/refresh in case of connection '
+                    'errors or Vmstore appliance retriable errors.'),
 ]
 
 VMSTORE_NFS_OPTS = [

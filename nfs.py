@@ -58,9 +58,13 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     .. code-block:: none
 
         3.0-beta - Initial driver version.
+        3.0.2 - Added vmstore_refresh_openstack_region parameter for
+              hypervisor refresh API.
+              - Added vmstore_refresh_retry_count specific for hypervisor
+              refresh API.
     """
 
-    VERSION = '3.0-beta'
+    VERSION = '3.0.2'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -277,6 +281,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.OpenStackHostRefreshSpec',
                 'hostname': hostname,
                 'volumeFilePath': volume_path,
+                'region': self.configuration.vmstore_refresh_openstack_region,
             }
             self.vmstore.cinder_refresh.create(payload)
         except Exception as e:
