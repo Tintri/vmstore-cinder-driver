@@ -65,6 +65,7 @@ class VmstoreRequest(object):
         self.proxy = proxy
         self.method = method
         self.attempts = proxy.retries + 1
+        self.refresh_attempts = proxy.refresh_retries + 1
         self.payload = None
         self.error = None
         self.path = None
@@ -89,7 +90,10 @@ class VmstoreRequest(object):
         LOG.debug('Start request: %(info)s', {'info': info})
         self.path = path
         self.payload = payload
-        for attempt in range(self.attempts):
+        attempts = self.attempts
+        if path == 'cinder/host/refresh':
+            attempts = self.refresh_attempts
+        for attempt in range(attempts):
             if self.error:
                 self.delay(attempt)
                 if not self.proxy.update_host():
@@ -98,7 +102,7 @@ class VmstoreRequest(object):
                           'failed attempts, maximum retry attempts '
                           '%(attempts)s, reason: %(error)s',
                           {'info': info, 'attempt': attempt,
-                           'attempts': self.attempts,
+                           'attempts': attempts,
                            'error': self.error})
             self.data = []
             try:
@@ -147,7 +151,7 @@ class VmstoreRequest(object):
         LOG.error('Failed request %(info)s, '
                   'reached maximum retry attempts: '
                   '%(attempts)s, reason: %(error)s',
-                  {'info': info, 'attempts': self.attempts,
+                  {'info': info, 'attempts': attempts,
                    'error': self.error})
         raise self.error
 
@@ -411,6 +415,7 @@ class VmstoreProxy(object):
         self.password = conf.vmstore_password
         self.backend = backend
         self.retries = conf.vmstore_rest_retry_count
+        self.refresh_retries = conf.vmstore_refresh_retry_count
         self.backoff = conf.vmstore_rest_backoff_factor
         self.timeout = (conf.vmstore_rest_connect_timeout,
                         conf.vmstore_rest_read_timeout)

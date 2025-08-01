@@ -1,5 +1,10 @@
 # VMstore Openstack cinder driver (NFS).
 
+## Compatibility matrix
+|Vmstore version|CSI driver version|
+|--- |---|
+|>=6.0.0.1|>=3.0.2|
+
 ## Prerequisites
 Install NFS client
 ```bash
@@ -53,10 +58,12 @@ vmstore_qcow2_volumes = False
 | `vmstore_rest_read_timeout`   | Float   | `300`                 | no       | Specifies the time limit (in seconds) for Vmstore REST API interface to send a response. |
 | `vmstore_rest_backoff_factor` | Float   | `1`                   | no       | Specifies the backoff factor to apply between connection attempts to Vmstore REST API interface. |
 | `vmstore_rest_retry_count`    | Int     | `5`                   | no       | Specifies the number of times to repeat Vmstore REST API calls in case of connection errors or retriable errors. |
+| `vmstore_refresh_retry_count`  | Int     | `1`                   | no       | Specifies the number of times to repeat Vmstore RESTful API call to cinder/host/refresh in case of connection errors or Vmstore appliance retriable errors. |
 | `vmstore_qcow2_volumes`       | Boolean | `False`               | no       | Use qcow2 volumes.                                                    |
 | `vmstore_mount_point_base`    | String  | `$state_path/mnt`     | no       | Base directory containing NFS share mount points.                      |
 | `vmstore_sparsed_volumes`     | Boolean | `True`                | no       | Defines whether the volumes need to be thin-provisioned.               |
 | `vmstore_dataset_description` | String  | -                    | no       | Human-readable description for the backend.                            |
+| `vmstore_refresh_openstack_region` | String  | RegionOne       | yes       | Openstack region for Vmstore hypervisor refresh call.                            |
 
 
 #### Restart Openstack Cinder service
