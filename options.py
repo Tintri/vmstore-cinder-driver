@@ -1,20 +1,20 @@
 # Copyright 2025 DDN, Inc. All rights reserved.
 #
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
 #
-#         http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
+"""Configuration options for VMstore Cinder driver."""
 
 from oslo_config import cfg
-
-from cinder.volume import configuration as conf
 
 VMSTORE_CONNECTION_OPTS = [
     cfg.StrOpt('vmstore_rest_protocol',
@@ -59,9 +59,12 @@ VMSTORE_CONNECTION_OPTS = [
                     'RESTful API calls in case of connection errors '
                     'or Vmstore appliance retriable errors.'),
     cfg.StrOpt('vmstore_refresh_openstack_region',
-               required=True,
                default='RegionOne',
                help='Openstack region for Vmstore hypervisor refresh call.'),
+    cfg.StrOpt('vmstore_openstack_hostname',
+               help='OpenStack controller hostname or IP address. '
+                    'Used for VMstore hypervisor refresh operations. '
+                    'If not set, attempts to resolve from Keystone config.'),
     cfg.IntOpt('vmstore_refresh_retry_count',
                default=1,
                help='Specifies the number of times to repeat Vmstore RESTful '
@@ -81,15 +84,14 @@ VMSTORE_NFS_OPTS = [
 VMSTORE_DATASET_OPTS = [
     cfg.BoolOpt('vmstore_sparsed_volumes',
                 default=True,
-                help='Defines whether the volumes need to be thin-provisioned.'),
+                help='Defines whether the volumes need to be '
+                     'thin-provisioned.'),
     cfg.StrOpt('vmstore_dataset_description',
                default='',
                help='Human-readable description for the backend.')
 ]
+
 VMSTORE_NFS_OPTS += (
     VMSTORE_CONNECTION_OPTS +
     VMSTORE_DATASET_OPTS
 )
-
-CONF = cfg.CONF
-CONF.register_opts(VMSTORE_NFS_OPTS, group=conf.SHARED_CONF_GROUP)

@@ -1,27 +1,27 @@
 # Copyright 2025 DDN, Inc. All rights reserved.
 #
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
 #
-#         http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
+"""VMstore REST API client for Cinder driver."""
 
 import hashlib
 import json
 import posixpath
-import requests
-import six
+from urllib import parse as urlparse
 
 from eventlet import greenthread
 from oslo_log import log as logging
 import requests
-import six
 
 from cinder import exception
 from cinder.i18n import _
@@ -31,7 +31,10 @@ LOG = logging.getLogger(__name__)
 
 ASYNC_WAIT = 0.25
 
+
 class VmstoreException(exception.VolumeDriverException):
+    """Exception class for VMstore driver errors."""
+
     def __init__(self, data=None, **kwargs):
         defaults = {
             'typeId': 'VmstoreError',
@@ -48,7 +51,7 @@ class VmstoreException(exception.VolumeDriverException):
                     kwargs[key] = data[key]
                 else:
                     kwargs[key] = defaults[key]
-        elif isinstance(data, six.string_types):
+        elif isinstance(data, str):
             if 'causeDetails' not in kwargs:
                 kwargs['causeDetails'] = data
         for key in defaults:
@@ -59,6 +62,7 @@ class VmstoreException(exception.VolumeDriverException):
         self.code = kwargs['code']
         del kwargs['causeDetails']
         super(VmstoreException, self).__init__(message)
+
 
 class VmstoreRequest(object):
     def __init__(self, proxy, method):
@@ -112,7 +116,7 @@ class VmstoreRequest(object):
                     self.error = error
                 else:
                     code = 'RESOURCE_NOT_FOUND'
-                    message = six.text_type(error)
+                    message = str(error)
                     self.error = VmstoreException(message, code=code)
                 LOG.error('Failed request %(info)s: %(error)s',
                           {'info': info, 'error': self.error})
@@ -133,17 +137,18 @@ class VmstoreRequest(object):
             if response.content:
                 content = json.loads(response.content)
             if not response.ok:
-                if (content.get('message') and 
+                if (content.get('message') and
                         'does not exist' in content['message']):
                     code = 'RESOURCE_NOT_FOUND'
-                    message = six.text_type(content['message'])
-                    raise VmstoreException(message, code=code) 
+                    message = str(content['message'])
+                    raise VmstoreException(message, code=code)
                 LOG.error('Failed request %(info)s, '
                           'response content: %(content)s',
                           {'info': info, 'content': content})
                 self.error = VmstoreException(content)
                 continue
-            if response.status_code == requests.codes.created and 'items' in content:
+            is_created = response.status_code == requests.codes.created
+            if is_created and 'items' in content:
                 return content['items']
             if isinstance(content, dict) and 'items' in content:
                 return self.data
@@ -210,8 +215,8 @@ class VmstoreRequest(object):
             request.headers.update(self.proxy.session.headers)
             return self.proxy.session.send(request, **kwargs)
         elif response.status_code == requests.codes.not_found:
-            if response.request.method == 'DELETE' and (
-                'Failed to lookup' in content.get('causeDetails')):
+            if (response.request.method == 'DELETE' and
+                    'Failed to lookup' in content.get('causeDetails')):
                 message = content.get('causeDetails')
                 LOG.info('Did not find volume, ok for delete: %s', message)
                 response.status_code = 200
@@ -259,7 +264,8 @@ class VmstoreRequest(object):
         path = '/session/login'
         payload = {
             'username': self.proxy.username,
-            "typeId": "com.tintri.api.rest.vcommon.dto.rbac.RestApiCredentials",
+            "typeId": ("com.tintri.api.rest.vcommon.dto.rbac."
+                       "RestApiCredentials"),
             'password': self.proxy.password
         }
         self.proxy.delete_bearer()
@@ -284,8 +290,8 @@ class VmstoreRequest(object):
                             'href' in link and
                             'rel' in link and
                             link['rel'] == name):
-                        url = six.moves.urllib.parse.urlparse(link['href'])
-                        payload = six.moves.urllib.parse.parse_qs(url.query)
+                        url = urlparse.urlparse(link['href'])
+                        payload = urlparse.parse_qs(url.query)
                         return url.path, payload
         return None, None
 
@@ -300,7 +306,7 @@ class VmstoreCollections(object):
         self.properties = []
 
     def path(self, name):
-        quoted_name = six.moves.urllib.parse.quote_plus(name)
+        quoted_name = urlparse.quote_plus(name)
         return posixpath.join(self.root, quoted_name)
 
     def key(self, name):
@@ -340,17 +346,20 @@ class VmstoreCollections(object):
         path = self.path(payload)
         try:
             return self.proxy.delete(path, payload)
-        except Exception as error:
+        except VmstoreException as error:
             if error.code == 'RESOURCE_NOT_FOUND':
-                pass
-            else:
-                raise
+                LOG.debug('Resource not found during delete, treating as '
+                          'success: %(payload)s', {'payload': payload})
+                return
+            raise
+
 
 class VmstoreClones(VmstoreCollections):
     def __init__(self, proxy):
         super(VmstoreClones, self).__init__(proxy)
         self.root = 'cinder/clone'
         self.subj = 'Clones'
+
 
 class VmstoreVirtualDisks(VmstoreCollections):
     def __init__(self, proxy):
@@ -361,6 +370,7 @@ class VmstoreVirtualDisks(VmstoreCollections):
     def get(self, uuid):
         path = '%s?uuid=%s' % (self.root, uuid)
         return self.proxy.get(path)
+
 
 class VmstoreSnapshots(VmstoreCollections):
     def __init__(self, proxy):
@@ -385,11 +395,13 @@ class VmstoreAppliance(VmstoreCollections):
         self.root = 'appliance'
         self.subj = 'appliance'
 
+
 class VmstoreCinderRefresh(VmstoreCollections):
     def __init__(self, proxy):
         super(VmstoreCinderRefresh, self).__init__(proxy)
         self.root = 'cinder/host/refresh'
         self.subj = 'cinderRefresh'
+
 
 class VmstoreProxy(object):
     def __init__(
@@ -456,9 +468,8 @@ class VmstoreProxy(object):
             return False
 
         lock = '%s:%s' % (uuid, self.project)
-        if isinstance(lock, six.text_type):
-            lock = lock.encode('utf-8')
-        self.lock = hashlib.md5(lock).hexdigest()
+        lock = lock.encode('utf-8')
+        self.lock = hashlib.md5(lock, usedforsecurity=False).hexdigest()
         LOG.info('Coordination lock for group %(backend)s: %(lock)s',
                  {'backend': self.backend, 'lock': self.lock})
         return True
@@ -468,7 +479,7 @@ class VmstoreProxy(object):
             path = ''
         netloc = '%s:%d/api/v310' % (self.host, self.port)
         components = (self.scheme, netloc, path, None, None)
-        url = six.moves.urllib.parse.urlunsplit(components)
+        url = urlparse.urlunsplit(components)
         return url
 
     def delay(self, attempt, sync=True):

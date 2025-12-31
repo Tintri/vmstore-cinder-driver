@@ -1,49 +1,44 @@
 # Copyright 2025 DDN, Inc. All rights reserved.
 #
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
 #
-#         http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
+"""VMstore NFS Volume Driver for Cinder."""
 
 import hashlib
-import ipaddress
 import os
-import posixpath
 import re
-import six
-import sys
 import time
-import uuid
+from typing import List
 
-from os_brick.remotefs import remotefs
 from os_brick import encryptors
+from os_brick.remotefs import remotefs
 from oslo_concurrency import processutils
 from oslo_log import log as logging
-from oslo_utils import strutils
 from oslo_utils import units
 
-from cinder import coordination
 from cinder import context
+from cinder import coordination
 from cinder import db
 from cinder import exception
 from cinder.i18n import _
 from cinder.image import image_utils
 from cinder import interface
 from cinder import objects
-from cinder.privsep import fs
 from cinder import utils as cinder_utils
+from cinder.volume.drivers import nfs
 from cinder.volume.drivers.vmstore import api
 from cinder.volume.drivers.vmstore import options
 from cinder.volume.drivers.vmstore import utils
-from cinder.volume.drivers import nfs
-from cinder.volume import volume_types
 from cinder.volume import volume_utils
 
 LOG = logging.getLogger(__name__)
@@ -120,7 +115,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         self.nas_secure_file_permissions = (
             self.configuration.nas_secure_file_permissions.lower())
 
-
     @staticmethod
     def get_driver_options():
         return options.VMSTORE_NFS_OPTS
@@ -135,8 +129,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def _do_setup(self) -> bool:
         try:
             self.vmstore = api.VmstoreProxy(self.driver_volume_type,
-                                        self.backend_name,
-                                        self.configuration)
+                                            self.backend_name,
+                                            self.configuration)
         except api.VmstoreException as error:
             LOG.error('Failed to initialize RESTful API for backend '
                       '%(backend_name)s on host %(host)s: %(error)s',
@@ -212,10 +206,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             share_address = '%s:%s' % (nas_host, nas_share_path)
 
             if not re.match(self.SHARE_FORMAT_REGEX, share_address):
-                msg = (_('Share %s ignored due to invalid format. Must '
-                         'be of form address:/export. Please check the '
-                         'nas_host and nas_share_path settings.'),
-                       share_address)
+                msg = _('Share %(share)s ignored due to invalid format. '
+                        'Must be of form address:/export. Please check '
+                        'the nas_host and nas_share_path settings.'
+                        ) % {'share': share_address}
                 raise exception.InvalidConfigurationValue(msg)
 
             self.shares[share_address] = self.mount_options
@@ -276,9 +270,17 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     def refresh_hypervisor(self, volume_path=None):
         try:
-            hostname = utils.get_keystone_hostname()
+            hostname = self.configuration.safe_get(
+                'vmstore_openstack_hostname')
+            if not hostname:
+                hostname = utils.get_keystone_hostname()
+            if not hostname:
+                LOG.warning("No OpenStack hostname configured and "
+                            "auto-discovery failed. Skipping refresh.")
+                return
             payload = {
-                'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.OpenStackHostRefreshSpec',
+                'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                           'beans.cinder.OpenStackHostRefreshSpec'),
                 'hostname': hostname,
                 'volumeFilePath': volume_path,
                 'region': self.configuration.vmstore_refresh_openstack_region,
@@ -298,7 +300,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             message = _('Encryption is not yet supported.')
             raise exception.VolumeDriverException(message=message)
 
-        LOG.debug('Creating volume %(vol)s', {'vol': volume.id})
+        LOG.debug('Creating volume %(vol)s', {'vol': volume.name_id})
         self._ensure_shares_mounted()
 
         volume.provider_location = self._find_share(volume)
@@ -379,7 +381,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """Deletes a logical volume."""
 
         LOG.debug('Deleting volume %(vol)s, provider_location: %(loc)s',
-                  {'vol': volume.id, 'loc': volume.provider_location})
+                  {'vol': volume.name_id, 'loc': volume.provider_location})
 
         if not volume.provider_location:
             LOG.warning('Volume %s does not have provider_location '
@@ -398,9 +400,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         volume_path = base_volume_path
         self._delete(volume_path)
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
-        vmstore_volume_path = os.path.join(vmstore_subdir, volume['name'])
-        self.refresh_hypervisor(vmstore_volume_path)
 
     def _get_share_path(self):
         nas_host = self.configuration.nas_host
@@ -451,9 +450,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param volume: volume reference
         """
         share = volume.provider_location
-        if isinstance(share, six.text_type):
+        if isinstance(share, str):
             share = share.encode('utf-8')
-        path = hashlib.md5(share).hexdigest()
+        path = hashlib.md5(share, usedforsecurity=False).hexdigest()
         return os.path.join(self.mount_point_base, path)
 
     def _check_snapshot_support(self, setup_checking=False):
@@ -466,24 +465,28 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param snapshot: snapshot reference
         """
         volume_name = snapshot['volume_name']
-        vd = self.vmstore.virtual_disk.get(snapshot['volume_id'])
+        # Use volume.name_id for backend storage identification
+        # per Cinder guidelines
+        volume_name_id = snapshot.volume.name_id
+        vd = self.vmstore.virtual_disk.get(volume_name_id)
         timeout = 60
         current = 1
         while len(vd) < 1:
             if current < timeout:
                 LOG.info('VirtualDisk for %s not found, sleeping %d',
-                    snapshot['volume_id'], current)
+                         volume_name_id, current)
                 time.sleep(current)
                 current += 2
-                vd = self.vmstore.virtual_disk.get(snapshot['volume_id'])
+                vd = self.vmstore.virtual_disk.get(volume_name_id)
             else:
                 raise api.VmstoreException(
                     code='NotFound',
                     message=('Could not find VirtualDisk for %s' %
-                        snapshot['volume_name']))
+                             snapshot['volume_name']))
         vmstore_subdir = self.nas_path.removeprefix('/tintri/')
         payload = {
-            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderSnapshotSpec',
+            'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                       'beans.cinder.CinderSnapshotSpec'),
             'file': os.path.join(vmstore_subdir, volume_name),
             'vmName': vd[0]['vmName'],
             'description': snapshot['name'],
@@ -501,16 +504,17 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param snapshot: snapshot reference
         """
         snapshots = self.vmstore.snapshots.list()
-        uuid = ''
+        snap_uuid = ''
         for vmstore_snapshot in snapshots:
             if snapshot['name'] == vmstore_snapshot['description']:
-                uuid = vmstore_snapshot['uuid']['uuid']
-        if not uuid:
-            LOG.info('Did not find snapshot %s,'
-                     'this is ok for deletion.' % snapshot['name'])
+                snap_uuid = vmstore_snapshot['uuid']['uuid']
+        if not snap_uuid:
+            LOG.info('Did not find snapshot %(name)s, '
+                     'this is ok for deletion.',
+                     {'name': snapshot['name']})
             return
         try:
-            self.vmstore.snapshots.delete(uuid)
+            self.vmstore.snapshots.delete(snap_uuid)
         except api.VmstoreException as e:
             if 'VM is still present' in str(e):
                 LOG.warning(e)
@@ -525,18 +529,18 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param snapshot: reference of source snapshot
         """
         snapshots = self.vmstore.snapshots.list()
-        uuid = ''
+        snap_uuid = ''
         for vmstore_snapshot in snapshots:
             if snapshot['name'] == vmstore_snapshot['description']:
-                uuid = vmstore_snapshot['uuid']['uuid']
+                snap_uuid = vmstore_snapshot['uuid']['uuid']
         timeout = 30
         current = 1
-        while not uuid:
+        while not snap_uuid:
             if current < timeout:
                 snapshots = self.vmstore.snapshots.list()
                 for vmstore_snapshot in snapshots:
                     if snapshot['name'] == vmstore_snapshot['description']:
-                        uuid = vmstore_snapshot['uuid']['uuid']
+                        snap_uuid = vmstore_snapshot['uuid']['uuid']
             else:
                 msg = 'Did not find snapshot %s' % snapshot['name']
                 raise api.VmstoreException(code='NotFound', message=msg)
@@ -545,13 +549,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             vmstore_subdir, snapshot['name'])
 
         payload = {
-            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderCloneSpec',
-            'tintriSnapshotUuid': uuid,
+            'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                       'beans.cinder.CinderCloneSpec'),
+            'tintriSnapshotUuid': snap_uuid,
             'destinationPaths': clone_path,
         }
         self.vmstore.clones.create(payload)
         mount_dir = self._get_mount_point_for_share(self._get_share_path())
-        temp_clone_dir =os.path.join(mount_dir, snapshot['name'])
+        temp_clone_dir = os.path.join(mount_dir, snapshot['name'])
         temp_clone_path = os.path.join(temp_clone_dir, snapshot['volume_name'])
         clone_destination = os.path.join(
             mount_dir, volume['name'])
@@ -611,6 +616,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     @coordination.synchronized('{self.vmstore.lock}')
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume.
+
         Create a snapshot with DELETE_ON_ZERO_CLONE_REFERENCES.
         Create a cloned volume from that snapshot.
         When the cloned volume is deleted, snapshot will get deleted from
@@ -627,7 +633,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         while len(vd) < 1:
             if current < timeout:
                 LOG.info('VirtualDisk for %s not found, sleeping %d',
-                    src_id, current)
+                         src_id, current)
                 time.sleep(current)
                 current += 2
                 vd = self.vmstore.virtual_disk.get(src_id)
@@ -635,11 +641,12 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 raise api.VmstoreException(
                     code='NotFound',
                     message=('Could not find VirtualDisk for %s' %
-                        src_name))
+                             src_name))
         vmstore_subdir = self.nas_path.removeprefix('/tintri/')
         clone_name = 'clone-%s' % src_name
         payload = {
-            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderSnapshotSpec',
+            'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                       'beans.cinder.CinderSnapshotSpec'),
             'file': os.path.join(vmstore_subdir, src_name),
             'vmName': vd[0]['vmName'],
             'description': clone_name,
@@ -651,11 +658,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         self.vmstore.snapshots.create(payload)
 
         snapshots = self.vmstore.snapshots.list()
-        uuid = ''
+        snap_uuid = ''
         for vmstore_snapshot in snapshots:
             if clone_name == vmstore_snapshot['description']:
-                uuid = vmstore_snapshot['uuid']['uuid']
-        if not uuid:
+                snap_uuid = vmstore_snapshot['uuid']['uuid']
+        if not snap_uuid:
             msg = 'Did not find snapshot %s' % clone_name
             raise api.VmstoreException(code='NotFound', message=msg)
         vmstore_subdir = self.nas_path.removeprefix('/tintri')
@@ -663,13 +670,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             vmstore_subdir, clone_name)
 
         payload = {
-            'typeId': 'com.tintri.api.rest.v310.dto.domain.beans.cinder.CinderCloneSpec',
-            'tintriSnapshotUuid': uuid,
+            'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                       'beans.cinder.CinderCloneSpec'),
+            'tintriSnapshotUuid': snap_uuid,
             'destinationPaths': clone_path,
         }
         self.vmstore.clones.create(payload)
         mount_dir = self._get_mount_point_for_share(self._get_share_path())
-        temp_clone_dir =os.path.join(mount_dir, clone_name)
+        temp_clone_dir = os.path.join(mount_dir, clone_name)
         temp_clone_path = os.path.join(temp_clone_dir, src_name)
         clone_destination = os.path.join(
             mount_dir, volume['name'])
@@ -686,16 +694,16 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """Extend an existing volume to the new size."""
         if self._is_volume_attached(volume):
             msg = (_("Cannot extend volume %s while it is attached.")
-                   % volume['id'])
+                   % volume.name_id)
             raise exception.ExtendVolumeError(msg)
 
-        LOG.info('Extending volume %s.', volume.id)
+        LOG.info('Extending volume %s.', volume.name_id)
         extend_by = int(new_size) - volume.size
         if not self._is_share_eligible(volume.provider_location,
                                        extend_by):
             raise exception.ExtendVolumeError(reason='Insufficient space to'
                                               ' extend volume %s to %sG'
-                                              % (volume.id, new_size))
+                                              % (volume.name_id, new_size))
         # Use the active image file because this volume might have snapshot(s).
         active_file = self.get_active_image_from_info(volume)
         active_file_path = os.path.join(self._local_volume_dir(volume),
@@ -781,7 +789,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         pools = []
         for share in self._mounted_shares:
             pool = dict()
-            capacity, free, used = self._get_capacity_info(share)
+            capacity, free, _used = self._get_capacity_info(share)
             pool['pool_name'] = share
             pool['total_capacity_gb'] = capacity / float(units.Gi)
             pool['free_capacity_gb'] = free / float(units.Gi)
