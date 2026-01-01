@@ -400,6 +400,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         volume_path = base_volume_path
         self._delete(volume_path)
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        vmstore_volume_path = os.path.join(vmstore_subdir, volume['name'])
+        try:
+            self.refresh_hypervisor(vmstore_volume_path)
+        except Exception as exc:
+            LOG.debug(
+                'Received an error on attempt to refresh hypervisor after '
+                'delete_volume %(exc)s', {'exc': exc})
 
     def _get_share_path(self):
         nas_host = self.configuration.nas_host

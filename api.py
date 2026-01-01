@@ -118,8 +118,11 @@ class VmstoreRequest(object):
                     code = 'RESOURCE_NOT_FOUND'
                     message = str(error)
                     self.error = VmstoreException(message, code=code)
-                LOG.error('Failed request %(info)s: %(error)s',
-                          {'info': info, 'error': self.error})
+                if 'cinder/host/refresh' in response.request.url:
+                    raise self.error
+                else:
+                    LOG.error('Failed request %(info)s: %(error)s',
+                              {'info': info, 'error': self.error})
                 continue
             count = sum(self.stat.values())
             if 'v310/appliance' not in response.request.url:
@@ -142,9 +145,12 @@ class VmstoreRequest(object):
                     code = 'RESOURCE_NOT_FOUND'
                     message = str(content['message'])
                     raise VmstoreException(message, code=code)
-                LOG.error('Failed request %(info)s, '
-                          'response content: %(content)s',
-                          {'info': info, 'content': content})
+                if 'cinder/host/refresh' in response.request.url:
+                    return VmstoreException(content)
+                else:
+                    LOG.error('Failed request %(info)s, '
+                              'response content: %(content)s',
+                              {'info': info, 'content': content})
                 self.error = VmstoreException(content)
                 continue
             is_created = response.status_code == requests.codes.created
