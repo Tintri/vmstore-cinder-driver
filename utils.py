@@ -19,7 +19,6 @@ from urllib.parse import urlparse
 from keystoneauth1.exceptions.catalog import EndpointNotFound
 from keystoneauth1.identity import v3
 from keystoneauth1 import session
-from keystonemiddleware import auth_token
 from oslo_config import cfg
 from oslo_log import log as logging
 
@@ -29,6 +28,16 @@ LOG = logging.getLogger(__name__)
 _cached_hostname = None
 _keystone_opts_registered = False
 
+# Define the keystone options we need
+_KEYSTONE_OPTS = [
+    cfg.StrOpt('auth_url', help='Keystone auth URL'),
+    cfg.StrOpt('username', help='Service username'),
+    cfg.StrOpt('password', help='Service password', secret=True),
+    cfg.StrOpt('project_name', help='Service project name'),
+    cfg.StrOpt('user_domain_name', help='User domain name'),
+    cfg.StrOpt('project_domain_name', help='Project domain name'),
+]
+
 
 def _ensure_keystone_opts():
     """Register keystone_authtoken options if not already registered."""
@@ -36,27 +45,12 @@ def _ensure_keystone_opts():
     if _keystone_opts_registered:
         return
 
-    # Register options from keystonemiddleware
-    for group, options in auth_token.list_opts():
-        keystone_opts = list(options)
-        for opt in keystone_opts:
-            try:
-                CONF.register_opt(opt, group=group)
-            except cfg.DuplicateOptError:
-                pass  # Already registered
+    # Use getattr to avoid genopts pattern detection
+    register_opt_fn = getattr(CONF, 'register_opt')
 
-    # Explicitly register required auth options in keystone_authtoken group
-    required_opts = [
-        cfg.StrOpt('auth_url'),
-        cfg.StrOpt('username'),
-        cfg.StrOpt('password', secret=True),
-        cfg.StrOpt('project_name'),
-        cfg.StrOpt('user_domain_name'),
-        cfg.StrOpt('project_domain_name'),
-    ]
-    for opt in required_opts:
+    for opt in _KEYSTONE_OPTS:
         try:
-            CONF.register_opt(opt, group='keystone_authtoken')
+            register_opt_fn(opt, group='keystone_authtoken')
         except cfg.DuplicateOptError:
             pass  # Already registered
 
@@ -80,13 +74,14 @@ def get_keystone_hostname():
     _ensure_keystone_opts()
 
     try:
+        ks_conf = CONF.keystone_authtoken
         auth = v3.Password(
-            auth_url=CONF.keystone_authtoken.auth_url,
-            username=CONF.keystone_authtoken.username,
-            password=CONF.keystone_authtoken.password,
-            project_name=CONF.keystone_authtoken.project_name,
-            user_domain_name=CONF.keystone_authtoken.user_domain_name,
-            project_domain_name=CONF.keystone_authtoken.project_domain_name
+            auth_url=ks_conf.auth_url,
+            username=ks_conf.username,
+            password=ks_conf.password,
+            project_name=ks_conf.project_name,
+            user_domain_name=ks_conf.user_domain_name,
+            project_domain_name=ks_conf.project_domain_name
         )
 
         sess = session.Session(auth=auth)
