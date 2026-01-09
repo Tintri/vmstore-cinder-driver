@@ -331,7 +331,7 @@ class VmstoreCollections(object):
         return self.proxy.put(path, payload)
 
     def list(self, payload=None):
-        LOG.debug('List of %(subj)s: %(payload)s',
+        LOG.debug('Getting list of %(subj)s: %(payload)s',
                   {'subj': self.subj, 'payload': payload})
         path = self.root
         return self.proxy.get(path, payload)

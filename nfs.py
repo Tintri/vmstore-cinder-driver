@@ -301,6 +301,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 'region': self.configuration.vmstore_refresh_openstack_region,
             }
             self.vmstore.cinder_refresh.create(payload)
+            LOG.info('Sleeping 5s after refresh')
+            time.sleep(5)
         except Exception as e:
             LOG.warning("Failed to refresh hypervisor, error: %s", e)
 
@@ -432,27 +434,27 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
-        volume_name = volume['name']
+        volume_id = volume['id']
         LOG.debug('Checking for VMstore snapshots associated with '
-                  'volume %(vol)s', {'vol': volume_name})
+                  'volume %(vol)s', {'vol': volume_id})
         try:
             snapshots = self.vmstore.snapshots.list()
             for vmstore_snapshot in snapshots:
-                if vmstore_snapshot.get('vmName') == volume_name:
+                if vmstore_snapshot.get('vmName') == volume_id:
                     snap_uuid = vmstore_snapshot['uuid']['uuid']
                     LOG.debug('Deleting VMstore snapshot %(snap_uuid)s '
                               'for volume %(vol)s',
-                              {'snap_uuid': snap_uuid, 'vol': volume_name})
+                              {'snap_uuid': snap_uuid, 'vol': volume_id})
                     try:
                         self.vmstore.snapshots.delete(snap_uuid)
                     except api.VmstoreException as e:
                         LOG.warning('Failed to delete snapshot %(snap)s '
                                     'for volume %(vol)s: %(err)s',
-                                    {'snap': snap_uuid, 'vol': volume_name,
+                                    {'snap': snap_uuid, 'vol': volume_id,
                                      'err': e})
         except api.VmstoreException as e:
             LOG.warning('Failed to list snapshots for volume %(vol)s: %(err)s',
-                        {'vol': volume_name, 'err': e})
+                        {'vol': volume_id, 'err': e})
 
     def _get_share_path(self):
         nas_host = self.configuration.nas_host
@@ -524,11 +526,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         vd = self.vmstore.virtual_disk.get(volume_name_id)
         timeout = 60
         current = 1
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        volume_path = os.path.join(vmstore_subdir, volume_name)
         while len(vd) < 1:
             if current < timeout:
                 LOG.info('VirtualDisk for %s not found, sleeping %d',
                          volume_name_id, current)
                 time.sleep(current)
+                self.refresh_hypervisor(volume_path)
                 current += 2
                 vd = self.vmstore.virtual_disk.get(volume_name_id)
             else:
@@ -536,11 +541,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     code='NotFound',
                     message=('Could not find VirtualDisk for %s' %
                              snapshot['volume_name']))
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
                        'beans.cinder.CinderSnapshotSpec'),
-            'file': os.path.join(vmstore_subdir, volume_name),
+            'file': volume_path,
             'vmName': vd[0]['vmName'],
             'description': snapshot['name'],
             'vmTintriUuid': vd[0]['vmUuid']['uuid'],
