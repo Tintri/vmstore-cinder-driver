@@ -1,4 +1,4 @@
-# Copyright 2025 DDN, Inc. All rights reserved.
+# Copyright 2026 DDN, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -16,6 +16,8 @@
 
 from oslo_config import cfg
 
+from cinder.volume import configuration as config
+
 VMSTORE_CONNECTION_OPTS = [
     cfg.StrOpt('vmstore_rest_protocol',
                default='https',
@@ -25,17 +27,14 @@ VMSTORE_CONNECTION_OPTS = [
                default=443,
                help='Vmstore RESTful API interface port'),
     cfg.StrOpt('vmstore_user',
-               required=True,
                default='admin',
                help='User name to connect to Vmstore RESTful API '
                     'interface.'),
     cfg.StrOpt('vmstore_password',
-               required=True,
                secret=True,
                help='User password to connect to Vmstore RESTful API '
                     'interface.'),
     cfg.StrOpt('vmstore_rest_address',
-               required=True,
                help='IP address or hostname for management '
                     'communication with Vmstore RESTful API interface.'),
     cfg.FloatOpt('vmstore_rest_connect_timeout',
@@ -95,3 +94,6 @@ VMSTORE_NFS_OPTS += (
     VMSTORE_CONNECTION_OPTS +
     VMSTORE_DATASET_OPTS
 )
+
+CONF = cfg.CONF
+CONF.register_opts(VMSTORE_NFS_OPTS, group=config.SHARED_CONF_GROUP)

@@ -1,4 +1,4 @@
-# Copyright 2025 DDN, Inc. All rights reserved.
+# Copyright 2026 DDN, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -121,10 +121,25 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     def do_setup(self, ctxt) -> None:
         self.ctxt = ctxt
+        self._validate_required_options()
         retries = 0
         while not self._do_setup():
             retries += 1
             self.vmstore.delay(retries)
+
+    def _validate_required_options(self) -> None:
+        """Validate that required configuration options are set."""
+        required_opts = ['vmstore_password', 'vmstore_rest_address']
+        missing = []
+        for opt in required_opts:
+            if not getattr(self.configuration, opt, None):
+                missing.append(opt)
+        if missing:
+            raise exception.InvalidConfigurationValue(
+                option=', '.join(missing),
+                value='<not set>',
+                reason=_('Required VMstore configuration options are missing')
+            )
 
     def _do_setup(self) -> bool:
         try:
@@ -388,6 +403,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                         'specified, skipping', volume.name)
             return
 
+        # Delete all VMstore snapshots associated with this volume
+        self._delete_volume_snapshots(volume)
+
         info_path = self._local_path_volume_info(volume)
         info = self._read_info_file(info_path, empty_if_missing=True)
 
@@ -408,6 +426,33 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             LOG.debug(
                 'Received an error on attempt to refresh hypervisor after '
                 'delete_volume %(exc)s', {'exc': exc})
+
+    def _delete_volume_snapshots(self, volume):
+        """Delete all VMstore snapshots associated with the volume.
+
+        :param volume: volume reference
+        """
+        volume_name = volume['name']
+        LOG.debug('Checking for VMstore snapshots associated with '
+                  'volume %(vol)s', {'vol': volume_name})
+        try:
+            snapshots = self.vmstore.snapshots.list()
+            for vmstore_snapshot in snapshots:
+                if vmstore_snapshot.get('vmName') == volume_name:
+                    snap_uuid = vmstore_snapshot['uuid']['uuid']
+                    LOG.debug('Deleting VMstore snapshot %(snap_uuid)s '
+                              'for volume %(vol)s',
+                              {'snap_uuid': snap_uuid, 'vol': volume_name})
+                    try:
+                        self.vmstore.snapshots.delete(snap_uuid)
+                    except api.VmstoreException as e:
+                        LOG.warning('Failed to delete snapshot %(snap)s '
+                                    'for volume %(vol)s: %(err)s',
+                                    {'snap': snap_uuid, 'vol': volume_name,
+                                     'err': e})
+        except api.VmstoreException as e:
+            LOG.warning('Failed to list snapshots for volume %(vol)s: %(err)s',
+                        {'vol': volume_name, 'err': e})
 
     def _get_share_path(self):
         nas_host = self.configuration.nas_host
