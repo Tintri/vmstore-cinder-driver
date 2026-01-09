@@ -283,8 +283,15 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                           {'attempt': attempt, 'exc': e})
                 time.sleep(1)
 
-    def refresh_hypervisor(self, volume_path=None):
+    def refresh_hypervisor(self, volume):
+        """Refresh VMstore hypervisor for the given volume.
+
+        :param volume: volume reference
+        """
         try:
+            vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+            volume_path = os.path.join(vmstore_subdir, volume['name'])
+
             hostname = self.configuration.safe_get(
                 'vmstore_openstack_hostname')
             if not hostname:
@@ -301,8 +308,22 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 'region': self.configuration.vmstore_refresh_openstack_region,
             }
             self.vmstore.cinder_refresh.create(payload)
-            LOG.info('Sleeping 5s after refresh')
-            time.sleep(5)
+            vd = self.vmstore.virtual_disk.get(volume.name_id)
+            timeout = 30
+            current = 1
+            while len(vd) < 1:
+                if current < timeout:
+                    LOG.info('VirtualDisk for %s not found, sleeping %d',
+                             volume.name_id, current)
+                    time.sleep(current)
+                    self.vmstore.cinder_refresh.create(payload)
+                    current += 2
+                    vd = self.vmstore.virtual_disk.get(volume.name_id)
+                else:
+                    raise api.VmstoreException(
+                        code='NotFound',
+                        message=('Could not find VirtualDisk for %s' %
+                                 volume['name']))
         except Exception as e:
             LOG.warning("Failed to refresh hypervisor, error: %s", e)
 
@@ -325,9 +346,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.info('casted to %s', volume.provider_location)
 
         self._do_create_volume(volume)
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
-        volume_path = os.path.join(vmstore_subdir, volume['name'])
-        self.refresh_hypervisor(volume_path)
+        self.refresh_hypervisor(volume)
         return {'provider_location': volume.provider_location}
 
     def _do_create_volume(self, volume: objects.Volume) -> None:
@@ -420,10 +439,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         volume_path = base_volume_path
         self._delete(volume_path)
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
-        vmstore_volume_path = os.path.join(vmstore_subdir, volume['name'])
         try:
-            self.refresh_hypervisor(vmstore_volume_path)
+            self.refresh_hypervisor(volume)
         except Exception as exc:
             LOG.debug(
                 'Received an error on attempt to refresh hypervisor after '
@@ -434,7 +451,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
-        volume_id = volume['id']
+        volume_id = volume.name_id
         LOG.debug('Checking for VMstore snapshots associated with '
                   'volume %(vol)s', {'vol': volume_id})
         try:
@@ -519,28 +536,28 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param snapshot: snapshot reference
         """
-        volume_name = snapshot['volume_name']
+        volume = snapshot.volume
+        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        volume_path = os.path.join(vmstore_subdir, volume['name'])
         # Use volume.name_id for backend storage identification
         # per Cinder guidelines
-        volume_name_id = snapshot.volume.name_id
+        volume_name_id = volume.name_id
         vd = self.vmstore.virtual_disk.get(volume_name_id)
         timeout = 60
         current = 1
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
-        volume_path = os.path.join(vmstore_subdir, volume_name)
         while len(vd) < 1:
             if current < timeout:
                 LOG.info('VirtualDisk for %s not found, sleeping %d',
                          volume_name_id, current)
                 time.sleep(current)
-                self.refresh_hypervisor(volume_path)
+                self.refresh_hypervisor(volume)
                 current += 2
                 vd = self.vmstore.virtual_disk.get(volume_name_id)
             else:
                 raise api.VmstoreException(
                     code='NotFound',
                     message=('Could not find VirtualDisk for %s' %
-                             snapshot['volume_name']))
+                             volume['name']))
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
                        'beans.cinder.CinderSnapshotSpec'),
@@ -620,9 +637,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         os.rename(temp_clone_path, clone_destination)
         os.rmdir(temp_clone_dir)
 
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
-        volume_path = os.path.join(vmstore_subdir, volume['name'])
-        self.refresh_hypervisor(volume_path)
+        self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
         return {'provider_location': volume.provider_location}
 
@@ -683,7 +698,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param src_vref: source volume reference
         """
         src_name = src_vref['name']
-        src_id = src_vref['id']
+        src_id = src_vref.name_id
         vd = self.vmstore.virtual_disk.get(src_id)
         timeout = 30
         current = 1
@@ -741,9 +756,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         os.rename(temp_clone_path, clone_destination)
         os.rmdir(temp_clone_dir)
 
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
-        volume_path = os.path.join(vmstore_subdir, volume['name'])
-        self.refresh_hypervisor(volume_path)
+        self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
         return {'provider_location': volume.provider_location}
 
