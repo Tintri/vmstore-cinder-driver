@@ -110,10 +110,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         self.nas_share = None
         self.nas_mntpoint = None
         self.vmstore = None
-        self.nas_secure_file_operations = (
-            self.configuration.nas_secure_file_operations.lower())
-        self.nas_secure_file_permissions = (
-            self.configuration.nas_secure_file_permissions.lower())
 
     @staticmethod
     def get_driver_options():
@@ -156,21 +152,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         return True
 
     def check_for_setup_error(self) -> None:
-        secure_options = {
-            'nas_secure_file_operations': self.nas_secure_file_operations,
-            'nas_secure_file_permissions': self.nas_secure_file_permissions
-        }
-        for option_name, option_value in secure_options.items():
-            if option_value not in ['auto', 'true', 'false']:
-                code = 'EINVAL'
-                message = (_('Invalid value %(option_value)s for '
-                             'configuration option %(option_name)s '
-                             'defined for backend %(backend_name)s')
-                           % {'option_value': option_value,
-                              'option_name': option_name,
-                              'backend_name': self.backend_name})
-                raise api.VmstoreException(code=code, message=message)
-        self.set_nas_security_options(self._is_voldb_empty_at_startup)
         retries = 0
         while not self._check_for_setup_error():
             retries += 1
@@ -543,7 +524,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # per Cinder guidelines
         volume_name_id = volume.name_id
         vd = self.vmstore.virtual_disk.get(volume_name_id)
-        timeout = 60
+        timeout = 30
         current = 1
         while len(vd) < 1:
             if current < timeout:

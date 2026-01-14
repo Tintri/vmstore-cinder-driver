@@ -147,6 +147,10 @@ class VmstoreRequest(object):
                     raise VmstoreException(message, code=code)
                 if 'cinder/host/refresh' in response.request.url:
                     return VmstoreException(content)
+                elif 'live VM is still present' in content.get('causeDetails'):
+                    LOG.info(
+                        'Could not delete snapshot with existing clones, '
+                        'will be cleaned up when the parent volume is deleted')
                 else:
                     LOG.error('Failed request %(info)s, '
                               'response content: %(content)s',
