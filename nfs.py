@@ -211,7 +211,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             self.shares[share_address] = self.mount_options
 
         else:
-            LOG.error('nas_host or nas_share_path not configured.')
+            msg = 'nas_host or nas_share_path not configured.'
+            LOG.error(msg)
+            raise exception.InvalidConfigurationValue(msg)
 
         LOG.debug('shares loaded: %s', self.shares)
 
