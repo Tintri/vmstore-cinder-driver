@@ -57,9 +57,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
               hypervisor refresh API.
               - Added vmstore_refresh_retry_count specific for hypervisor
               refresh API.
+        3.0.3 - refresh_hypervisor: poll for virtual disk after the API call
+              to cinder/refresh and retry if not available.
     """
 
-    VERSION = '3.0.2'
+    VERSION = '3.0.3'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
