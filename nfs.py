@@ -115,9 +115,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     @staticmethod
     def get_driver_options():
+        LOG.info('VmstoreNfsDriver get_driver_options')
         return options.VMSTORE_NFS_OPTS
 
     def do_setup(self, ctxt) -> None:
+        LOG.info('VmstoreNfsDriver do_setup for context: %s', ctxt)
         self.ctxt = ctxt
         self._validate_required_options()
         retries = 0
@@ -127,6 +129,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     def _validate_required_options(self) -> None:
         """Validate that required configuration options are set."""
+        LOG.info('VmstoreNfsDriver _validate_required_options')
         required_opts = ['vmstore_password', 'vmstore_rest_address']
         missing = []
         for opt in required_opts:
@@ -140,6 +143,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             )
 
     def _do_setup(self) -> bool:
+        LOG.info('VmstoreNfsDriver _do_setup')
         try:
             self.vmstore = api.VmstoreProxy(self.driver_volume_type,
                                             self.backend_name,
@@ -154,18 +158,21 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         return True
 
     def check_for_setup_error(self) -> None:
+        LOG.info('Checking for setup error')
         retries = 0
         while not self._check_for_setup_error():
             retries += 1
             self.vmstore.delay(retries)
 
     def _check_for_setup_error(self):
+        LOG.info('VmstoreNfsDriver _check_for_setup_error')
         appliance = self.vmstore.appliance.get(None)
         if appliance:
             return True
         return False
 
     def _get_backend_name(self) -> str:
+        LOG.info('VmstoreNfsDriver _get_backend_name')
         backend_name = self.configuration.safe_get('volume_backend_name')
         if not backend_name:
             LOG.error('Failed to get configured volume backend name')
@@ -177,6 +184,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     def _ensure_shares_mounted(self) -> None:
         """Look for remote shares in the flags and mount them locally."""
+        LOG.info('VmstoreNfsDriver _ensure_shares_mounted')
         mounted_shares: List[str] = []
         self._load_shares()
 
@@ -192,6 +200,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.debug('Available shares %s', self._mounted_shares)
 
     def _load_shares(self) -> None:
+        LOG.info('VmstoreNfsDriver _load_shares')
         self.shares = {}
 
         if all((self.configuration.nas_host,
@@ -225,6 +234,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param share: nfs share
         :returns: mount point
         """
+        LOG.info('VmstoreNfsDriver _mount_share for share: %s', share)
         attempts = max(1, self.configuration.nfs_mount_attempts)
         for attempt in range(1, attempts + 1):
             try:
@@ -250,6 +260,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 return mntpoint
 
     def _ensure_share_mounted(self, nfs_share) -> None:
+        LOG.info('VmstoreNfsDriver _ensure_share_mounted for share: %s', nfs_share)
         num_attempts = max(1, self.configuration.nfs_mount_attempts)
         for attempt in range(num_attempts):
             try:
@@ -273,6 +284,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
+        LOG.info('Refreshing hypervisor for volume %s', volume.name_id)
         try:
             vmstore_subdir = self.nas_path.removeprefix('/tintri/')
             volume_path = os.path.join(vmstore_subdir, volume['name'])
@@ -319,6 +331,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :returns: provider_location update dict for database
         """
 
+        LOG.info('Creating volume %s', volume.name_id)
         if volume.encryption_key_id and not self._supports_encryption:
             message = _('Encryption is not yet supported.')
             raise exception.VolumeDriverException(message=message)
@@ -339,6 +352,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
+        LOG.info('VmstoreNfsDriver _do_create_volume for volume: %s',
+                 volume.name_id)
         volume_path = self.local_path(volume)
         volume_size = volume.size
 
@@ -379,6 +394,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :returns: encryption dict
         """
+        LOG.info('VmstoreNfsDriver check_encryption_provider for volume: %s',
+                 volume.id)
 
         encryption = db.volume_encryption_metadata_get(context, volume.id)
 
@@ -401,6 +418,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def delete_volume(self, volume):
         """Deletes a logical volume."""
 
+        LOG.info('Deleting volume %s', volume.name_id)
         LOG.debug('Deleting volume %(vol)s, provider_location: %(loc)s',
                   {'vol': volume.name_id, 'loc': volume.provider_location})
 
@@ -424,18 +442,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         volume_path = base_volume_path
         self._delete(volume_path)
-        try:
-            self.refresh_hypervisor(volume)
-        except Exception as exc:
-            LOG.debug(
-                'Received an error on attempt to refresh hypervisor after '
-                'delete_volume %(exc)s', {'exc': exc})
 
     def _delete_volume_snapshots(self, volume):
         """Delete all VMstore snapshots associated with the volume.
 
         :param volume: volume reference
         """
+        LOG.info('VmstoreNfsDriver _delete_volume_snapshots for volume: %s',
+                 volume.name_id)
         volume_id = volume.name_id
         LOG.debug('Checking for VMstore snapshots associated with '
                   'volume %(vol)s', {'vol': volume_id})
@@ -459,6 +473,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                         {'vol': volume_id, 'err': e})
 
     def _get_share_path(self):
+        LOG.info('VmstoreNfsDriver _get_share_path')
         nas_host = self.configuration.nas_host
         nas_share_path = self.configuration.nas_share_path
 
@@ -472,6 +487,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param connector: connector reference
         :returns: dictionary of connection information
         """
+        LOG.info('Initialize volume connection for volume %(vol)s with '
+                 'connector %(conn)s', {'vol': volume['name'], 'conn': connector})
         LOG.debug('Initialize volume connection for %(volume)s',
                   {'volume': volume['name']})
         volume_name = volume['name']
@@ -506,6 +523,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
+        LOG.info('VmstoreNfsDriver _local_volume_dir for volume: %s',
+                 volume.name_id)
         share = volume.provider_location
         if isinstance(share, str):
             share = share.encode('utf-8')
@@ -513,6 +532,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         return os.path.join(self.mount_point_base, path)
 
     def _check_snapshot_support(self, setup_checking=False):
+        LOG.info('VmstoreNfsDriver _check_snapshot_support, '
+                 'setup_checking: %s', setup_checking)
         return True
 
     @coordination.synchronized('{self.vmstore.lock}')
@@ -521,6 +542,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param snapshot: snapshot reference
         """
+        LOG.info('Creating snapshot %s', snapshot['name'])
         volume = snapshot.volume
         vmstore_subdir = self.nas_path.removeprefix('/tintri/')
         volume_path = os.path.join(vmstore_subdir, volume['name'])
@@ -562,6 +584,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param snapshot: snapshot reference
         """
+        LOG.info('Deleting snapshot %s', snapshot['name'])
         snapshots = self.vmstore.snapshots.list()
         snap_uuid = ''
         for vmstore_snapshot in snapshots:
@@ -587,6 +610,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param volume: reference of volume to be created
         :param snapshot: reference of source snapshot
         """
+        LOG.info('Creating volume %(vol)s from snapshot %(snap)s',
+                 {'vol': volume['name'], 'snap': snapshot['name']})
         snapshots = self.vmstore.snapshots.list()
         snap_uuid = ''
         for vmstore_snapshot in snapshots:
@@ -634,6 +659,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                              disable_sparse: bool = False) -> None:
         """Fetch the image from image_service and write it to the volume."""
 
+        LOG.info('Copying image %(image)s to volume %(vol)s',
+                 {'image': image_id, 'vol': volume.name_id})
         volpath = self.local_path(volume)
         image_utils.fetch_to_raw(context,
                                  image_service,
@@ -662,6 +689,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                              image_service,
                              image_meta: dict) -> None:
         """Copy the volume to the specified image."""
+        LOG.info('Copying volume %(vol)s to image %(image)s',
+                 {'vol': volume.name_id, 'image': image_meta.get('id')})
         volpath = self.local_path(volume)
         volume_utils.upload_volume(context,
                                    image_service,
@@ -682,6 +711,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param volume: new volume reference
         :param src_vref: source volume reference
         """
+        LOG.info('Creating cloned volume %(vol)s from source %(src)s',
+                 {'vol': volume['name'], 'src': src_vref['name']})
         src_name = src_vref['name']
         src_id = src_vref.name_id
         vd = self.vmstore.virtual_disk.get(src_id)
@@ -747,12 +778,15 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     def extend_volume(self, volume, new_size):
         """Extend an existing volume to the new size."""
+        LOG.info('Extending volume %(vol)s to new size %(size)s GB.',
+                 {'vol': volume.name_id, 'size': new_size})
         if self._is_volume_attached(volume):
             msg = (_("Cannot extend volume %s while it is attached.")
                    % volume.name_id)
             raise exception.ExtendVolumeError(msg)
 
-        LOG.info('Extending volume %s.', volume.name_id)
+        LOG.info('Extending volume %(vol)s to new size %(size)s GB.',
+                 {'vol': volume.name_id, 'size': new_size})
         extend_by = int(new_size) - volume.size
         if not self._is_share_eligible(volume.provider_location,
                                        extend_by):
@@ -784,12 +818,15 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         If 'refresh' is True, run update the stats first.
         """
+        LOG.info('VmstoreNfsDriver get_volume_stats, refresh: %s',
+                 refresh)
         if refresh or not self._stats:
             self._update_volume_stats()
         return self._stats
 
     def _update_volume_stats(self) -> None:
         """Retrieve stats info for Red cluster."""
+        LOG.info('VmstoreNfsDriver _update_volume_stats')
         provisioned_capacity_gb = total_volumes = 0
         volumes = objects.VolumeList.get_all_by_host(self.ctxt, self.host)
         for volume in volumes:
