@@ -59,9 +59,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
               refresh API.
         3.0.3 - refresh_hypervisor: poll for virtual disk after the API call
               to cinder/refresh and retry if not available.
+        3.0.4 - Added logging, removed refresh_hypervisor from delete_volume
     """
 
-    VERSION = '3.0.3'
+    VERSION = '3.0.4'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
