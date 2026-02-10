@@ -60,9 +60,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         3.0.3 - refresh_hypervisor: poll for virtual disk after the API call
               to cinder/refresh and retry if not available.
         3.0.4 - Added logging, removed refresh_hypervisor from delete_volume
+        3.0.5 - Moved all provisioning properties to pool in
+              _update_volume_stats for thin provisioning.
     """
 
-    VERSION = '3.0.4'
+    VERSION = '3.0.5'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -732,7 +734,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     message=('Could not find VirtualDisk for %s' %
                              src_name))
         vmstore_subdir = self.nas_path.removeprefix('/tintri/')
-        clone_name = 'clone-%s' % src_name
+        clone_name = 'clone-%(src_name)s-%(vol_name)s' % {
+            'src_name': src_name,
+            'vol_name': volume['name']}
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
                        'beans.cinder.CinderSnapshotSpec'),
@@ -814,6 +818,22 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             raise exception.ExtendVolumeError(
                 reason='Resizing image file failed.')
 
+    def _get_provisioned_capacity(self):
+        mount_path = self._get_mount_point_for_share(self.nas_path)
+        provisioned_bytes = 0
+
+        for filename in os.listdir(mount_path):
+            # Only count cinder volume files to avoid counting temp files or snapshots
+            if filename.startswith('volume-'):
+                filepath = os.path.join(mount_path, filename)
+                try:
+                    # .st_size returns the 'apparent size' (provisioned capacity)
+                    provisioned_bytes += os.stat(filepath).st_size
+                except OSError:
+                    continue
+
+        return provisioned_bytes / float(units.Gi)
+
     def get_volume_stats(self, refresh=False) -> dict:
         """Get volume stats.
 
@@ -826,38 +846,62 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         return self._stats
 
     def _update_volume_stats(self) -> None:
-        """Retrieve stats info for Red cluster."""
         LOG.info('VmstoreNfsDriver _update_volume_stats')
-        provisioned_capacity_gb = total_volumes = 0
-        volumes = objects.VolumeList.get_all_by_host(self.ctxt, self.host)
-        for volume in volumes:
-            provisioned_capacity_gb += volume['size']
-            total_volumes += 1
-        max_over_subscription_ratio = (
-            self.configuration.safe_get('max_over_subscription_ratio'))
-        reserved_percentage = (
-            self.configuration.safe_get('reserved_percentage'))
-        if reserved_percentage is None:
-            reserved_percentage = 0
+        self._ensure_shares_mounted()
+        share_string = "%s:%s" % (self.nas_host, self.nas_path)
+        mount_path = self._get_mount_point_for_share(share_string)
+
+        provisioned_bytes = 0
+        total_volumes = 0
+
+        if os.path.exists(mount_path):
+            for filename in os.listdir(mount_path):
+                # Count base volumes, excluding metadata/info files
+                if filename.startswith('volume-') and not filename.endswith('.info'):
+                    filepath = os.path.join(mount_path, filename)
+                    try:
+                        stat = os.stat(filepath)
+                        # Logical size (The "promised" capacity)
+                        provisioned_bytes += stat.st_size
+                        # Physical blocks on disk (The "actual" consumption)
+                        total_volumes += 1
+                    except OSError:
+                        continue
+
+        capacity, free, _used = self._get_capacity_info(share_string)
+
+        max_osr = self.configuration.safe_get('max_over_subscription_ratio')
+        reserved = self.configuration.safe_get('reserved_percentage') or 0
+
         location_info = '%(driver)s:%(host)s:%(path)s' % {
             'driver': self.nas_driver,
             'host': self.nas_host,
             'path': self.nas_path
         }
-        description = (
-            self.configuration.safe_get('vmstore_dataset_description'))
-        if not description:
-            description = '%(product)s %(host)s:%(path)s' % {
-                'product': self.product_name,
-                'host': self.nas_host,
-                'path': self.nas_path
-            }
         display_name = 'Capabilities of %(product)s %(protocol)s driver' % {
             'product': self.product_name,
             'protocol': self.storage_protocol
         }
 
-        stats = {
+        # There will always be exactly 1 pool for NFS driver
+        pool = {
+            'pool_name': share_string,
+            'total_capacity_gb': capacity / float(units.Gi),
+            'free_capacity_gb': free / float(units.Gi),
+            'reserved_percentage': reserved,
+            'provisioned_capacity_gb': provisioned_bytes / float(units.Gi),
+            'max_over_subscription_ratio': max_osr,
+            'thin_provisioning_support': True,
+            'thick_provisioning_support': False,
+            'total_volumes': total_volumes,
+            'multiattach': False,
+            'QoS_support': False,
+            'online_extend_support': False,
+            'consistencygroup_support': False,
+            'consistent_group_snapshot_enabled': False,
+        }
+
+        self._stats = {
             'backend_state': 'up',
             'driver_version': self.VERSION,
             'vendor_name': self.vendor_name,
@@ -865,33 +909,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'volume_backend_name': self.backend_name,
             'location_info': location_info,
             'display_name': display_name,
-            'multiattach': False,
-            'QoS_support': False,
-            'consistencygroup_support': False,
-            'consistent_group_snapshot_enabled': False,
-            'online_extend_support': False,
-            'sparse_copy_volume': False,
-            'thin_provisioning_support': True,
-            'thick_provisioning_support': False,
-            'total_volumes': total_volumes,
-            'provisioned_capacity_gb': provisioned_capacity_gb,
-            'max_over_subscription_ratio': max_over_subscription_ratio,
+            'sparse_copy_volume': True,
+            'pools': [pool],
         }
-        self._ensure_shares_mounted()
-
-        pools = []
-        for share in self._mounted_shares:
-            pool = dict()
-            capacity, free, _used = self._get_capacity_info(share)
-            pool['pool_name'] = share
-            pool['total_capacity_gb'] = capacity / float(units.Gi)
-            pool['free_capacity_gb'] = free / float(units.Gi)
-            pool['reserved_percentage'] = 0
-            pool['QoS_support'] = True
-            pools.append(pool)
-        stats['pools'] = pools
-
-        self._stats = stats
         LOG.debug('Updated volume backend statistics for host %(host)s '
                   'and volume backend %(backend_name)s: %(stats)s',
                   {'host': self.host,
