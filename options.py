@@ -58,7 +58,7 @@ VMSTORE_CONNECTION_OPTS = [
                     'RESTful API calls in case of connection errors '
                     'or Vmstore appliance retriable errors.'),
     cfg.StrOpt('vmstore_refresh_openstack_region',
-               default='RegionOne',
+               default='',
                help='Openstack region for Vmstore hypervisor refresh call.'),
     cfg.StrOpt('vmstore_openstack_hostname',
                help='OpenStack controller hostname or IP address. '
@@ -78,6 +78,11 @@ VMSTORE_NFS_OPTS = [
     cfg.StrOpt('vmstore_mount_point_base',
                default='$state_path/mnt',
                help='Base directory that contains NFS share mount points.'),
+    cfg.IntOpt('vmstore_stats_cache_period',
+               default=59,
+               help='Period in seconds for caching volume statistics. '
+                    'Stats will be refreshed only if the cache is older '
+                    'than this value. Set to 0 to disable caching.'),
 ]
 
 VMSTORE_DATASET_OPTS = [

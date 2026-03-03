@@ -118,7 +118,7 @@ class VmstoreRequest(object):
                     code = 'RESOURCE_NOT_FOUND'
                     message = str(error)
                     self.error = VmstoreException(message, code=code)
-                if 'cinder/host/refresh' in response.request.url:
+                if 'cinder/host/refresh' in self.path:
                     raise self.error
                 else:
                     LOG.error('Failed request %(info)s: %(error)s',
@@ -145,7 +145,7 @@ class VmstoreRequest(object):
                     code = 'RESOURCE_NOT_FOUND'
                     message = str(content['message'])
                     raise VmstoreException(message, code=code)
-                if 'cinder/host/refresh' in response.request.url:
+                if 'cinder/host/refresh' in self.path:
                     return VmstoreException(content)
                 elif 'live VM is still present' in content.get('causeDetails'):
                     LOG.info(
@@ -387,6 +387,27 @@ class VmstoreSnapshots(VmstoreCollections):
         super(VmstoreSnapshots, self).__init__(proxy)
         self.root = 'snapshot'
         self.subj = 'VolumeSnapshot'
+
+    def list(self, filters=None):
+        """List snapshots with optional filtering.
+
+        :param filters: Dictionary of filter parameters to apply.
+                        Example: {'uuid': 'abc-123', 'name': 'snapshot-1'}
+        :return: List of snapshots matching the filters
+        """
+        path = self.root
+        if filters and isinstance(filters, dict):
+            # Build query string from filters dictionary
+            query_params = []
+            for key, value in filters.items():
+                encoded_value = urlparse.quote_plus(str(value))
+                query_params.append('%s=%s' % (key, encoded_value))
+            if query_params:
+                query_string = '&'.join(query_params)
+                path = '%s?%s' % (self.root, query_string)
+        LOG.debug('Getting list of %(subj)s with path: %(path)s',
+                  {'subj': self.subj, 'path': path})
+        return self.proxy.get(path)
 
     def create(self, payload=None):
         LOG.debug('Create %(subj)s: %(payload)s',

@@ -62,9 +62,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         3.0.4 - Added logging, removed refresh_hypervisor from delete_volume
         3.0.5 - Moved all provisioning properties to pool in
               _update_volume_stats for thin provisioning.
+        3.0.6 - Cache volume stats. Added filtering for all list snapshots
+              operations.
     """
 
-    VERSION = '3.0.5'
+    VERSION = '3.0.6'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -115,6 +117,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         self.nas_share = None
         self.nas_mntpoint = None
         self.vmstore = None
+        # Stats caching
+        self._stats_cache = None
+        self._stats_cache_timestamp = 0
 
     @staticmethod
     def get_driver_options():
@@ -457,7 +462,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.debug('Checking for VMstore snapshots associated with '
                   'volume %(vol)s', {'vol': volume_id})
         try:
-            snapshots = self.vmstore.snapshots.list()
+            snapshots = self.vmstore.snapshots.list({'contain': volume_id})
             for vmstore_snapshot in snapshots:
                 if vmstore_snapshot.get('vmName') == volume_id:
                     snap_uuid = vmstore_snapshot['uuid']['uuid']
@@ -588,7 +593,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param snapshot: snapshot reference
         """
         LOG.info('Deleting snapshot %s', snapshot['name'])
-        snapshots = self.vmstore.snapshots.list()
+        snapshots = self.vmstore.snapshots.list({'contain': snapshot['name']})
         snap_uuid = ''
         for vmstore_snapshot in snapshots:
             if snapshot['name'] == vmstore_snapshot['description']:
@@ -615,7 +620,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """
         LOG.info('Creating volume %(vol)s from snapshot %(snap)s',
                  {'vol': volume['name'], 'snap': snapshot['name']})
-        snapshots = self.vmstore.snapshots.list()
+        snapshots = self.vmstore.snapshots.list({'contain': snapshot['name']})
         snap_uuid = ''
         for vmstore_snapshot in snapshots:
             if snapshot['name'] == vmstore_snapshot['description']:
@@ -624,7 +629,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         current = 1
         while not snap_uuid:
             if current < timeout:
-                snapshots = self.vmstore.snapshots.list()
+                snapshots = self.vmstore.snapshots.list(
+                    {'contain': snapshot['name']})
                 for vmstore_snapshot in snapshots:
                     if snapshot['name'] == vmstore_snapshot['description']:
                         snap_uuid = vmstore_snapshot['uuid']['uuid']
@@ -734,6 +740,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     message=('Could not find VirtualDisk for %s' %
                              src_name))
         vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        vm_uuid = vd[0]['vmUuid']['uuid']
         clone_name = 'clone-%(src_name)s-%(vol_name)s' % {
             'src_name': src_name,
             'vol_name': volume['name']}
@@ -743,21 +750,24 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'file': os.path.join(vmstore_subdir, src_name),
             'vmName': vd[0]['vmName'],
             'description': clone_name,
-            'vmTintriUuid': vd[0]['vmUuid']['uuid'],
+            'vmTintriUuid': vm_uuid,
             'instanceId': vd[0]['instanceUuid'],
             'snapshotCreator': 'Vmstore cinder driver',
             'deletionPolicy': 'DELETE_ON_ZERO_CLONE_REFERENCES'
         }
-        self.vmstore.snapshots.create(payload)
-
-        snapshots = self.vmstore.snapshots.list()
+        resp = self.vmstore.snapshots.create(payload)
         snap_uuid = ''
-        for vmstore_snapshot in snapshots:
-            if clone_name == vmstore_snapshot['description']:
-                snap_uuid = vmstore_snapshot['uuid']['uuid']
+        if resp:
+            snap_uuid = resp[0]
+
+        if not snap_uuid:
+            snapshots = self.vmstore.snapshots.list({'vmUuid': vm_uuid})
+            for vmstore_snapshot in snapshots:
+                if clone_name == vmstore_snapshot['description']:
+                    snap_uuid = vmstore_snapshot['uuid']['uuid']
         if not snap_uuid:
             msg = 'Did not find snapshot %s' % clone_name
-            raise api.VmstoreException(code='NotFound', message=msg)
+            raise api.VmstoreException(code='NotFound', causeDetails=msg)
         vmstore_subdir = self.nas_path.removeprefix('/tintri')
         clone_path = os.path.join(
             vmstore_subdir, clone_name)
@@ -837,12 +847,34 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def get_volume_stats(self, refresh=False) -> dict:
         """Get volume stats.
 
-        If 'refresh' is True, run update the stats first.
+        Stats are cached based on vmstore_stats_cache_period configuration.
         """
         LOG.info('VmstoreNfsDriver get_volume_stats, refresh: %s',
                  refresh)
-        if refresh or not self._stats:
+
+        cache_period = self.configuration.vmstore_stats_cache_period
+        current_time = time.time()
+        cache_age = current_time - self._stats_cache_timestamp
+
+        # Update stats if:
+        # 1. No stats cached yet, OR
+        # 2. Cache is disabled (cache_period == 0), OR
+        # 3. Cache has expired
+        if (not self._stats_cache or
+            cache_period == 0 or
+            cache_age >= cache_period):
+            LOG.debug('Updating volume stats: cache_age=%.2f, '
+                      'cache_period=%d',
+                      cache_age, cache_period)
             self._update_volume_stats()
+            self._stats_cache = self._stats
+            self._stats_cache_timestamp = current_time
+        else:
+            LOG.debug('Using cached volume stats: cache_age=%.2f, '
+                      'cache_period=%d',
+                      cache_age, cache_period)
+            self._stats = self._stats_cache
+
         return self._stats
 
     def _update_volume_stats(self) -> None:
@@ -863,7 +895,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                         stat = os.stat(filepath)
                         # Logical size (The "promised" capacity)
                         provisioned_bytes += stat.st_size
-                        # Physical blocks on disk (The "actual" consumption)
                         total_volumes += 1
                     except OSError:
                         continue
