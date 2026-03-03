@@ -3,7 +3,7 @@
 ## Compatibility matrix
 |Vmstore version|CSI driver version|
 |--- |---|
-|>=6.0.0.1|>=3.0.2|
+|>=6.0.1.1|>=3.0.2|
 
 ## Prerequisites
 Install NFS client
@@ -63,7 +63,9 @@ vmstore_qcow2_volumes = False
 | `vmstore_mount_point_base`    | String  | `$state_path/mnt`     | no       | Base directory containing NFS share mount points.                      |
 | `vmstore_sparsed_volumes`     | Boolean | `True`                | no       | Defines whether the volumes need to be thin-provisioned.               |
 | `vmstore_dataset_description` | String  | -                    | no       | Human-readable description for the backend.                            |
-| `vmstore_refresh_openstack_region` | String  | RegionOne       | yes       | Openstack region for Vmstore hypervisor refresh call.                            |
+| `vmstore_refresh_openstack_region` | String  | ``     | no        | OpenStack region for Vmstore hypervisor refresh call.                 |
+| `vmstore_openstack_hostname` | String  | -                    | no        | OpenStack controller hostname or IP. Used for VMstore hypervisor refresh. If not set, attempts to resolve from Keystone config. |
+| `vmstore_stats_cache_period` | Int  | 59                    | no        | Period in seconds for caching volume statistics. Stats will be refreshed only if the cache is older than this value. Set to 0 to disable caching. |
 
 
 #### Restart Openstack Cinder service
