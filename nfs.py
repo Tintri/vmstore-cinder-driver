@@ -314,7 +314,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             }
             self.vmstore.cinder_refresh.create(payload)
             vd = self.vmstore.virtual_disk.get(volume.name_id)
-            timeout = 30
+            timeout = self.configuration.vmstore_get_vd_timeout
             current = 1
             while len(vd) < 1:
                 if current < timeout:
@@ -558,7 +558,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # per Cinder guidelines
         volume_name_id = volume.name_id
         vd = self.vmstore.virtual_disk.get(volume_name_id)
-        timeout = 30
+        timeout = self.configuration.vmstore_get_vd_timeout
         current = 1
         while len(vd) < 1:
             if current < timeout:
@@ -625,18 +625,21 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         for vmstore_snapshot in snapshots:
             if snapshot['name'] == vmstore_snapshot['description']:
                 snap_uuid = vmstore_snapshot['uuid']['uuid']
-        timeout = 30
+        timeout = self.configuration.vmstore_get_vd_timeout
         current = 1
         while not snap_uuid:
             if current < timeout:
                 snapshots = self.vmstore.snapshots.list(
                     {'contain': snapshot['name']})
+                time.sleep(current)
+                current += 2
                 for vmstore_snapshot in snapshots:
                     if snapshot['name'] == vmstore_snapshot['description']:
                         snap_uuid = vmstore_snapshot['uuid']['uuid']
             else:
                 msg = 'Did not find snapshot %s' % snapshot['name']
                 raise api.VmstoreException(code='NotFound', message=msg)
+
         vmstore_subdir = self.nas_path.removeprefix('/tintri')
         clone_path = os.path.join(
             vmstore_subdir, snapshot['name'])
@@ -725,7 +728,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         src_name = src_vref['name']
         src_id = src_vref.name_id
         vd = self.vmstore.virtual_disk.get(src_id)
-        timeout = 30
+        timeout = self.configuration.vmstore_get_vd_timeout
         current = 1
         while len(vd) < 1:
             if current < timeout:
@@ -733,6 +736,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                          src_id, current)
                 time.sleep(current)
                 current += 2
+                self.refresh_hypervisor(src_vref)
                 vd = self.vmstore.virtual_disk.get(src_id)
             else:
                 raise api.VmstoreException(

@@ -66,6 +66,7 @@ vmstore_qcow2_volumes = False
 | `vmstore_refresh_openstack_region` | String  | ``     | no        | OpenStack region for Vmstore hypervisor refresh call.                 |
 | `vmstore_openstack_hostname` | String  | -                    | no        | OpenStack controller hostname or IP. Used for VMstore hypervisor refresh. If not set, attempts to resolve from Keystone config. |
 | `vmstore_stats_cache_period` | Int  | 59                    | no        | Period in seconds for caching volume statistics. Stats will be refreshed only if the cache is older than this value. Set to 0 to disable caching. |
+| `vmstore_get_vd_timeout` | Int  | 8                    | no        | Specifies the timeout for attempting to get virtual disk of a volume. |
 
 
 #### Restart Openstack Cinder service

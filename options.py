@@ -69,6 +69,10 @@ VMSTORE_CONNECTION_OPTS = [
                help='Specifies the number of times to repeat Vmstore RESTful '
                     'API call to cinder/host/refresh in case of connection '
                     'errors or Vmstore appliance retriable errors.'),
+    cfg.IntOpt('vmstore_get_vd_timeout',
+               default=8,
+               help='Specifies the timeout for attempting to get virtual '
+                    'disk of a volume.'),
 ]
 
 VMSTORE_NFS_OPTS = [

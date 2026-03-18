@@ -498,8 +498,7 @@ class VmstoreProxy(object):
         except Exception:
             return False
 
-        lock = '%s:%s' % (uuid, self.project)
-        lock = lock.encode('utf-8')
+        lock = uuid['uuid'].encode('utf-8')
         self.lock = hashlib.md5(lock, usedforsecurity=False).hexdigest()
         LOG.info('Coordination lock for group %(backend)s: %(lock)s',
                  {'backend': self.backend, 'lock': self.lock})
