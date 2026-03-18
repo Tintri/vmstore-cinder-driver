@@ -95,9 +95,34 @@ VMSTORE_DATASET_OPTS = [
                help='Human-readable description for the backend.')
 ]
 
+VMSTORE_PERF_OPTS = [
+    cfg.IntOpt('vmstore_snapshot_poll_timeout',
+               default=10,
+               help='Maximum time to wait for snapshot detection (seconds). '
+                    'Reduced from 30s to minimize lock hold time.'),
+    cfg.FloatOpt('vmstore_snapshot_poll_initial_delay',
+                 default=0.5,
+                 help='Initial delay between snapshot poll attempts (seconds). '
+                      'Uses exponential backoff up to 5s max.'),
+    cfg.IntOpt('vmstore_virtual_disk_retries',
+               default=3,
+               help='Number of retries for virtual disk lookup before failing.'),
+    cfg.BoolOpt('vmstore_async_hypervisor_refresh',
+                default=True,
+                help='Use asynchronous hypervisor refresh to avoid blocking '
+                     'operations. When enabled, refresh failures are logged '
+                     'but do not fail the operation.'),
+    cfg.BoolOpt('vmstore_use_volume_locks',
+                default=True,
+                help='Use volume-level locks instead of backend-wide locks '
+                     'to allow concurrent operations on different volumes. '
+                     'Set to False for legacy backend-wide locking.'),
+]
+
 VMSTORE_NFS_OPTS += (
     VMSTORE_CONNECTION_OPTS +
-    VMSTORE_DATASET_OPTS
+    VMSTORE_DATASET_OPTS +
+    VMSTORE_PERF_OPTS
 )
 
 CONF = cfg.CONF
