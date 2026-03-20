@@ -36,23 +36,7 @@
 
 ## Testing Infrastructure Requirements
 
-### Minimal Testing Setup (No Full OpenStack Needed)
-
-#### Option 1: Unit Testing with Mocks
-**Infrastructure**: Just your laptop/workstation
-**Requirements**:
-- Python 3.8+
-- Mock/unittest libraries
-- No VMstore appliance needed
-
-**What can be tested**:
-- ✅ Lock key generation logic
-- ✅ Exponential backoff behavior
-- ✅ VMstore API call patterns
-- ✅ Error handling paths
-- ✅ Configuration validation
-
-#### Option 2: Integration Testing with DevStack
+#### Option 1: Integration Testing with DevStack
 **Infrastructure**: Single VM or bare metal server
 **Requirements**:
 - Ubuntu 22.04 LTS (recommended) or Rocky Linux 9
@@ -69,7 +53,7 @@
 - ✅ Lock behavior under load
 - ⚠️ Limited concurrency (single host)
 
-#### Option 3: Full Scale Testing with Real OpenStack
+#### Option 2: Full Scale Testing with Real OpenStack
 **Infrastructure**: Multi-node OpenStack cluster
 **Requirements**:
 - OpenStack deployment (Yoga, Zed, or Antelope release)
@@ -88,185 +72,7 @@
 
 ## Testing Strategy
 
-### Level 1: Unit Tests (1-2 days)
-
-#### Test Environment Setup
-```bash
-cd /home/freddy/work/tintri/vmstore-cinder-driver
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install test dependencies
-pip install pytest pytest-mock pytest-cov mock
-```
-
-#### Create Unit Tests
-Create file: `test_vmstore_nfs_performance.py`
-
-```python
-"""Unit tests for VMstore NFS driver performance optimizations."""
-
-import time
-import unittest
-from unittest import mock
-
-# Mock the Cinder imports
-import sys
-sys.modules['cinder'] = mock.MagicMock()
-sys.modules['cinder.volume'] = mock.MagicMock()
-sys.modules['cinder.volume.drivers'] = mock.MagicMock()
-sys.modules['oslo_config'] = mock.MagicMock()
-sys.modules['oslo_log'] = mock.MagicMock()
-sys.modules['oslo_utils'] = mock.MagicMock()
-sys.modules['oslo_concurrency'] = mock.MagicMock()
-sys.modules['os_brick'] = mock.MagicMock()
-sys.modules['os_brick.remotefs'] = mock.MagicMock()
-
-# Now import your driver
-from nfs import VmstoreNfsDriver
-
-
-class TestLockKeyGeneration(unittest.TestCase):
-    """Test volume and snapshot lock key generation."""
-    
-    @mock.patch('nfs.processutils')
-    def setUp(self, mock_processutils):
-        """Set up test driver instance."""
-        self.config = mock.MagicMock()
-        self.config.vmstore_use_volume_locks = True
-        self.driver = VmstoreNfsDriver()
-        self.driver.configuration = self.config
-        self.driver.vmstore = mock.MagicMock()
-        self.driver.vmstore.lock = 'backend-uuid-123'
-    
-    def test_volume_specific_lock_key(self):
-        """Test volume-specific lock key is different for different volumes."""
-        volume_id_1 = 'vol-123'
-        volume_id_2 = 'vol-456'
-        
-        lock_1 = self.driver._get_volume_lock_key(volume_id_1)
-        lock_2 = self.driver._get_volume_lock_key(volume_id_2)
-        
-        self.assertNotEqual(lock_1, lock_2)
-        self.assertIn('volume', lock_1)
-        self.assertIn(volume_id_1, lock_1)
-        self.assertIn('backend-uuid-123', lock_1)
-    
-    def test_backend_wide_lock_fallback(self):
-        """Test fallback to backend-wide lock when disabled."""
-        self.config.vmstore_use_volume_locks = False
-        
-        lock = self.driver._get_volume_lock_key('any-volume')
-        
-        self.assertEqual(lock, 'backend-uuid-123')
-
-
-class TestExponentialBackoff(unittest.TestCase):
-    """Test exponential backoff in polling loops."""
-    
-    @mock.patch('nfs.processutils')
-    @mock.patch('time.sleep')
-    def setUp(self, mock_sleep, mock_processutils):
-        """Set up test driver instance."""
-        self.mock_sleep = mock_sleep
-        self.config = mock.MagicMock()
-        self.config.vmstore_snapshot_poll_timeout = 10
-        self.config.vmstore_snapshot_poll_initial_delay = 0.5
-        self.driver = VmstoreNfsDriver()
-        self.driver.configuration = self.config
-        self.driver.vmstore = mock.MagicMock()
-    
-    def test_snapshot_polling_uses_exponential_backoff(self):
-        """Test that polling uses exponential backoff."""
-        # Mock: snapshot not found in first 2 calls, found in 3rd
-        self.driver.vmstore.snapshots.list.side_effect = [
-            [],  # First attempt
-            [],  # Second attempt
-            [{'description': 'test-snap', 'uuid': {'uuid': 'snap-123'}}]  # Found
-        ]
-        
-        result = self.driver._wait_for_snapshot('test-snap')
-        
-        self.assertEqual(result, 'snap-123')
-        # Should have slept with increasing delays
-        self.assertEqual(self.mock_sleep.call_count, 2)
-        # First sleep: 0.5s, second sleep: 1.0s (exponential)
-        calls = [call[0][0] for call in self.mock_sleep.call_args_list]
-        self.assertEqual(calls[0], 0.5)
-        self.assertEqual(calls[1], 1.0)
-    
-    def test_snapshot_polling_timeout(self):
-        """Test that polling respects timeout."""
-        # Mock: snapshot never found
-        self.driver.vmstore.snapshots.list.return_value = []
-        
-        result = self.driver._wait_for_snapshot('test-snap', timeout=2)
-        
-        self.assertIsNone(result)
-
-
-class TestAsyncHypervisorRefresh(unittest.TestCase):
-    """Test async hypervisor refresh behavior."""
-    
-    @mock.patch('nfs.processutils')
-    def setUp(self, mock_processutils):
-        """Set up test driver instance."""
-        self.config = mock.MagicMock()
-        self.config.vmstore_async_hypervisor_refresh = True
-        self.config.vmstore_refresh_openstack_region = 'RegionOne'
-        self.config.safe_get.return_value = 'controller.local'
-        self.driver = VmstoreNfsDriver()
-        self.driver.configuration = self.config
-        self.driver.vmstore = mock.MagicMock()
-        self.driver.nas_path = '/tintri/cinder'
-    
-    def test_async_refresh_does_not_block(self):
-        """Test async refresh returns immediately without waiting."""
-        volume = {'name': 'vol-1', 'name_id': 'vol-uuid-1'}
-        
-        # Should not call virtual_disk.get in async mode
-        self.driver.refresh_hypervisor(volume, block=False)
-        
-        self.driver.vmstore.cinder_refresh.create.assert_called_once()
-        self.driver.vmstore.virtual_disk.get.assert_not_called()
-    
-    def test_blocking_refresh_waits_for_vd(self):
-        """Test blocking refresh waits for virtual disk."""
-        volume = {'name': 'vol-1', 'name_id': 'vol-uuid-1'}
-        self.driver._get_virtual_disk_with_retry = mock.MagicMock(
-            return_value=[{'vmName': 'vol-1'}]
-        )
-        
-        self.driver.refresh_hypervisor(volume, block=True)
-        
-        self.driver._get_virtual_disk_with_retry.assert_called_once()
-
-
-if __name__ == '__main__':
-    unittest.main()
-```
-
-#### Run Unit Tests
-```bash
-# Run tests with coverage
-pytest test_vmstore_nfs_performance.py -v --cov=nfs --cov-report=html
-
-# View coverage report
-open htmlcov/index.html
-```
-
-**Expected Results**:
-- All tests pass
-- >80% code coverage on new methods
-- Confirms lock key generation logic works
-- Confirms exponential backoff behavior
-- Confirms async/sync modes work correctly
-
----
-
-### Level 2: DevStack Integration Testing (3-5 days)
+### Level 1: DevStack Integration Testing (3-5 days)
 
 #### Infrastructure Setup
 
@@ -420,7 +226,7 @@ openstack volume list --status available | grep clone | wc -l
 
 ---
 
-### Level 3: Performance Benchmarking (1 week)
+### Level 2: Performance Benchmarking (1 week)
 
 #### Infrastructure: Production-Like OpenStack
 
@@ -677,10 +483,8 @@ If issues arise:
 
 ## Next Steps
 
-1. **Week 1**: Run unit tests (Level 1)
-2. **Week 2**: Deploy DevStack and run functional tests (Level 2)
-3. **Week 3**: Conduct stress tests on DevStack
-4. **Week 4**: Deploy to staging/production and run Rally benchmarks (Level 3)
-5. **Week 5**: Monitor production metrics and tune parameters
+1. **Week 1**: Deploy DevStack and run functional tests (Level 2)
+2. **Week 1**: Conduct stress tests on DevStack
+3. **Week 2**: Deploy to staging/production and run Rally benchmarks (Level 3)
+4. **Week 2**: Monitor production metrics and tune parameters
 
-**Recommended Starting Point**: Begin with Level 1 (Unit Tests) to validate logic, then proceed to DevStack for integration testing.
