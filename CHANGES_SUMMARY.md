@@ -1,8 +1,8 @@
-# VMstore Cinder Driver - Performance Improvements (v3.0.7 → v3.0.8)
+# VMstore Cinder Driver - Performance Improvements (v3.0.7 → v3.0.7a)
 
 ## Summary of Changes
 
-This document describes the performance optimizations implemented in **v3.0.8** of the VMstore Cinder NFS driver. These changes represent a major performance upgrade from v3.0.7, focusing on:
+This document describes the performance optimizations implemented in **v3.0.7a** of the VMstore Cinder NFS driver. These changes represent a major performance upgrade from v3.0.7, focusing on:
 
 1. **Granular Locking** - Volume/snapshot-level locks instead of backend-wide serialization
 2. **Exponential Backoff** - Intelligent polling with reduced API load  
@@ -14,9 +14,9 @@ This document describes the performance optimizations implemented in **v3.0.8** 
 
 ---
 
-## Quick Comparison: v3.0.7 vs v3.0.8
+## Quick Comparison: v3.0.7 vs v3.0.7a
 
-| Feature | v3.0.7 | v3.0.8 | Benefit |
+| Feature | v3.0.7 | v3.0.7a | Benefit |
 |---------|--------|--------|---------|
 | **Locking** | Backend-wide (`self.vmstore.lock`) | Volume/snapshot-level | 10-50x concurrency |
 | **initialize_connection** | Has lock | No lock | Never blocked |
@@ -42,7 +42,7 @@ This document describes the performance optimizations implemented in **v3.0.8** 
 - Fixed undefined `self.project` in api.py lock key (now uses appliance UUID only)  
 - Added `vmstore_get_vd_timeout` config option  
 
-**v3.0.8** - Performance optimization release (Current)  
+**v3.0.7a** - Performance optimization release (Current)  
 - Added **exponential backoff with jitter** to snapshot polling and virtual disk retrieval  
 - Reduces load on appliance and avoids thundering herd issues  
 - Implemented **volume-level and snapshot-level locks** (replaces backend-wide locking)  
@@ -53,7 +53,7 @@ This document describes the performance optimizations implemented in **v3.0.8** 
 - Ensured locks are **not held during backoff sleep periods** for better concurrency  
 - Removed lock from `initialize_connection()` (read-only operation)
 
-## Quick Reference - What Changed in v3.0.8
+## Quick Reference - What Changed in v3.0.7a
 
 #### 🔒 Lock Granularity (Biggest Impact)
 **Before (v3.0.7)**: Single backend-wide lock for ALL operations
@@ -68,7 +68,7 @@ def create_snapshot(...)  # All snapshots serialized
 def create_cloned_volume(...)  # All clones serialized
 ```
 
-**After (v3.0.8)**: Volume-level, snapshot-level, or no locks
+**After (v3.0.7a)**: Volume-level, snapshot-level, or no locks
 ```python
 # Read-only: No lock needed
 def initialize_connection(...)  # Never blocked
@@ -100,7 +100,7 @@ while len(vd) < 1:
         current += 2
 ```
 
-**After (v3.0.8)**: Exponential backoff with caps
+**After (v3.0.7a)**: Exponential backoff with caps
 ```python
 # New _wait_for_snapshot() and _get_virtual_disk_with_retry()
 delay = 0.5  # Initial delay from config
@@ -125,7 +125,7 @@ def create_cloned_volume(...):
     # Lock held entire time
 ```
 
-**After (v3.0.8)**: Fire-and-forget async refresh (configurable)
+**After (v3.0.7a)**: Fire-and-forget async refresh (configurable)
 ```python
 def _create_cloned_volume_locked(...):
     # ... create clone ...
@@ -149,7 +149,7 @@ def _create_cloned_volume_locked(...):
 # No explicit timeout, relied on attempt counters
 ```
 
-**After (v3.0.8)**: Configurable 10-second default with faster cycles
+**After (v3.0.7a)**: Configurable 10-second default with faster cycles
 ```python
 vmstore_snapshot_poll_timeout = 10  # Fast failure detection
 vmstore_snapshot_poll_initial_delay = 0.5  # Quick first check
@@ -173,7 +173,7 @@ if not snap_uuid:
             snap_uuid = vmstore_snapshot['uuid']['uuid']
 ```
 
-**After (v3.0.8)**: Try response first, then optimized polling
+**After (v3.0.7a)**: Try response first, then optimized polling
 ```python
 resp = self.vmstore.snapshots.create(payload)
 # Try multiple response formats
@@ -197,7 +197,7 @@ if not snap_uuid:
 
 ## Configuration Reference
 
-### New Options Added in v3.0.8 (options.py)
+### New Options Added in v3.0.7a (options.py)
 
 All new options are in the `VMSTORE_PERF_OPTS` section:
 
@@ -240,7 +240,7 @@ vmstore_use_volume_locks = True
 ### Configuration Removed from v3.0.7
 
 ```python
-vmstore_get_vd_timeout = 8  # REMOVED in v3.0.8
+vmstore_get_vd_timeout = 8  # REMOVED in v3.0.7a
     # Replaced by vmstore_virtual_disk_retries (more predictable behavior)
 ```
 
@@ -336,9 +336,9 @@ T3:              [Snapshot Vol D waits.......................] [Snapshot blocked
 ```
 **Problem**: All operations serialized. One slow clone blocks everything.
 
-### v3.0.8: Volume/Snapshot-Level Locks (Parallel)
+### v3.0.7a: Volume/Snapshot-Level Locks (Parallel)
 ```
-Operation Locks in v3.0.8:
+Operation Locks in v3.0.7a:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 initialize_connection()       NO LOCK (read-only operation)
 create_snapshot()             @synchronized('{self._get_volume_lock_key(volume.id)}')
@@ -390,7 +390,7 @@ Result: ALL RUN IN PARALLEL
 
 ## Code Changes Summary
 
-### Version 3.0.7 → 3.0.8 Changes
+### Version 3.0.7 → 3.0.7a Changes
 
 #### Files Modified
 
@@ -422,7 +422,7 @@ Result: ALL RUN IN PARALLEL
 **REMOVED Methods (1):**
    - `_wait_for_virtual_disk(volume)` - Replaced by `_get_virtual_disk_with_retry()` + `_get_virtual_disk_or_refresh()`
 
-**3. `api.py`** - No changes (v3.0.7 → v3.0.8)
+**3. `api.py`** - No changes (v3.0.7 → v3.0.7a)
 
 ### Lock Decorator Changes
 
@@ -432,7 +432,7 @@ Result: ALL RUN IN PARALLEL
 def initialize_connection(...)
 ```
 
-**After (v3.0.8)** - Granular locks or no locks:
+**After (v3.0.7a)** - Granular locks or no locks:
 ```python
 # Read-only: No lock
 def initialize_connection(...)
@@ -458,7 +458,7 @@ def delete_snapshot(...)
 
 ### Log Messages to Watch For
 
-**Success Indicators (v3.0.8)**:
+**Success Indicators (v3.0.7a)**:
 ```
 # Optimized snapshot polling
 Found snapshot clone-vol-123-vol-456 after 0.75 seconds
@@ -466,7 +466,7 @@ Found snapshot clone-vol-123-vol-456 after 0.75 seconds
 # Virtual disk retry
 Found virtual disk for vol-789 on attempt 1
 
-# Async refresh (new in v3.0.8)
+# Async refresh (new in v3.0.7a)
 Async hypervisor refresh initiated for vol-abc-123
 Refreshing hypervisor for volume vol-xyz-456 (blocking=False)
 
@@ -490,7 +490,7 @@ Found virtual disk for vol-456 on attempt 3
 
 **Lock Behavior** (if `vmstore_use_volume_locks=True`):
 ```
-# Volume-specific locks (v3.0.8) - different volumes run in parallel
+# Volume-specific locks (v3.0.7a) - different volumes run in parallel
 coordinator: Lock acquired: backend-uuid-123:volume:vol-456
 coordinator: Lock acquired: backend-uuid-123:volume:vol-789  # PARALLEL!
 coordinator: Lock released: backend-uuid-123:volume:vol-456
@@ -571,7 +571,7 @@ vmstore_snapshot_poll_initial_delay = 0.5
 
 **Issue**: Want to revert to v3.0.7 behavior completely
 ```ini
-# Disable all v3.0.8 features:
+# Disable all v3.0.7a features:
 vmstore_use_volume_locks = False  # Backend-wide locks
 vmstore_async_hypervisor_refresh = False  # Blocking refresh
 vmstore_snapshot_poll_timeout = 30  # Longer timeout
@@ -605,7 +605,7 @@ See `TESTING.md` section "Rollback Plan"
 
 ## Version Compatibility
 
-- **Driver Version**: v3.0.8 (upgraded from v3.0.7)
+- **Driver Version**: v3.0.7a (upgraded from v3.0.7)
 - **Cinder Version**: Tested with Yoga, Zed, Antelope (2023.1, 2023.2, 2024.1)
 - **VMstore Version**: Requires >=6.0.1.1 (same as v3.0.7)
 - **Python**: 3.8, 3.9, 3.10, 3.11

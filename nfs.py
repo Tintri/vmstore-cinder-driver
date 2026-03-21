@@ -72,7 +72,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
               check). Fix undefined self.project in api.py lock key
               (now uses appliance UUID only). Add vmstore_get_vd_timeout
               config option.
-        3.0.8 - Add exponential backoff with jitter to snapshot polling and
+        3.0.7a - Add exponential backoff with jitter to snapshot polling and
               virtual disk retrieval to reduce load on appliance and avoid
                 thundering herd issues. Add more detailed logging around these
                 operations to aid in troubleshooting. Add configuration options
@@ -80,7 +80,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 not held during backoff sleep periods to allow better concurrency.
     """
 
-    VERSION = '3.0.8'
+    VERSION = '3.0.7a'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
