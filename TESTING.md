@@ -16,8 +16,7 @@
 - **Added** proper `time.sleep()` in all polling loops
 
 ### Phase 3: Async Operations ✅
-- **Made** `refresh_hypervisor()` support async mode (default: enabled)
-- **Configurable** via `vmstore_async_hypervisor_refresh` (default: True)
+- **Made** `refresh_hypervisor()` support async mode 
 - **Changed** clone operations to use non-blocking refresh
 
 ### Phase 4: REST API Optimization ✅
@@ -29,7 +28,6 @@
 - `vmstore_snapshot_poll_timeout`: 10s (was 30s)
 - `vmstore_snapshot_poll_initial_delay`: 0.5s
 - `vmstore_virtual_disk_retries`: 3
-- `vmstore_async_hypervisor_refresh`: True
 - `vmstore_use_volume_locks`: True
 
 ---
@@ -116,7 +114,6 @@ vmstore_rest_address = <VMSTORE_MGMT_IP>
 vmstore_qcow2_volumes = False
 
 # Performance tuning (enable new features)
-vmstore_async_hypervisor_refresh = True
 vmstore_use_volume_locks = True
 vmstore_snapshot_poll_timeout = 10
 vmstore_snapshot_poll_initial_delay = 0.5
@@ -459,20 +456,14 @@ If issues arise:
    vmstore_use_volume_locks = False
    ```
 
-2. **Disable async refresh** (use blocking mode):
-   ```ini
-   [vmstore]
-   vmstore_async_hypervisor_refresh = False
-   ```
-
-3. **Increase timeouts** (if polling fails):
+2. **Increase timeouts** (if polling fails):
    ```ini
    [vmstore]
    vmstore_snapshot_poll_timeout = 30
    vmstore_virtual_disk_retries = 5
    ```
 
-4. **Full rollback**:
+3. **Full rollback**:
    ```bash
    git checkout main  # or previous stable branch
    # Redeploy old driver code

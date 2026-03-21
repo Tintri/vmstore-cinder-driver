@@ -134,9 +134,7 @@ def _create_cloned_volume_locked(...):
 ```
 
 **refresh_hypervisor() modes:**
-- `block=True`: Wait for virtual disk (old behavior)
-- `block=False`: Fire and forget (new default)
-- `block=None`: Use config `vmstore_async_hypervisor_refresh`
+- Fire and forget (new default)
 
 **Impact**:
 - Lock released **immediately** after VMstore operation
@@ -220,14 +218,6 @@ vmstore_virtual_disk_retries = 3
     # Each retry uses exponential backoff: 0.5s → 1s → 2s
     # Replaces vmstore_get_vd_timeout from v3.0.7
 
-# Async Operations
-vmstore_async_hypervisor_refresh = True
-    # Enable non-blocking hypervisor refresh
-    # Default: True (async enabled)
-    # When True: refresh_hypervisor() returns immediately, errors logged
-    # When False: refresh_hypervisor() waits for virtual disk (v3.0.7 behavior)
-    # Set to False if seeing hypervisor consistency issues
-
 # Lock Granularity
 vmstore_use_volume_locks = True
     # Use volume/snapshot-level locks instead of backend-wide locking
@@ -252,7 +242,6 @@ vmstore_get_vd_timeout = 8  # REMOVED in v3.0.7a
 # ... existing config ...
 
 # Performance tuning
-vmstore_async_hypervisor_refresh = True
 vmstore_use_volume_locks = True
 vmstore_snapshot_poll_timeout = 10
 vmstore_snapshot_poll_initial_delay = 0.5
@@ -268,7 +257,6 @@ vmstore_stats_cache_period = 59
 # ... existing config ...
 
 # Conservative settings
-vmstore_async_hypervisor_refresh = False  # Blocking mode
 vmstore_use_volume_locks = True  # Still use volume locks
 vmstore_snapshot_poll_timeout = 15  # Longer timeout
 vmstore_snapshot_poll_initial_delay = 1.0
@@ -281,7 +269,6 @@ vmstore_virtual_disk_retries = 5
 # ... existing config ...
 
 # Disable all new features
-vmstore_async_hypervisor_refresh = False
 vmstore_use_volume_locks = False  # Backend-wide locks
 vmstore_snapshot_poll_timeout = 30  # Original timeout
 vmstore_snapshot_poll_initial_delay = 1.0
@@ -398,7 +385,6 @@ Result: ALL RUN IN PARALLEL
    - `vmstore_snapshot_poll_timeout` (default: 10, reduced from implicit 30s)
    - `vmstore_snapshot_poll_initial_delay` (default: 0.5)
    - `vmstore_virtual_disk_retries` (default: 3)
-   - `vmstore_async_hypervisor_refresh` (default: True)
    - `vmstore_use_volume_locks` (default: True)
    - **Removed** `vmstore_get_vd_timeout` from v3.0.7
 
@@ -509,9 +495,6 @@ coordinator: Lock acquired: backend-uuid-123  # Serialized!
 # In async mode (default), refresh errors just logged:
 Async hypervisor refresh failed for vol-123: Connection timeout
 
-# In blocking mode (vmstore_async_hypervisor_refresh=False):
-Hypervisor refresh failed for vol-123: Connection timeout
-# (operation would fail)
 ```
 
 ### Troubleshooting
@@ -536,7 +519,6 @@ INFO: Virtual disk not found, refreshing hypervisor for vol-456
 3. Consider blocking refresh for problematic volumes
 ```ini
 vmstore_virtual_disk_retries = 5  # Increase from default 3
-vmstore_async_hypervisor_refresh = False  # Use blocking mode
 ```
 
 **Issue**: High lock contention (seeing v3.0.7-style serialization)
@@ -555,16 +537,13 @@ vmstore_use_volume_locks = True  # Should be True (default)
 ```
 WARNING: Async hypervisor refresh failed for vol-123: API timeout
 ```
-**Solution**: This is normal in async mode. If problematic:
-```ini
-vmstore_async_hypervisor_refresh = False  # Switch to blocking mode
-```
+**Solution**: This is normal in async mode. If problematic must review logic with fire and forget refresh.
+
 
 **Issue**: Operations seem slower than v3.0.7
 ```ini
 # Verify these are enabled (they should be by default):
 vmstore_use_volume_locks = True
-vmstore_async_hypervisor_refresh = True
 vmstore_snapshot_poll_timeout = 10
 vmstore_snapshot_poll_initial_delay = 0.5
 ```
@@ -573,7 +552,6 @@ vmstore_snapshot_poll_initial_delay = 0.5
 ```ini
 # Disable all v3.0.7a features:
 vmstore_use_volume_locks = False  # Backend-wide locks
-vmstore_async_hypervisor_refresh = False  # Blocking refresh
 vmstore_snapshot_poll_timeout = 30  # Longer timeout
 vmstore_snapshot_poll_initial_delay = 1.0  # Slower first check
 vmstore_virtual_disk_retries = 5  # More retries
@@ -615,7 +593,6 @@ See `TESTING.md` section "Rollback Plan"
 
 **Automatic compatibility**: All new options have defaults that provide performance improvements while maintaining stability:
 - `vmstore_use_volume_locks=True` - Safe, huge perf boost
-- `vmstore_async_hypervisor_refresh=True` - Safe, errors logged only
 - `vmstore_snapshot_poll_timeout=10` - Reduced from implicit 30s
 - `vmstore_snapshot_poll_initial_delay=0.5` - Faster first check
 - `vmstore_virtual_disk_retries=3` - Replaces old timeout logic
@@ -635,9 +612,8 @@ See `TESTING.md` section "Rollback Plan"
 **Performance Not Improving?**
 1. Verify `vmstore_use_volume_locks = True` is set
 2. Check lock messages in logs (should see volume-specific keys)
-3. Ensure `vmstore_async_hypervisor_refresh = True`
-4. Review VMstore appliance performance
-5. Check network latency between Cinder and VMstore
+3. Review VMstore appliance performance
+4. Check network latency between Cinder and VMstore
 
 **Breaking Something?**
 1. Check `get_errors` output during deployment

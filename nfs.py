@@ -206,64 +206,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                    {'name': snapshot_name, 'timeout': timeout})
         return None
 
-    def _get_virtual_disk_with_retry(self, volume_id, volume_name=None):
-        """Get virtual disk with exponential backoff retry.
-        
-        This is an improvement on previous version 3.0.7 _wait_for_virtual_disk to reduce load on appliance 
-        and avoid thundering herd issues.
-
-        :param volume_id: Volume name_id (UUID)
-        :param volume_name: Optional volume name for logging
-        :returns: Virtual disk info or None
-        """
-        max_retries = self.configuration.vmstore_virtual_disk_retries
-        delay = 0.5
-        
-        for attempt in range(max_retries):
-            vd = self.vmstore.virtual_disk.get(volume_id)
-            if vd:
-                LOG.debug('Found virtual disk for %(id)s on attempt %(attempt)s',
-                         {'id': volume_name or volume_id, 'attempt': attempt + 1})
-                return vd
-            
-            if attempt < max_retries - 1:
-                LOG.debug('Virtual disk for %(id)s not found, retry %(attempt)s/%(max)s '
-                         'after %(delay).2f seconds',
-                         {'id': volume_name or volume_id, 'attempt': attempt + 1,
-                          'max': max_retries, 'delay': delay})
-                time.sleep(delay)
-                delay *= 2  # Exponential backoff
-        
-        LOG.warning('Virtual disk for %(id)s not found after %(retries)s retries',
-                   {'id': volume_name or volume_id, 'retries': max_retries})
-        return None
-
-    def _get_virtual_disk_or_refresh(self, volume_id, volume, volume_name=None):
-        """Get virtual disk with retry and fallback to hypervisor refresh.
-        
-        First attempts to get the virtual disk using exponential backoff retry.
-        If not found, triggers a hypervisor refresh and tries once more.
-        
-        :param volume_id: Volume name_id (UUID) to retrieve
-        :param volume: Volume object for hypervisor refresh
-        :param volume_name: Optional volume name for logging
-        :returns: Virtual disk info
-        :raises: VmstoreException if virtual disk not found after all attempts
-        """
-        # Try with exponential backoff retry
-        vd = self._get_virtual_disk_with_retry(volume_id, volume_name)   
-        if not vd:
-            # Try refresh and one more attempt
-            LOG.info('Virtual disk not found, refreshing hypervisor for %s', 
-                     volume_name or volume.get('name') or volume_id)
-            self.refresh_hypervisor(volume, block=True)
-            vd = self.vmstore.virtual_disk.get(volume_id)         
-            if not vd:
-                raise api.VmstoreException(
-                    code='NotFound',
-                    message=f'Could not find VirtualDisk for {volume_name or volume.get("name") or volume_id}')
-        return vd
-
     def do_setup(self, ctxt) -> None:
         LOG.info('VmstoreNfsDriver do_setup for context: %s', ctxt)
         self.ctxt = ctxt
@@ -425,19 +367,13 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                           {'attempt': attempt, 'exc': e})
                 time.sleep(1)
 
-    def refresh_hypervisor(self, volume, block=None):
+    def refresh_hypervisor(self, volume):
         """Refresh VMstore hypervisor for the given volume.
 
         :param volume: volume reference
-        :param block: If True, wait for completion. If False, fire and forget.
-                     If None, uses configuration default.
         """
-        if block is None:
-            # Default: use async mode from configuration
-            block = not self.configuration.vmstore_async_hypervisor_refresh
         
-        LOG.info('Refreshing hypervisor for volume %(vol)s (blocking=%(block)s)',
-                {'vol': volume.name_id, 'block': block})
+        LOG.info('Refreshing hypervisor for volume %(vol)s', {'vol': volume.name_id})
         
         try:
             vmstore_subdir = self.nas_path.removeprefix('/tintri/')
@@ -462,38 +398,47 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             
             # Call refresh API
             self.vmstore.cinder_refresh.create(payload)
-            
-            if not block:
-                # Async mode: don't wait for virtual disk to appear
-                LOG.debug('Async hypervisor refresh initiated for %s', volume.name_id)
-                return
-            
-            # Blocking mode: wait for virtual disk with retry
-            vd = self._get_virtual_disk_with_retry(volume.name_id, volume.get('name'))
-            if not vd:
-                # Try one more refresh call
-                LOG.info('Retrying hypervisor refresh for %s', volume.name_id)
-                self.vmstore.cinder_refresh.create(payload)
-                time.sleep(2)
-                vd = self.vmstore.virtual_disk.get(volume.name_id)
-                
-                if not vd:
-                    raise api.VmstoreException(
-                        code='NotFound',
-                        message=f'Could not find VirtualDisk for {volume["name"]}')
-            
-            LOG.debug('Hypervisor refresh completed for %s', volume.name_id)
+            LOG.debug('Async hypervisor refresh initiated for %s', volume.name_id)
+            return
             
         except Exception as e:
-            if block:
-                # In blocking mode, propagate errors
-                LOG.error("Hypervisor refresh failed for %(vol)s: %(err)s",
-                         {'vol': volume.name_id, 'err': e})
-                raise
-            else:
-                # In async mode, just log and continue
-                LOG.warning("Async hypervisor refresh failed for %(vol)s: %(err)s",
-                           {'vol': volume.name_id, 'err': e})
+            # In async mode, just log and continue
+            LOG.warning("Async hypervisor refresh failed for %(vol)s: %(err)s",
+                        {'vol': volume.name_id, 'err': e})
+
+    def _get_virtual_disk_with_retry(self, volume):
+        """Get virtual disk with exponential backoff retry
+        and refresh hypervisor if not found.
+        
+        This is an improvement on previous version 3.0.7 _wait_for_virtual_disk to reduce load on appliance 
+        and avoid thundering herd issues.
+
+        :param volume: volume reference
+        :returns: Virtual disk info or None
+        """
+        max_retries = self.configuration.vmstore_virtual_disk_retries
+        delay = 0.5
+        for attempt in range(max_retries):
+            vd = self.vmstore.virtual_disk.get(volume.name_id)
+            if vd:
+                LOG.debug('Found virtual disk for %(id)s on attempt %(attempt)s',
+                         {'id': volume.name_id, 'attempt': attempt + 1})
+                return vd
+            
+            if attempt < max_retries - 1:
+                LOG.debug('Virtual disk for %(id)s not found, retry %(attempt)s/%(max)s '
+                         'after %(delay).2f seconds',
+                         {'id': volume.name_id, 'attempt': attempt + 1,
+                          'max': max_retries, 'delay': delay})
+                # Try refresh call
+                LOG.info('VirtualDisk for %s not found, sleeping %d', volume.name_id, delay)
+                self.refresh_hypervisor(volume)
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+        
+        LOG.warning('Virtual disk for %(name)s not found after %(retries)s retries',
+                   {'name': volume['name'], 'retries': max_retries})
+        return None
 
     def create_volume(self, volume: objects.Volume) -> dict:
         """Creates a volume.
@@ -713,7 +658,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """Creates a snapshot.
 
         VirtualDisk discovery is performed outside the coordination lock
-        via _wait_for_virtual_disk() to avoid blocking other Cinder workers
+        via _get_virtual_disk_with_retry() to avoid blocking other Cinder workers
         during potentially long VMstore cache population waits.
 
         :param snapshot: snapshot reference
@@ -721,8 +666,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.info('Creating snapshot %s', snapshot['name'])
         volume = snapshot.volume
         
-        # Get virtual disk with retry and fallback to hypervisor refresh
-        vd = self._get_virtual_disk_or_refresh(volume.name_id, volume, volume['name'])
+        # Get virtual disk with retry and hypervisor refresh
+        vd = self._get_virtual_disk_with_retry(volume)
         self._create_snapshot_locked(snapshot, vd)
 
     @coordination.synchronized('{self._get_volume_lock_key(snapshot.volume.id)}')
@@ -830,7 +775,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  {'src': temp_clone_path, 'dst': clone_destination})
 
         # Async refresh - don't block waiting for hypervisor
-        self.refresh_hypervisor(volume, block=False)
+        self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
         return {'provider_location': volume.provider_location}
 
@@ -886,7 +831,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """Creates a clone of the specified volume.
 
         VirtualDisk discovery is performed outside the coordination lock
-        via _wait_for_virtual_disk() to avoid blocking other Cinder workers
+        via _get_virtual_disk_with_retry() to avoid blocking other Cinder workers
         during potentially long VMstore cache population waits.
 
         :param volume: new volume reference
@@ -894,11 +839,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """
         LOG.info('Creating cloned volume %(vol)s from source %(src)s',
                  {'vol': volume['name'], 'src': src_vref['name']})
-        src_name = src_vref['name']
-        src_id = src_vref.name_id
         
-        # Get virtual disk with retry and fallback to hypervisor refresh
-        vd = self._get_virtual_disk_or_refresh(src_id, src_vref, src_name)
+        # Get virtual disk with retry and hypervisor refresh
+        vd = self._get_virtual_disk_with_retry(src_vref)
         return self._create_cloned_volume_locked(volume, src_vref, vd)
 
     @coordination.synchronized('{self._get_volume_lock_key(src_vref.id)}')
@@ -919,11 +862,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param vd: virtual disk info for the source volume
         """
         LOG.info('Creating cloned volume %(vol)s from source %(src)s',
-                 {'vol': volume['name'], 'src': src_vref['name']})
+                 {'vol': volume.name_id, 'src': src_vref['name']})
         
         src_name = src_vref['name']
         vm_uuid = vd[0]['vmUuid']['uuid']
-        clone_name = f'clone-{src_name}-{volume["name"]}'
+        clone_name = f'clone-{src_name}-{volume.name_id}'
         vmstore_subdir = self.nas_path.removeprefix('/tintri/')
         
         # Create snapshot for cloning
@@ -992,7 +935,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  {'src': temp_clone_path, 'dst': clone_destination})
 
         # Async refresh - don't block waiting for hypervisor
-        self.refresh_hypervisor(volume, block=False)
+        self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
         
         LOG.info('Successfully created cloned volume %(vol)s from %(src)s',
