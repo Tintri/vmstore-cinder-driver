@@ -1,0 +1,12 @@
+{
+  "uuid": {
+    "uuid": "{{randomValue type='UUID'}}"
+  },
+  "name": "{{jsonPath request.body '$.name'}}",
+  "size": 10,
+  "status": "ONLINE",
+  "snapshot": true,
+  "thin": true,
+  "createTime": "{{now format='yyyy-MM-dd'T'HH:mm:ss.SSSZ'}}",
+  "parentVolumeUuid": "{{jsonPath request.body '$.parentVolumeUuid'}}"
+}

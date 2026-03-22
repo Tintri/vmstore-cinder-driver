@@ -1,0 +1,17 @@
+{
+  "uuid": {
+    "uuid": "{{randomValue type='UUID'}}"
+  },
+  "name": "{{jsonPath request.body '$.name'}}",
+  "size": {{jsonPath request.body '$.sizeInGb'}},
+  "status": "ONLINE",
+  "provisionedSize": "{{jsonPath request.body '$.sizeInGb'}}",
+  "usedSize": 0,
+  "snapshot": false,
+  "thin": true,
+  "createTime": "{{now format='yyyy-MM-dd HH:mm:ss'}}",
+  "modifiedTime": "{{now format='yyyy-MM-dd HH:mm:ss'}}",
+  "datastore": {
+    "uuid": "datastore-001"
+  }
+}
