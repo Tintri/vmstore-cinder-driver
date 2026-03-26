@@ -671,7 +671,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # Get virtual disk with retry and hypervisor refresh
         vd = self._get_virtual_disk_with_retry(volume)
-        lock_key = self._get_snapshot_lock_key(volume.id)
+        lock_key = self._get_snapshot_lock_key(snapshot.id)
         self._create_snapshot_locked(snapshot, vd, lock_key)
 
     @coordination.synchronized('{lock_key}')
