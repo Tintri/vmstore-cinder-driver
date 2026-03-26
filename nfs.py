@@ -78,9 +78,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 operations to aid in troubleshooting. Add configuration options
                 for tuning backoff parameters and timeouts. Ensure that locks are
                 not held during backoff sleep periods to allow better concurrency.
+        3.0.7b - Fix lock_key parameter in create_snapshot.   
     """
 
-    VERSION = '3.0.7a'
+    VERSION = '3.0.7b'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
