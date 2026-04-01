@@ -79,9 +79,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 for tuning backoff parameters and timeouts. Ensure that locks are
                 not held during backoff sleep periods to allow better concurrency.
         3.0.7b - Fix lock_key parameter in create_snapshot.   
+        3.0.7c - Fix create_volume_from_snapshot to use unique clone name.
     """
 
-    VERSION = '3.0.7b'
+    VERSION = '3.0.7c'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -776,7 +777,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             raise api.VmstoreException(code='NotFound', message=msg)
 
         vmstore_subdir = self.nas_path.removeprefix('/tintri')
-        clone_path = os.path.join(vmstore_subdir, snapshot['name'])
+        clone_name = f'{snapshot["name"]}-vol-{volume.name_id}'
+        clone_path = os.path.join(vmstore_subdir, clone_name)
 
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
