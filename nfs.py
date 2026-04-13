@@ -80,9 +80,17 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 not held during backoff sleep periods to allow better concurrency.
         3.0.7b - Fix lock_key parameter in create_snapshot.   
         3.0.7c - Fix create_volume_from_snapshot to use unique clone name.
+        3.0.7d - Fix BUG: wrong volume name (should use unique clone name), 
+                 Fix BUG: Handle None from Virtual Disk Api Call ( _get_virtual_disk_with_retry ), 
+                   logs error and raises exception VmstoreException NotFound instead of AttributeError,
+                 Add Option for max delay in snapshot polling to avoid excessively long waits in case of issues,
+                 Refactor: add TINTRI_PATH_PREFIX constant
+        3.0.8 - Release version for April 2026
+                 
+
     """
 
-    VERSION = '3.0.7c'
+    VERSION = '3.0.8'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -90,6 +98,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     storage_protocol = 'NFS'
     driver_prefix = 'vmstore'
     driver_volume_type = 'nfs'
+    TINTRI_PATH_PREFIX = '/tintri/'
 
     def __init__(self, execute=processutils.execute, *args, **kwargs):
 
@@ -175,7 +184,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         if timeout is None:
             timeout = self.configuration.vmstore_snapshot_poll_timeout
 
-        max_delay = 5.0  # Cap backoff at 5 seconds
+        max_delay = self.configuration.vmstore_snapshot_max_delay  # Cap backoff at configured max delay
         delay = self.configuration.vmstore_snapshot_poll_initial_delay
         elapsed = 0
         start_time = time.time()
@@ -379,7 +388,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.info('Refreshing hypervisor for volume %(vol)s', {'vol': volume.name_id})
 
         try:
-            vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+            vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
             volume_path = os.path.join(vmstore_subdir, volume['name'])
 
             hostname = self.configuration.safe_get(
@@ -673,6 +682,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # Get virtual disk with retry and hypervisor refresh
         vd = self._get_virtual_disk_with_retry(volume)
+        if not vd:
+            msg = f'Virtual disk for volume {volume["name"]} not found, cannot create snapshot'
+            LOG.error(msg)
+            raise api.VmstoreException(code='NotFound', message=msg)
+        
         lock_key = self._get_snapshot_lock_key(snapshot.id)
         self._create_snapshot_locked(snapshot, vd, lock_key)
 
@@ -688,7 +702,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """
         LOG.debug('Creating snapshot (with locking) after aquiring vd %s', snapshot['name'])
         volume = snapshot.volume
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
         volume_path = os.path.join(vmstore_subdir, volume['name'])
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
@@ -776,7 +790,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             LOG.error(msg)
             raise api.VmstoreException(code='NotFound', message=msg)
 
-        vmstore_subdir = self.nas_path.removeprefix('/tintri')
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
         clone_name = f'{snapshot["name"]}-vol-{volume.name_id}'
         clone_path = os.path.join(vmstore_subdir, clone_name)
 
@@ -795,7 +809,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # File system operations (no lock needed for these)
         mount_dir = self._get_mount_point_for_share(self._get_share_path())
-        temp_clone_dir = os.path.join(mount_dir, snapshot['name'])
+        temp_clone_dir = os.path.join(mount_dir, clone_name)
         temp_clone_path = os.path.join(temp_clone_dir, snapshot['volume_name'])
         clone_destination = os.path.join(mount_dir, volume['name'])
 
@@ -873,6 +887,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # Get virtual disk with retry and hypervisor refresh
         vd = self._get_virtual_disk_with_retry(src_vref)
+        if not vd:
+            msg = f'Virtual disk for source volume {src_vref["name"]} not found, cannot create clone'
+            LOG.error(msg)
+            raise api.VmstoreException(code='NotFound', message=msg)
+        
         lock_key = self._get_volume_lock_key(volume.id)
         return self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
 
@@ -900,7 +919,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         src_name = src_vref['name']
         vm_uuid = vd[0]['vmUuid']['uuid']
         clone_name = f'clone-{src_name}-{volume.name_id}'
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
 
         # Create snapshot for cloning
         payload = {
@@ -943,7 +962,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             {'name': clone_name, 'uuid': snap_uuid, 'lock': lock_key})
 
         # Create clone from snapshot
-        vmstore_subdir = self.nas_path.removeprefix('/tintri')
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
         clone_path = os.path.join(vmstore_subdir, clone_name)
 
         clone_payload = {

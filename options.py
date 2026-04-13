@@ -97,9 +97,9 @@ VMSTORE_DATASET_OPTS = [
 
 VMSTORE_PERF_OPTS = [
     cfg.IntOpt('vmstore_snapshot_poll_timeout',
-               default=10,
+               default=30,
                help='Maximum time to wait for snapshot detection (seconds). '
-                    'Reduced from 30s to minimize lock hold time.'),
+                    'Default 30s.'),
     cfg.FloatOpt('vmstore_snapshot_poll_initial_delay',
                  default=0.5,
                  help='Initial delay between snapshot poll attempts (seconds). '
@@ -112,6 +112,10 @@ VMSTORE_PERF_OPTS = [
                 help='Use volume-level locks instead of backend-wide locks '
                      'to allow concurrent operations on different volumes. '
                      'Set to False for legacy backend-wide locking.'),
+    cfg.FloatOpt('vmstore_snapshot_max_delay',
+                default=12.0,
+                help='Maximum delay for snapshot operations (seconds). '
+                     'Uses exponential backoff up to this value.'),
 ]
 
 VMSTORE_NFS_OPTS += (
