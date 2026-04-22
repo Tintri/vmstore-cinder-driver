@@ -1,0 +1,6 @@
+{
+  "taskId": "{{randomValue type='UUID'}}",
+  "status": "SUCCESS",
+  "message": "Hypervisor refresh initiated",
+  "timestamp": "{{now format='yyyy-MM-dd'T'HH:mm:ss.SSSZ'}}"
+}
