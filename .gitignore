@@ -1,0 +1,17 @@
+*.ipynb_checkpoints/*
+*.pyc
+*.egg-info
+venv/
+.venv/
+.idea/
+docs/_build/*
+
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.zip
+*.tar.gz
+dist/
+build/
+__pycache__/

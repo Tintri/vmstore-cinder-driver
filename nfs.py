@@ -64,9 +64,33 @@ class VmstoreNfsDriver(nfs.NfsDriver):
               _update_volume_stats for thin provisioning.
         3.0.6 - Cache volume stats. Added filtering for all list snapshots
               operations.
+        3.0.7 - Fix coordination lock held during VirtualDisk discovery.
+              Extracted _wait_for_virtual_disk() helper; VD polling now
+              occurs outside the lock in create_snapshot and
+              create_cloned_volume. Fix infinite busy-wait loop in
+              create_volume_from_snapshot (replaced with single-shot
+              check). Fix undefined self.project in api.py lock key
+              (now uses appliance UUID only). Add vmstore_get_vd_timeout
+              config option.
+        3.0.7a - Add exponential backoff with jitter to snapshot polling and
+              virtual disk retrieval to reduce load on appliance and avoid
+                thundering herd issues. Add more detailed logging around these
+                operations to aid in troubleshooting. Add configuration options
+                for tuning backoff parameters and timeouts. Ensure that locks are
+                not held during backoff sleep periods to allow better concurrency.
+        3.0.7b - Fix lock_key parameter in create_snapshot.   
+        3.0.7c - Fix create_volume_from_snapshot to use unique clone name.
+        3.0.7d - Fix BUG: wrong volume name (should use unique clone name), 
+                 Fix BUG: Handle None from Virtual Disk Api Call ( _get_virtual_disk_with_retry ), 
+                   logs error and raises exception VmstoreException NotFound instead of AttributeError,
+                 Add Option for max delay in snapshot polling to avoid excessively long waits in case of issues,
+                 Refactor: add TINTRI_PATH_PREFIX constant
+        3.0.8 - Release version for April 2026
+                 
+
     """
 
-    VERSION = '3.0.6'
+    VERSION = '3.0.8'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -74,6 +98,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     storage_protocol = 'NFS'
     driver_prefix = 'vmstore'
     driver_volume_type = 'nfs'
+    TINTRI_PATH_PREFIX = '/tintri/'
 
     def __init__(self, execute=processutils.execute, *args, **kwargs):
 
@@ -125,6 +150,73 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def get_driver_options():
         LOG.info('VmstoreNfsDriver get_driver_options')
         return options.VMSTORE_NFS_OPTS
+
+    def _get_volume_lock_key(self, volume_id):
+        """Generate volume-specific lock key.
+
+        :param volume_id: Volume UUID or ID
+        :returns: Lock key string for coordination
+        """
+        if self.configuration.vmstore_use_volume_locks:
+            return f"{self.vmstore.lock}:volume:{volume_id}"
+        # Fall back to backend-wide lock for compatibility
+        return self.vmstore.lock
+
+    def _get_snapshot_lock_key(self, snapshot_id):
+        """Generate snapshot-specific lock key.
+
+        :param snapshot_id: Snapshot UUID or ID
+        :returns: Lock key string for coordination
+        """
+        if self.configuration.vmstore_use_volume_locks:
+            return f"{self.vmstore.lock}:snapshot:{snapshot_id}"
+        # Fall back to backend-wide lock for compatibility
+        return self.vmstore.lock
+
+    def _wait_for_snapshot(self, snapshot_name, vm_uuid=None, timeout=None):
+        """Poll for snapshot with exponential backoff.
+
+        :param snapshot_name: Name/description of snapshot to find
+        :param vm_uuid: Optional VM UUID for filtering
+        :param timeout: Maximum time to wait in seconds (uses config default)
+        :returns: snapshot UUID or None
+        """
+        if timeout is None:
+            timeout = self.configuration.vmstore_snapshot_poll_timeout
+
+        max_delay = self.configuration.vmstore_snapshot_max_delay  # Cap backoff at configured max delay
+        delay = self.configuration.vmstore_snapshot_poll_initial_delay
+        elapsed = 0
+        start_time = time.time()
+
+        while elapsed < timeout:
+            # Single API call with filtering
+            filters = {'contain': snapshot_name}
+            if vm_uuid:
+                filters['vmUuid'] = vm_uuid
+
+            snapshots = self.vmstore.snapshots.list(filters)
+
+            for snap in snapshots:
+                if snap.get('description') == snapshot_name:
+                    LOG.debug(
+                        'Found snapshot %(name)s after %(elapsed).2f sec.',
+                        {'name': snapshot_name, 'elapsed': elapsed})
+                    return snap['uuid']['uuid']
+
+            # Exponential backoff with cap
+            sleep_time = min(delay, max_delay)
+            LOG.debug(
+                'Snapshot %(name)s not found, waiting %(sleep).2f seconds '
+                '(elapsed: %(elapsed).2f/%(timeout)s)',
+                {'name': snapshot_name, 'sleep': sleep_time,
+                 'elapsed': elapsed, 'timeout': timeout})
+            time.sleep(sleep_time)
+            elapsed = time.time() - start_time
+            delay *= 2  # Exponential backoff
+
+        LOG.warning('Snapshot %(name)s not found after %(timeout)s seconds', {'name': snapshot_name, 'timeout': timeout})
+        return None
 
     def do_setup(self, ctxt) -> None:
         LOG.info('VmstoreNfsDriver do_setup for context: %s', ctxt)
@@ -292,9 +384,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         """
-        LOG.info('Refreshing hypervisor for volume %s', volume.name_id)
+
+        LOG.info('Refreshing hypervisor for volume %(vol)s', {'vol': volume.name_id})
+
         try:
-            vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+            vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
             volume_path = os.path.join(vmstore_subdir, volume['name'])
 
             hostname = self.configuration.safe_get(
@@ -305,6 +399,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 LOG.warning("No OpenStack hostname configured and "
                             "auto-discovery failed. Skipping refresh.")
                 return
+
             payload = {
                 'typeId': ('com.tintri.api.rest.v310.dto.domain.'
                            'beans.cinder.OpenStackHostRefreshSpec'),
@@ -312,25 +407,52 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 'volumeFilePath': volume_path,
                 'region': self.configuration.vmstore_refresh_openstack_region,
             }
+
+            # Call refresh API
             self.vmstore.cinder_refresh.create(payload)
-            vd = self.vmstore.virtual_disk.get(volume.name_id)
-            timeout = self.configuration.vmstore_get_vd_timeout
-            current = 1
-            while len(vd) < 1:
-                if current < timeout:
-                    LOG.info('VirtualDisk for %s not found, sleeping %d',
-                             volume.name_id, current)
-                    time.sleep(current)
-                    self.vmstore.cinder_refresh.create(payload)
-                    current += 2
-                    vd = self.vmstore.virtual_disk.get(volume.name_id)
-                else:
-                    raise api.VmstoreException(
-                        code='NotFound',
-                        message=('Could not find VirtualDisk for %s' %
-                                 volume['name']))
+            LOG.debug('Async hypervisor refresh initiated for %s', volume.name_id)
+            return
+
         except Exception as e:
-            LOG.warning("Failed to refresh hypervisor, error: %s", e)
+            # In async mode, just log and continue
+            LOG.warning("Async hypervisor refresh failed for %(vol)s: %(err)s",
+                        {'vol': volume.name_id, 'err': e})
+
+    def _get_virtual_disk_with_retry(self, volume):
+        """Get virtual disk with exponential backoff retry
+        and refresh hypervisor if not found.
+
+        This is an improvement on previous version 3.0.7 _wait_for_virtual_disk to reduce load on appliance
+        and avoid thundering herd issues.
+
+        :param volume: volume reference
+        :returns: Virtual disk info or None
+        """
+        max_retries = self.configuration.vmstore_virtual_disk_retries
+        delay = 0.5
+        for attempt in range(max_retries):
+            vd = self.vmstore.virtual_disk.get(volume.name_id)
+            if vd:
+                LOG.debug('Found virtual disk for %(id)s on attempt %(attempt)s',
+                          {'id': volume.name_id, 'attempt': attempt + 1})
+                return vd
+
+            if attempt < max_retries - 1:
+                LOG.debug(
+                    'Virtual disk for %(id)s not found, retry %(attempt)s/%(max)s '
+                    'after %(delay).2f seconds',
+                    {'id': volume.name_id, 'attempt': attempt + 1,
+                     'max': max_retries, 'delay': delay})
+                # Try refresh call
+                LOG.info('VirtualDisk for %s not found, sleeping %d', volume.name_id, delay)
+                self.refresh_hypervisor(volume)
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+
+        LOG.warning(
+            'Virtual disk for %(name)s not found after %(retries)s retries',
+            {'name': volume['name'], 'retries': max_retries})
+        return None
 
     def create_volume(self, volume: objects.Volume) -> dict:
         """Creates a volume.
@@ -487,9 +609,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         return '%s:%s' % (nas_host, nas_share_path)
 
-    @coordination.synchronized('{self.vmstore.lock}')
     def initialize_connection(self, volume, connector):
         """Allow connection to connector and return connection info.
+
+        NO LOCK NEEDED - This is a read-only operation on the file system.
+        Multiple concurrent connections can be initialized safely.
 
         :param volume: volume reference
         :param connector: connector reference
@@ -544,35 +668,42 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  'setup_checking: %s', setup_checking)
         return True
 
-    @coordination.synchronized('{self.vmstore.lock}')
     def create_snapshot(self, snapshot):
         """Creates a snapshot.
+
+        VirtualDisk discovery is performed outside the coordination lock
+        via _get_virtual_disk_with_retry() to avoid blocking other Cinder workers
+        during potentially long VMstore cache population waits.
 
         :param snapshot: snapshot reference
         """
         LOG.info('Creating snapshot %s', snapshot['name'])
         volume = snapshot.volume
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
+
+        # Get virtual disk with retry and hypervisor refresh
+        vd = self._get_virtual_disk_with_retry(volume)
+        if not vd:
+            msg = f'Virtual disk for volume {volume["name"]} not found, cannot create snapshot'
+            LOG.error(msg)
+            raise api.VmstoreException(code='NotFound', message=msg)
+        
+        lock_key = self._get_snapshot_lock_key(snapshot.id)
+        self._create_snapshot_locked(snapshot, vd, lock_key)
+
+    @coordination.synchronized('{lock_key}')
+    def _create_snapshot_locked(self, snapshot, vd, lock_key):
+        """Creates a snapshot.
+
+        Uses volume-level lock to allow concurrent snapshots of different volumes.
+
+        :param snapshot: snapshot reference
+        :param vd: virtual disk info for the snapshot's volume
+        :param lock_key: coordination lock key
+        """
+        LOG.debug('Creating snapshot (with locking) after aquiring vd %s', snapshot['name'])
+        volume = snapshot.volume
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
         volume_path = os.path.join(vmstore_subdir, volume['name'])
-        # Use volume.name_id for backend storage identification
-        # per Cinder guidelines
-        volume_name_id = volume.name_id
-        vd = self.vmstore.virtual_disk.get(volume_name_id)
-        timeout = self.configuration.vmstore_get_vd_timeout
-        current = 1
-        while len(vd) < 1:
-            if current < timeout:
-                LOG.info('VirtualDisk for %s not found, sleeping %d',
-                         volume_name_id, current)
-                time.sleep(current)
-                self.refresh_hypervisor(volume)
-                current += 2
-                vd = self.vmstore.virtual_disk.get(volume_name_id)
-            else:
-                raise api.VmstoreException(
-                    code='NotFound',
-                    message=('Could not find VirtualDisk for %s' %
-                             volume['name']))
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
                        'beans.cinder.CinderSnapshotSpec'),
@@ -585,12 +716,24 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'deletionPolicy': 'DELETE_ON_EXPIRATION'
         }
         self.vmstore.snapshots.create(payload)
+        LOG.info('Snapshot %s created successfully', snapshot['name'])
 
-    @coordination.synchronized('{self.vmstore.lock}')
     def delete_snapshot(self, snapshot):
         """Deletes a snapshot.
 
+        Uses snapshot-level lock to allow concurrent deletion of different snapshots.
+
         :param snapshot: snapshot reference
+        """
+        lock_key = self._get_snapshot_lock_key(snapshot.id)
+        return self._delete_snapshot_locked(snapshot, lock_key)
+
+    @coordination.synchronized('{lock_key}')
+    def _delete_snapshot_locked(self, snapshot, lock_key):
+        """Deletes a snapshot with coordination lock.
+
+        :param snapshot: snapshot reference
+        :param lock_key: coordination lock key
         """
         LOG.info('Deleting snapshot %s', snapshot['name'])
         snapshots = self.vmstore.snapshots.list({'contain': snapshot['name']})
@@ -598,51 +741,58 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         for vmstore_snapshot in snapshots:
             if snapshot['name'] == vmstore_snapshot['description']:
                 snap_uuid = vmstore_snapshot['uuid']['uuid']
+                break  # Found it, no need to continue
+
         if not snap_uuid:
             LOG.info('Did not find snapshot %(name)s, '
                      'this is ok for deletion.',
                      {'name': snapshot['name']})
             return
+
         try:
             self.vmstore.snapshots.delete(snap_uuid)
+            LOG.info('Snapshot %s deleted successfully', snapshot['name'])
         except api.VmstoreException as e:
             if 'VM is still present' in str(e):
-                LOG.warning(e)
+                LOG.warning(
+                    'Snapshot %s has active clones, will be cleaned up '
+                    'when parent volume is deleted: %s', snapshot['name'], e)
             else:
                 raise
 
-    @coordination.synchronized('{self.vmstore.lock}')
     def create_volume_from_snapshot(self, volume, snapshot):
         """Create new volume from other's snapshot on appliance.
+
+        Uses snapshot-level lock to allow concurrent clones from different snapshots.
 
         :param volume: reference of volume to be created
         :param snapshot: reference of source snapshot
         """
-        LOG.info('Creating volume %(vol)s from snapshot %(snap)s',
-                 {'vol': volume['name'], 'snap': snapshot['name']})
-        snapshots = self.vmstore.snapshots.list({'contain': snapshot['name']})
-        snap_uuid = ''
-        for vmstore_snapshot in snapshots:
-            if snapshot['name'] == vmstore_snapshot['description']:
-                snap_uuid = vmstore_snapshot['uuid']['uuid']
-        timeout = self.configuration.vmstore_get_vd_timeout
-        current = 1
-        while not snap_uuid:
-            if current < timeout:
-                snapshots = self.vmstore.snapshots.list(
-                    {'contain': snapshot['name']})
-                time.sleep(current)
-                current += 2
-                for vmstore_snapshot in snapshots:
-                    if snapshot['name'] == vmstore_snapshot['description']:
-                        snap_uuid = vmstore_snapshot['uuid']['uuid']
-            else:
-                msg = 'Did not find snapshot %s' % snapshot['name']
-                raise api.VmstoreException(code='NotFound', message=msg)
+        lock_key = self._get_snapshot_lock_key(snapshot.id)
+        return self._create_volume_from_snapshot_locked(volume, snapshot, lock_key)
 
-        vmstore_subdir = self.nas_path.removeprefix('/tintri')
-        clone_path = os.path.join(
-            vmstore_subdir, snapshot['name'])
+    @coordination.synchronized('{lock_key}')
+    def _create_volume_from_snapshot_locked(self, volume, snapshot, lock_key):
+        """Create new volume from snapshot with coordination lock.
+
+        :param volume: reference of volume to be created
+        :param snapshot: reference of source snapshot
+        :param lock_key: coordination lock key
+        """
+        LOG.info('Creating volume %(vol)s from snapshot %(snap)s with lock %(lock)s',
+                 {'vol': volume['name'], 'snap': snapshot['name'], 'lock': lock_key})
+
+        # Optimized snapshot lookup with exponential backoff
+        snap_uuid = self._wait_for_snapshot(snapshot['name'])
+
+        if not snap_uuid:
+            msg = f'Snapshot {snapshot["name"]} not found after polling timeout'
+            LOG.error(msg)
+            raise api.VmstoreException(code='NotFound', message=msg)
+
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
+        clone_name = f'{snapshot["name"]}-vol-{volume.name_id}'
+        clone_path = os.path.join(vmstore_subdir, clone_name)
 
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
@@ -650,15 +800,27 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'tintriSnapshotUuid': snap_uuid,
             'destinationPaths': clone_path,
         }
+
+        LOG.debug(
+            'Creating clone from snapshot %(snap)s to %(path)s '
+            'with lock %(lock)s',
+            {'snap': snapshot['name'], 'path': clone_path, 'lock': lock_key})
         self.vmstore.clones.create(payload)
+
+        # File system operations (no lock needed for these)
         mount_dir = self._get_mount_point_for_share(self._get_share_path())
-        temp_clone_dir = os.path.join(mount_dir, snapshot['name'])
+        temp_clone_dir = os.path.join(mount_dir, clone_name)
         temp_clone_path = os.path.join(temp_clone_dir, snapshot['volume_name'])
-        clone_destination = os.path.join(
-            mount_dir, volume['name'])
+        clone_destination = os.path.join(mount_dir, volume['name'])
+
         os.rename(temp_clone_path, clone_destination)
         os.rmdir(temp_clone_dir)
+        LOG.debug(
+            'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
+            {'src': temp_clone_path, 'dst': clone_destination,
+             'lock': lock_key})
 
+        # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
         return {'provider_location': volume.provider_location}
@@ -711,9 +873,35 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                                    volume,
                                    run_as_root=self._execute_as_root)
 
-    @coordination.synchronized('{self.vmstore.lock}')
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume.
+
+        VirtualDisk discovery is performed outside the coordination lock
+        via _get_virtual_disk_with_retry() to avoid blocking other Cinder workers
+        during potentially long VMstore cache population waits.
+
+        :param volume: new volume reference
+        :param src_vref: source volume reference
+        """
+        LOG.info('Creating cloned volume %(vol)s from source %(src)s', {'vol': volume['name'], 'src': src_vref['name']})
+
+        # Get virtual disk with retry and hypervisor refresh
+        vd = self._get_virtual_disk_with_retry(src_vref)
+        if not vd:
+            msg = f'Virtual disk for source volume {src_vref["name"]} not found, cannot create clone'
+            LOG.error(msg)
+            raise api.VmstoreException(code='NotFound', message=msg)
+        
+        lock_key = self._get_volume_lock_key(volume.id)
+        return self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
+
+    @coordination.synchronized('{lock_key}')
+    def _create_cloned_volume_locked(self, volume, src_vref, vd, lock_key):
+        """Creates a clone of the specified volume.
+
+        Uses source volume-level lock to allow concurrent clones from different
+        source volumes. Multiple clones can be created from different sources
+        in parallel.
 
         Create a snapshot with DELETE_ON_ZERO_CLONE_REFERENCES.
         Create a cloned volume from that snapshot.
@@ -722,32 +910,18 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: new volume reference
         :param src_vref: source volume reference
+        :param vd: virtual disk info for the source volume
+        :param lock_key: coordination lock key
         """
-        LOG.info('Creating cloned volume %(vol)s from source %(src)s',
-                 {'vol': volume['name'], 'src': src_vref['name']})
+        LOG.info('Creating cloned volume %(vol)s from source %(src)s with lock %(lock)s',
+                 {'vol': volume.name_id, 'src': src_vref['name'], 'lock': lock_key})
+
         src_name = src_vref['name']
-        src_id = src_vref.name_id
-        vd = self.vmstore.virtual_disk.get(src_id)
-        timeout = self.configuration.vmstore_get_vd_timeout
-        current = 1
-        while len(vd) < 1:
-            if current < timeout:
-                LOG.info('VirtualDisk for %s not found, sleeping %d',
-                         src_id, current)
-                time.sleep(current)
-                current += 2
-                self.refresh_hypervisor(src_vref)
-                vd = self.vmstore.virtual_disk.get(src_id)
-            else:
-                raise api.VmstoreException(
-                    code='NotFound',
-                    message=('Could not find VirtualDisk for %s' %
-                             src_name))
-        vmstore_subdir = self.nas_path.removeprefix('/tintri/')
         vm_uuid = vd[0]['vmUuid']['uuid']
-        clone_name = 'clone-%(src_name)s-%(vol_name)s' % {
-            'src_name': src_name,
-            'vol_name': volume['name']}
+        clone_name = f'clone-{src_name}-{volume.name_id}'
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
+
+        # Create snapshot for cloning
         payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
                        'beans.cinder.CinderSnapshotSpec'),
@@ -759,40 +933,72 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'snapshotCreator': 'Vmstore cinder driver',
             'deletionPolicy': 'DELETE_ON_ZERO_CLONE_REFERENCES'
         }
+
+        LOG.debug('Creating temporary snapshot for clone: %s', clone_name)
         resp = self.vmstore.snapshots.create(payload)
-        snap_uuid = ''
+
+        # Try to extract UUID from response
+        snap_uuid = None
         if resp:
-            snap_uuid = resp[0]
+            if isinstance(resp, list) and len(resp) > 0:
+                # Response might be a list with UUID
+                if isinstance(resp[0], dict) and 'uuid' in resp[0]:
+                    snap_uuid = resp[0]['uuid']['uuid']
+                elif isinstance(resp[0], str):
+                    snap_uuid = resp[0]
+
+        # If UUID not in response, poll for it with optimized backoff
+        if not snap_uuid:
+            LOG.debug('Snapshot UUID not in response, polling for %s', clone_name)
+            snap_uuid = self._wait_for_snapshot(clone_name, vm_uuid=vm_uuid)
 
         if not snap_uuid:
-            snapshots = self.vmstore.snapshots.list({'vmUuid': vm_uuid})
-            for vmstore_snapshot in snapshots:
-                if clone_name == vmstore_snapshot['description']:
-                    snap_uuid = vmstore_snapshot['uuid']['uuid']
-        if not snap_uuid:
-            msg = 'Did not find snapshot %s' % clone_name
+            msg = f'Snapshot {clone_name} not found after creation'
+            LOG.error(msg)
             raise api.VmstoreException(code='NotFound', causeDetails=msg)
-        vmstore_subdir = self.nas_path.removeprefix('/tintri')
-        clone_path = os.path.join(
-            vmstore_subdir, clone_name)
 
-        payload = {
+        LOG.debug(
+            'Snapshot %(name)s created with UUID %(uuid)s with lock %(lock)s',
+            {'name': clone_name, 'uuid': snap_uuid, 'lock': lock_key})
+
+        # Create clone from snapshot
+        vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
+        clone_path = os.path.join(vmstore_subdir, clone_name)
+
+        clone_payload = {
             'typeId': ('com.tintri.api.rest.v310.dto.domain.'
                        'beans.cinder.CinderCloneSpec'),
             'tintriSnapshotUuid': snap_uuid,
             'destinationPaths': clone_path,
         }
-        self.vmstore.clones.create(payload)
+
+        LOG.debug(
+            'Creating clone from snapshot %(snap)s to %(path)s '
+            'with lock %(lock)s',
+            {'snap': clone_name, 'path': clone_path, 'lock': lock_key})
+        self.vmstore.clones.create(clone_payload)
+
+        # File system operations (no lock contention)
         mount_dir = self._get_mount_point_for_share(self._get_share_path())
         temp_clone_dir = os.path.join(mount_dir, clone_name)
         temp_clone_path = os.path.join(temp_clone_dir, src_name)
-        clone_destination = os.path.join(
-            mount_dir, volume['name'])
+        clone_destination = os.path.join(mount_dir, volume['name'])
+
         os.rename(temp_clone_path, clone_destination)
         os.rmdir(temp_clone_dir)
+        LOG.debug(
+            'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
+            {'src': temp_clone_path, 'dst': clone_destination,
+             'lock': lock_key})
 
+        # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
+
+        LOG.info(
+            'Successfully created cloned volume %(vol)s from %(src)s '
+            'with lock %(lock)s',
+            {'vol': volume['name'], 'src': src_name, 'lock': lock_key})
         return {'provider_location': volume.provider_location}
 
     def extend_volume(self, volume, new_size):
@@ -864,9 +1070,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # 1. No stats cached yet, OR
         # 2. Cache is disabled (cache_period == 0), OR
         # 3. Cache has expired
-        if (not self._stats_cache or
-            cache_period == 0 or
-            cache_age >= cache_period):
+        if (not self._stats_cache or cache_period == 0 or cache_age >= cache_period):
             LOG.debug('Updating volume stats: cache_age=%.2f, '
                       'cache_period=%d',
                       cache_age, cache_period)
