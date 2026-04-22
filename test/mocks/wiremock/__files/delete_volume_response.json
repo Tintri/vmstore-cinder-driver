@@ -1,5 +1,0 @@
-{
-  "taskId": "{{randomValue type='UUID'}}",
-  "status": "SUCCESS",
-  "message": "Volume deleted successfully"
-}
