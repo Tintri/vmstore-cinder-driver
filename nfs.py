@@ -450,7 +450,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.debug('Creating volume %(vol)s', {'vol': volume.name_id})
         self._ensure_shares_mounted()
 
-        volume.provider_location = self._find_share(volume)
+        volume.provider_location = self._get_share_path()
 
         LOG.info('casted to %s', volume.provider_location)
 
@@ -790,7 +790,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
-        volume.provider_location = self._find_share(volume)
+        volume.provider_location = self._get_share_path()
         return {'provider_location': volume.provider_location}
 
     def copy_image_to_volume(self,
@@ -936,7 +936,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
-        volume.provider_location = self._find_share(volume)
+        volume.provider_location = self._get_share_path()
 
         LOG.info(
             'Successfully created cloned volume %(vol)s from %(src)s '
