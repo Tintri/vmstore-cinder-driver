@@ -1001,43 +1001,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             {'vol': volume['name'], 'src': src_name, 'lock': lock_key})
         return {'provider_location': volume.provider_location}
 
-    def extend_volume(self, volume, new_size):
-        """Extend an existing volume to the new size."""
-        LOG.info('Extending volume %(vol)s to new size %(size)s GB.',
-                 {'vol': volume.name_id, 'size': new_size})
-        if self._is_volume_attached(volume):
-            msg = (_("Cannot extend volume %s while it is attached.")
-                   % volume.name_id)
-            raise exception.ExtendVolumeError(msg)
-
-        LOG.info('Extending volume %(vol)s to new size %(size)s GB.',
-                 {'vol': volume.name_id, 'size': new_size})
-        extend_by = int(new_size) - volume.size
-        if not self._is_share_eligible(volume.provider_location,
-                                       extend_by):
-            raise exception.ExtendVolumeError(reason='Insufficient space to'
-                                              ' extend volume %s to %sG'
-                                              % (volume.name_id, new_size))
-        # Use the active image file because this volume might have snapshot(s).
-        active_file = self.get_active_image_from_info(volume)
-        active_file_path = os.path.join(self._local_volume_dir(volume),
-                                        active_file)
-        LOG.info('Resizing file to %sG...', new_size)
-        file_format = None
-        admin_metadata = objects.Volume.get_by_id(
-            context.get_admin_context(), volume.id).admin_metadata
-
-        if admin_metadata and 'format' in admin_metadata:
-            file_format = admin_metadata['format']
-        image_utils.resize_image(
-            active_file_path, new_size,
-            run_as_root=self._execute_as_root,
-            file_format=file_format)
-        if file_format == 'qcow2' and not self._is_file_size_equal(
-                active_file_path, new_size):
-            raise exception.ExtendVolumeError(
-                reason='Resizing image file failed.')
-
     def _get_provisioned_capacity(self):
         mount_path = self._get_mount_point_for_share(self.nas_path)
         provisioned_bytes = 0
