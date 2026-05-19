@@ -365,7 +365,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         for attempt in range(num_attempts):
             try:
                 self._remotefsclient.mount(nfs_share)
-                self._mounted_shares.append(nfs_share)
+                self._mounted_shares.append(nfs_share) # why are we adding this here?
                 return
             except Exception as e:
                 if attempt == (num_attempts - 1):
@@ -649,19 +649,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         }
         LOG.debug('conn_info: %s', info)
         return info
-
-    def _local_volume_dir(self, volume):
-        """Get volume dir (mounted locally fs path) for given volume.
-
-        :param volume: volume reference
-        """
-        LOG.info('VmstoreNfsDriver _local_volume_dir for volume: %s',
-                 volume.name_id)
-        share = volume.provider_location
-        if isinstance(share, str):
-            share = share.encode('utf-8')
-        path = hashlib.md5(share, usedforsecurity=False).hexdigest()
-        return os.path.join(self.mount_point_base, path)
 
     def _check_snapshot_support(self, setup_checking=False):
         LOG.info('VmstoreNfsDriver _check_snapshot_support, '
