@@ -359,25 +359,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                            'attempt': attempt})
                 return mntpoint
 
-    def _ensure_share_mounted(self, nfs_share) -> None:
-        LOG.info('VmstoreNfsDriver _ensure_share_mounted for share: %s', nfs_share)
-        num_attempts = max(1, self.configuration.nfs_mount_attempts)
-        for attempt in range(num_attempts):
-            try:
-                self._remotefsclient.mount(nfs_share)
-                self._mounted_shares.append(nfs_share) # why are we adding this here?
-                return
-            except Exception as e:
-                if attempt == (num_attempts - 1):
-                    LOG.error('Mount failure for %(share)s after '
-                              '%(count)d attempts.',
-                              {'share': nfs_share,
-                               'count': num_attempts})
-                    raise exception.NfsException(str(e))
-                LOG.debug('Mount attempt %(attempt)d failed: %(exc)s.\n'
-                          'Retrying mount ...',
-                          {'attempt': attempt, 'exc': e})
-                time.sleep(1)
 
     def refresh_hypervisor(self, volume):
         """Refresh VMstore hypervisor for the given volume.
