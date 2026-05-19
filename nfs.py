@@ -800,30 +800,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                              image_id: str,
                              disable_sparse: bool = False) -> None:
         """Fetch the image from image_service and write it to the volume."""
-
-        LOG.info('Copying image %(image)s to volume %(vol)s',
-                 {'image': image_id, 'vol': volume.name_id})
-        volpath = self.local_path(volume)
-        image_utils.fetch_to_raw(context,
-                                 image_service,
-                                 image_id,
-                                 volpath,
-                                 self.configuration.volume_dd_blocksize,
-                                 size=volume.size,
-                                 run_as_root=self._execute_as_root,
-                                 disable_sparse=disable_sparse)
-
-        image_utils.resize_image(volpath, volume.size,
-                                 run_as_root=self._execute_as_root)
-
-        data = image_utils.qemu_img_info(volpath,
-                                         run_as_root=self._execute_as_root)
-        virt_size = data.virtual_size // units.Gi
-        if virt_size != volume.size:
-            raise exception.ImageUnacceptable(
-                image_id=image_id,
-                reason=(_("Expected volume size was %d") % volume.size)
-                + (_(" but size is now %d") % virt_size))
+        LOG.info('VmstoreNfsDriver copy_image_to_volume, volume: %s, image_id: %s',
+                 volume.id, image_id)
+        super(VmstoreNfsDriver, self).copy_image_to_volume(
+            context, volume, image_service, image_id, disable_sparse)
 
     def copy_volume_to_image(self,
                              context: context.RequestContext,
@@ -831,15 +811,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                              image_service,
                              image_meta: dict) -> None:
         """Copy the volume to the specified image."""
-        LOG.info('Copying volume %(vol)s to image %(image)s',
-                 {'vol': volume.name_id, 'image': image_meta.get('id')})
-        volpath = self.local_path(volume)
-        volume_utils.upload_volume(context,
-                                   image_service,
-                                   image_meta,
-                                   volpath,
-                                   volume,
-                                   run_as_root=self._execute_as_root)
+        LOG.info('VmstoreNfsDriver copy_volume_to_image, volume: %s, image_id: %s',
+                 volume.id, image_meta.get('id'))
+        super(VmstoreNfsDriver, self).copy_volume_to_image(
+            context, volume, image_service, image_meta)
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume.
