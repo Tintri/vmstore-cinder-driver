@@ -991,29 +991,55 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         return self._stats
 
+    def _get_capacity_info(self, nfs_share: str) -> tuple[float, float, float]:
+        """Calculate available space on the NFS share.
+        
+        Overrides base class to calculate provisioned capacity for thin
+        provisioning support instead of actual disk usage (du).
+        
+        :param nfs_share: example 172.18.194.100:/var/nfs
+        :returns: (total_size, total_available, provisioned_capacity)
+        """
+        mount_point = self._get_mount_point_for_share(nfs_share)
+        
+        # Get filesystem capacity using stat
+        df, _ = self._execute('stat', '-f', '-c', '%S %b %a', mount_point,
+                              run_as_root=self._execute_as_root)
+        block_size, blocks_total, blocks_avail = map(float, df.split())
+        total_available = block_size * blocks_avail
+        total_size = block_size * blocks_total
+        
+        # Calculate provisioned capacity (logical/promised capacity)
+        # For thin provisioning, this is the sum of volume logical sizes,
+        # not actual disk usage
+        provisioned_bytes = 0
+        if os.path.exists(mount_point):
+            for filename in os.listdir(mount_point):
+                # Count base volumes, excluding metadata/info files
+                if filename.startswith('volume-') and not filename.endswith('.info'):
+                    filepath = os.path.join(mount_point, filename)
+                    try:
+                        # st_size gives logical size ("promised" capacity)
+                        provisioned_bytes += os.stat(filepath).st_size
+                    except OSError:
+                        continue
+        
+        return total_size, total_available, provisioned_bytes
+
     def _update_volume_stats(self) -> None:
         LOG.info('VmstoreNfsDriver _update_volume_stats')
         self._ensure_shares_mounted()
         share_string = "%s:%s" % (self.nas_host, self.nas_path)
         mount_path = self._get_mount_point_for_share(share_string)
 
-        provisioned_bytes = 0
+        # Count total volumes for statistics
         total_volumes = 0
-
         if os.path.exists(mount_path):
             for filename in os.listdir(mount_path):
-                # Count base volumes, excluding metadata/info files
                 if filename.startswith('volume-') and not filename.endswith('.info'):
-                    filepath = os.path.join(mount_path, filename)
-                    try:
-                        stat = os.stat(filepath)
-                        # Logical size (The "promised" capacity)
-                        provisioned_bytes += stat.st_size
-                        total_volumes += 1
-                    except OSError:
-                        continue
+                    total_volumes += 1
 
-        capacity, free, _used = self._get_capacity_info(share_string)
+        capacity, free, provisioned = self._get_capacity_info(share_string)
 
         max_osr = self.configuration.safe_get('max_over_subscription_ratio')
         reserved = self.configuration.safe_get('reserved_percentage') or 0
@@ -1034,7 +1060,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'total_capacity_gb': capacity / float(units.Gi),
             'free_capacity_gb': free / float(units.Gi),
             'reserved_percentage': reserved,
-            'provisioned_capacity_gb': provisioned_bytes / float(units.Gi),
+            'provisioned_capacity_gb': provisioned / float(units.Gi),
             'max_over_subscription_ratio': max_osr,
             'thin_provisioning_support': True,
             'thick_provisioning_support': False,
