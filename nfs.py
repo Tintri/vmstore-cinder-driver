@@ -86,11 +86,23 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  Add Option for max delay in snapshot polling to avoid excessively long waits in case of issues,
                  Refactor: add TINTRI_PATH_PREFIX constant
         3.0.8 - Release version for April 2026
-                 
+        3.0.9 - Removed custom implementations of copy_image_to_volume and copy_volume_to_image, 
+                    replacing them with calls to the superclass methods for cleaner and more maintainable code.
+                Deleted the _ensure_share_mounted, _local_volume_dir, and extend_volume methods, 
+                    reducing code duplication and potential maintenance overhead.
+                Added _get_capacity_info Override
+                    Overrides the base class method to avoid the expensive du operation
+                    Calculates provisioned capacity (logical size) instead of actual disk usage
+                    Returns filesystem stats from stat plus the provisioned capacity calculation
+                Simplified _update_volume_stats
+                    Removed duplicate provisioned capacity calculation
+                    Now just counts volumes for the total_volumes stat
+                    Uses the clearer variable name provisioned instead of _used
+                    Directly uses provisioned from _get_capacity_info
 
     """
 
-    VERSION = '3.0.8'
+    VERSION = '3.0.9'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
