@@ -86,11 +86,12 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  Add Option for max delay in snapshot polling to avoid excessively long waits in case of issues,
                  Refactor: add TINTRI_PATH_PREFIX constant
         3.0.8 - Release version for April 2026
-                 
+        3.0.9 - Fixes VMS-4184: Pass volume.id while querying virtual disk information. Also, populate
+                volumeId parameter in payload to /host/refresh API in refresh_hypervisor function.
 
     """
 
-    VERSION = '3.0.8'
+    VERSION = '3.0.9'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -385,7 +386,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param volume: volume reference
         """
 
-        LOG.info('Refreshing hypervisor for volume %(vol)s', {'vol': volume.name_id})
+        LOG.info('Refreshing hypervisor for volume %(vol)s', {'vol': volume.id})
 
         try:
             vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
@@ -406,17 +407,18 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 'hostname': hostname,
                 'volumeFilePath': volume_path,
                 'region': self.configuration.vmstore_refresh_openstack_region,
+                'volumeId': volume['id'],
             }
 
             # Call refresh API
             self.vmstore.cinder_refresh.create(payload)
-            LOG.debug('Async hypervisor refresh initiated for %s', volume.name_id)
+            LOG.debug('Async hypervisor refresh initiated for %s', volume.id)
             return
 
         except Exception as e:
             # In async mode, just log and continue
             LOG.warning("Async hypervisor refresh failed for %(vol)s: %(err)s",
-                        {'vol': volume.name_id, 'err': e})
+                        {'vol': volume.id, 'err': e})
 
     def _get_virtual_disk_with_retry(self, volume):
         """Get virtual disk with exponential backoff retry
@@ -431,20 +433,20 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         max_retries = self.configuration.vmstore_virtual_disk_retries
         delay = 0.5
         for attempt in range(max_retries):
-            vd = self.vmstore.virtual_disk.get(volume.name_id)
+            vd = self.vmstore.virtual_disk.get(volume.id)
             if vd:
                 LOG.debug('Found virtual disk for %(id)s on attempt %(attempt)s',
-                          {'id': volume.name_id, 'attempt': attempt + 1})
+                          {'id': volume.id, 'attempt': attempt + 1})
                 return vd
 
             if attempt < max_retries - 1:
                 LOG.debug(
                     'Virtual disk for %(id)s not found, retry %(attempt)s/%(max)s '
                     'after %(delay).2f seconds',
-                    {'id': volume.name_id, 'attempt': attempt + 1,
+                    {'id': volume.id, 'attempt': attempt + 1,
                      'max': max_retries, 'delay': delay})
                 # Try refresh call
-                LOG.info('VirtualDisk for %s not found, sleeping %d', volume.name_id, delay)
+                LOG.info('VirtualDisk for %s not found, sleeping %d', volume.id, delay)
                 self.refresh_hypervisor(volume)
                 time.sleep(delay)
                 delay *= 2  # Exponential backoff
