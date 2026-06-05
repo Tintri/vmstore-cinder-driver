@@ -720,7 +720,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'deletionPolicy': 'DELETE_ON_EXPIRATION'
         }
         self.vmstore.snapshots.create(payload)
-        volume.provider_location = self._find_share(volume)
 
         LOG.info('Snapshot %s created successfully', snapshot['name'])
         return {'provider_location': volume.provider_location}   
