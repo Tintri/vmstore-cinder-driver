@@ -88,6 +88,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         3.0.8 - Release version for April 2026
         3.0.9 - Fixes VMS-4184: Pass volume.id while querying virtual disk information. Also, populate
                 volumeId parameter in payload to /host/refresh API in refresh_hypervisor function.
+                Add rerturn provider_location in create_snapshot return dict to update database record, 
+                which is required for clone from snapshot operation to find the correct share path.
 
     """
 
@@ -690,7 +692,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             raise api.VmstoreException(code='NotFound', message=msg)
         
         lock_key = self._get_snapshot_lock_key(snapshot.id)
-        self._create_snapshot_locked(snapshot, vd, lock_key)
+        return self._create_snapshot_locked(snapshot, vd, lock_key)
 
     @coordination.synchronized('{lock_key}')
     def _create_snapshot_locked(self, snapshot, vd, lock_key):
@@ -718,7 +720,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'deletionPolicy': 'DELETE_ON_EXPIRATION'
         }
         self.vmstore.snapshots.create(payload)
+        volume.provider_location = self._find_share(volume)
+
         LOG.info('Snapshot %s created successfully', snapshot['name'])
+        return {'provider_location': volume.provider_location}   
 
     def delete_snapshot(self, snapshot):
         """Deletes a snapshot.
