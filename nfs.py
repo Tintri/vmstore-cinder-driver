@@ -401,7 +401,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 'hostname': hostname,
                 'volumeFilePath': volume_path,
                 'region': self.configuration.vmstore_refresh_openstack_region,
-                'volumeId': volume['id']
+                'volumeId': volume['id'],
             }
 
             # Call refresh API
