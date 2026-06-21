@@ -88,23 +88,29 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         3.0.8 - Release version for April 2026
         3.0.9 - Fixes VMS-4184: Pass volume.id while querying virtual disk information. Also, populate
                     volumeId parameter in payload to /host/refresh API in refresh_hypervisor function.
-        3.0.10 - Removed custom implementations of copy_image_to_volume and copy_volume_to_image, 
+        3.0.10 - Removed custom implementations of copy_image_to_volume and copy_volume_to_image,
                     replacing them with calls to the superclass methods for cleaner and more maintainable code.
-                 Deleted the _ensure_share_mounted, _local_volume_dir, and extend_volume methods, 
+                 Deleted the _ensure_share_mounted, _local_volume_dir, and extend_volume methods,
                     reducing code duplication and potential maintenance overhead.
-                 Added _get_capacity_info Override
-                    Overrides the base class method to avoid the expensive du operation
-                    Calculates provisioned capacity (logical size) instead of actual disk usage
-                    Returns filesystem stats from stat plus the provisioned capacity calculation
-                 Simplified _update_volume_stats
-                    Removed duplicate provisioned capacity calculation
-                    Now just counts volumes for the total_volumes stat
-                    Uses the clearer variable name provisioned instead of _used
-                    Directly uses provisioned from _get_capacity_info
+                 Added _get_capacity_info and _get_provisioned_capacity overrides to avoid
+                    the expensive du traversal. Uses os.stat() per volume file instead.
+                    VMstore reports st_size as logical/provisioned size for thin-provisioned files.
+                    VMstore snapshots are not visible as NFS files so volume-* filtering is complete.
+                 Refactored _update_volume_stats to call super() to stay in the Cinder parent
+                    stats chain. Capacity fields come from the overridden _get_capacity_info and
+                    _get_provisioned_capacity. Pool-based stats structure preserved for scheduler
+                    thin-provisioning support (introduced in 3.0.5).
+                 Fixes VMS-4243: (PCD-4852) Call extend_volume when creating a volume from a
+                    snapshot or clone and specifying a larger size for the new volume.
+                    extend_volume is now called outside the coordination lock (after lock releases,
+                    before returning to Cinder) to minimise lock hold time.
+                 Fixed _get_provisioned_capacity bug: was passing nas_path instead of host:path
+                    to _get_mount_point_for_share, causing incorrect mount resolution.
+                 Replace ValueError with VolumeDriverException in _extend_volume_for_cloned_volume.
 
     """
 
-    VERSION = '3.0.9'
+    VERSION = '3.0.10'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -752,7 +758,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param snapshot: reference of source snapshot
         """
         lock_key = self._get_snapshot_lock_key(snapshot.id)
-        return self._create_volume_from_snapshot_locked(volume, snapshot, lock_key)
+        result = self._create_volume_from_snapshot_locked(volume, snapshot, lock_key)
+        self._extend_volume_for_cloned_volume(volume, snapshot['volume_size'])
+        return result
 
     @coordination.synchronized('{lock_key}')
     def _create_volume_from_snapshot_locked(self, volume, snapshot, lock_key):
@@ -806,6 +814,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
         volume.provider_location = self._get_share_path()
+
         return {'provider_location': volume.provider_location}
 
     def copy_image_to_volume(self,
@@ -851,7 +860,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             raise api.VmstoreException(code='NotFound', message=msg)
         
         lock_key = self._get_volume_lock_key(volume.id)
-        return self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
+        result = self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
+        self._extend_volume_for_cloned_volume(volume, src_vref['size'])
+        return result
 
     @coordination.synchronized('{lock_key}')
     def _create_cloned_volume_locked(self, volume, src_vref, vd, lock_key):
@@ -959,21 +970,20 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             {'vol': volume['name'], 'src': src_name, 'lock': lock_key})
         return {'provider_location': volume.provider_location}
 
-    def _get_provisioned_capacity(self):
-        mount_path = self._get_mount_point_for_share(self.nas_path)
+    def _get_provisioned_capacity(self) -> float:
+        share_string = "%s:%s" % (self.nas_host, self.nas_path)
+        mount_point = self._get_mount_point_for_share(share_string)
         provisioned_bytes = 0
-
-        for filename in os.listdir(mount_path):
-            # Only count cinder volume files to avoid counting temp files or snapshots
-            if filename.startswith('volume-'):
-                filepath = os.path.join(mount_path, filename)
-                try:
-                    # .st_size returns the 'apparent size' (provisioned capacity)
-                    provisioned_bytes += os.stat(filepath).st_size
-                except OSError:
-                    continue
-
-        return provisioned_bytes / float(units.Gi)
+        if os.path.exists(mount_point):
+            for filename in os.listdir(mount_point):
+                if (filename.startswith('volume-') and
+                        not filename.endswith('.info')):
+                    filepath = os.path.join(mount_point, filename)
+                    try:
+                        provisioned_bytes += os.stat(filepath).st_size
+                    except OSError:
+                        continue
+        return round(provisioned_bytes / float(units.Gi), 2)
 
     def get_volume_stats(self, refresh=False) -> dict:
         """Get volume stats.
@@ -1043,21 +1053,21 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     def _update_volume_stats(self) -> None:
         LOG.info('VmstoreNfsDriver _update_volume_stats')
-        self._ensure_shares_mounted()
+
+        # Run the standard NFS stats chain. Our overridden _get_capacity_info
+        # and _get_provisioned_capacity are called here, so no du is invoked.
+        super(VmstoreNfsDriver, self)._update_volume_stats()
+        data = self._stats
+
+        # Count total volumes — not tracked by the parent chain
         share_string = "%s:%s" % (self.nas_host, self.nas_path)
         mount_path = self._get_mount_point_for_share(share_string)
-
-        # Count total volumes for statistics
         total_volumes = 0
         if os.path.exists(mount_path):
             for filename in os.listdir(mount_path):
-                if filename.startswith('volume-') and not filename.endswith('.info'):
+                if (filename.startswith('volume-') and
+                        not filename.endswith('.info')):
                     total_volumes += 1
-
-        capacity, free, provisioned = self._get_capacity_info(share_string)
-
-        max_osr = self.configuration.safe_get('max_over_subscription_ratio')
-        reserved = self.configuration.safe_get('reserved_percentage') or 0
 
         location_info = '%(driver)s:%(host)s:%(path)s' % {
             'driver': self.nas_driver,
@@ -1069,14 +1079,15 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'protocol': self.storage_protocol
         }
 
-        # There will always be exactly 1 pool for NFS driver
+        # There will always be exactly 1 pool for NFS driver.
+        # VMstore always uses thin provisioning regardless of nfs_sparsed_volumes.
         pool = {
             'pool_name': share_string,
-            'total_capacity_gb': capacity / float(units.Gi),
-            'free_capacity_gb': free / float(units.Gi),
-            'reserved_percentage': reserved,
-            'provisioned_capacity_gb': provisioned / float(units.Gi),
-            'max_over_subscription_ratio': max_osr,
+            'total_capacity_gb': data['total_capacity_gb'],
+            'free_capacity_gb': data['free_capacity_gb'],
+            'reserved_percentage': data['reserved_percentage'],
+            'provisioned_capacity_gb': data['provisioned_capacity_gb'],
+            'max_over_subscription_ratio': data['max_over_subscription_ratio'],
             'thin_provisioning_support': True,
             'thick_provisioning_support': False,
             'total_volumes': total_volumes,
@@ -1103,3 +1114,28 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                   {'host': self.host,
                    'backend_name': self.backend_name,
                    'stats': self._stats})
+        
+    def _extend_volume_for_cloned_volume(self, volume, original_size: int) -> None:
+        """Extend cloned volume if the requested size is larger than source."""
+        new_size = volume['size']
+
+        if new_size is None:
+            raise exception.VolumeDriverException(
+                message=_("New cloned volume size cannot be None"))
+
+        if original_size is None:
+            raise exception.VolumeDriverException(
+                message=_("Original source volume size cannot be None"))
+        
+        LOG.debug(
+            "Checking whether cloned volume %s needs resize. "
+            "New size: %s, original size: %s.",
+            volume['id'], new_size, original_size
+        )
+
+        if new_size > original_size:
+            LOG.debug(
+                "Resize the new volume %s to %s.",
+                volume['id'], new_size
+            )
+            self.extend_volume(volume, new_size)
