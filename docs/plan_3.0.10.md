@@ -1,12 +1,10 @@
-# VMstore Cinder Driver — Deep Audit (3.0.10)
-
-Generated during grilling + analysis session, 2026-06-21.
+# VMstore Cinder Driver — Plan for v3.0.10
 
 ---
 
 ## Bugs (by severity)
 
-### HIGH — Fix before next release
+### HIGH
 
 **B1 `api.py:150,229` — TypeError when `causeDetails` is missing from error response**
 `'live VM is still present' in content.get('causeDetails')` raises `TypeError: argument of type 'NoneType' is not iterable` when `causeDetails` is absent. Same at line 229. Any API error without that field crashes and masks the real error.
@@ -79,31 +77,18 @@ Fix: Move `VERSION` to a standalone `version.py` constant, or pass it as a const
 
 ## API_CALL_MAPPING.md Discrepancies
 
-| # | What the doc says | What the code actually does |
-|---|---|---|
-| D1 | `virtualDisk?uuid=<volume.name_id>` | Uses `volume.id` since 3.0.9 fix (VMS-4184) |
-| D2 | Refresh payload: `hostname, volumeFilePath, region` | Also includes `volumeId` (added in 3.0.9) |
-| D3 | All line numbers | Stale — every line reference is off after 3.0.10 edits |
-| D4 | `Tintri-Api-Client: Tintri-Cinder-Driver-3.0.8` in headers section | Code uses `VERSION` constant (now `3.0.10`); doc hardcodes `3.0.8` |
-| D5 | `update_lock()` GET to `/appliance` not documented | Called on every `VmstoreProxy.__init__` and `update_host()` retry |
+Update doc.
 
 ---
 
-## Implementation Rules Violations
+## Implementation Premises
 
-### Method ordering (must match base class order)
+Rely on Openstack base class whenever possible (when we need real change, otherwise we can add logs but execute underlying code).
+The order of the methods should be equal to the base class except for  our _locked sufixed methods which should be placed under their caller pair.
+Follow Openstack cinder driver best practices.
 
-| Method | Current position | Should be |
-|---|---|---|
-| `initialize_connection` | After `_get_share_path` (~line 614) | Before `do_setup` — first method after `get_driver_options` |
-| `copy_image_to_volume` / `copy_volume_to_image` | Between clone methods (~lines 820–841) | Before `create_volume_from_snapshot` |
-| `get_volume_stats` / `_update_volume_stats` block | After `create_cloned_volume` | Before `create_volume` |
-| `_get_capacity_info` | After `_update_volume_stats` | Before `_update_volume_stats` |
-
-### Redundant overrides (should use base class directly)
-
-- `copy_image_to_volume` / `copy_volume_to_image` — pure `LOG + super()`, no added value; can be removed entirely
-- `_do_create_volume` — reimplements parent almost verbatim; remove and call `super()` (resolves B5)
+- Method ordering (done)
+- Removed Redundant overrides (should use base class directly)
 
 ### Other best-practice violations
 
@@ -119,20 +104,6 @@ Fix: Call `super().initialize_connection(volume, connector)` and only add the VM
 **P3 — `get_volume_stats` ignores `refresh` flag (see B12)**
 
 **P4 — `do_setup` / `check_for_setup_error` infinite retry loop (see B3)**
-
----
-
-## Feature Gap Analysis vs NetApp ONTAP NFS Driver
-
-| Feature | Cinder Method(s) | Achievability | VMstore API Requirement | Notes |
-|---|---|---|---|---|
-| **Extend Attached Volume** | `extend_volume` (inherited) | ACHIEVABLE (offline) / NEEDS_VMSTORE_API (online) | None for offline; live-resize notification for online | Offline extend already works via inherited `NfsDriver.extend_volume`. `online_extend_support: False` is correctly declared. |
-| **Multi-Attach** | No new method — set `multiattach: True` in pool stats | **ACHIEVABLE** | None — NFS is inherently multi-mount | Change pool dict to `True`. Verify `initialize_connection` is re-entrant. Test hypervisor refresh on multi-host attach. |
-| **Volume Migration (Storage Assisted)** | `migrate_volume(context, volume, host)` | **NEEDS_VMSTORE_API** | Atomic server-side file-move endpoint — not in v310 API | Without it, Cinder falls back to host-assisted migration automatically (return `(False, {})`). |
-| **Consistency Groups** | `create_group`, `delete_group`, `update_group`, `create_group_snapshot`, `delete_group_snapshot`, `create_group_from_src` | ACHIEVABLE (non-atomic) / NEEDS_VMSTORE_API (crash-consistent) | Multi-volume atomic snapshot endpoint for crash-consistency | `create_group`/`delete_group`/`update_group` need no backend call. `create_group_snapshot` can iterate single snapshots (non-atomic). Declare `consistencygroup_support: True` only if non-atomic semantics are acceptable. |
-| **Volume Replication** | `failover_host`, `enable_replication`, `disable_replication`, `failover_replication` | **NEEDS_VMSTORE_API** | Replication-relationship API, secondary VMstore stanza, failover/promote endpoints — none in v310 | Largest feature gap. VMstore hardware HA does not map to Cinder's replication model. |
-| **QoS** | Internal hook in `create_volume` / `extend_volume` reading volume-type extra specs | **NEEDS_VMSTORE_API** | Per-file IOPS/throughput policy endpoint on virtualDisk resource | If VMstore performance policies exist in firmware, they need REST exposure. Extra spec key convention TBD (e.g. `vmstore:qos_policy`). |
-| **Active/Active HA** | `SUPPORTS_ACTIVE_ACTIVE = True` class attr; `failover()`; `failover_completed()` | **NEEDS_VMSTORE_API** | Same as Replication | Once Replication is implemented, splitting `failover_host` into `failover` + `failover_completed` is a pure driver change. |
 
 ---
 
@@ -156,11 +127,60 @@ Used to "avoid genopts pattern detection." Better: use keystonemiddleware's alre
 
 ---
 
-## Prioritised Remediation Order
+## Architecture Refactor Plan
+
+### 1. Transport layer — proxy dispatch + request engine (A+B) · **IN PROGRESS**
+
+**Sources:** Review 1 candidates A and B.
+
+**Problem (A):** `VmstoreProxy.__getattr__` synthesises `get`, `post`, `delete`, and `put`
+as `VmstoreRequest` objects at call time. The proxy has no navigable interface; tests
+cannot mock a specific HTTP verb without intercepting `__getattr__`. The only reason
+`api.py` imported `nfs.py` was to read `VmstoreNfsDriver.VERSION` for the session
+header — a circular import for one string.
+
+**Problem (B):** `VmstoreRequest` conflates five concerns — retry loop, HTTP execution,
+auth refresh (401 hook), pagination (recursive hook), and error translation — in one
+object with no seams. The `requests` response-hook callbacks recurse back into
+`self.request()` for pagination, making it impossible to test any concern in isolation.
+The `cinder/host/refresh` path was special-cased by string match in three separate
+spots.
+
+**Solution:**
+- Replace `__getattr__` with explicit `get / post / delete / put` methods on
+  `VmstoreProxy`, each delegating to a private `_execute` method.
+- Delete `VmstoreRequest`. Move its concerns into focused private methods on
+  `VmstoreProxy`: `_execute` (retry loop), `_attempt` (single attempt + 401
+  re-auth), `_collect` (explicit pagination loop — no hooks, no recursion),
+  `_send_raw` (raw HTTP, no logic), `_check_error` (error translation), `_auth`
+  (re-authentication).
+- `VmstoreCinderRefresh.create()` overrides base `create()` to call
+  `self.proxy._execute_strict(...)` — a dedicated method that raises immediately
+  on any error and uses the `refresh_retries` budget. No string checks anywhere.
+- Break circular import: `VmstoreProxy.__init__` receives `client_version` as a
+  parameter; `nfs.py` passes `'Tintri-Cinder-Driver-%s' % self.VERSION` at
+  instantiation. No `version.py` needed.
+- `update_lock()` calls `self._attempt('get', 'appliance')` directly (single
+  attempt) rather than `self.get(...)` to avoid infinite recursion: `_execute`
+  calls `update_host()` on retry, which calls `update_lock()`.
+
+**Locality gain:** Pagination is one explicit `while` loop in `_collect`.
+Auth refresh is one method. Retry budget is the loop bound in `_execute`.
+
+**Test gain:** `proxy.get` / `proxy.post` are real callables — `mock.patch.object`
+works without `__getattr__` interceptors. Pagination tested by injecting a
+two-page mock response into `_collect`. Auth refresh tested through `_attempt`
+alone.
+
+---
+
+
+## Prioritised Implementation Order
 
 1. **B1, B2, B3, B4, B8, B11, B12** — correctness bugs that surface under load or misconfiguration
 2. **Method reordering** — low risk, high maintainability payoff
-3. **Remove redundant overrides** (`copy_image_to_volume`, `copy_volume_to_image`, `_do_create_volume`)
+3. **Remove redundant overrides** (`_do_create_volume`)
 4. **Update `docs/API_CALL_MAPPING.md`** — D1–D5
 5. **Enable Multi-Attach** — one-line pool stat change + testing
-6. **Plan VMstore API extensions** for QoS, then Consistency Groups (non-atomic path first), then Replication + HA
+
+__INFO__: 5 will be set from a configuration setting for easily testing and validation.

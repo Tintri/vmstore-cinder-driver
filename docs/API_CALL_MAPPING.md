@@ -144,19 +144,20 @@ GET https://<vmstore-host>:<port>/api/v310/appliance
 
 ---
 
-#### 3. Virtual Disk Lookup (Line 434)
+#### 3. Virtual Disk Lookup
 
-### nfs.py:434
+### nfs.py (`_get_virtual_disk_with_retry`)
 ```python
-vd = self.vmstore.virtual_disk.get(volume.name_id)
+vd = self.vmstore.virtual_disk.get(volume.id)
 ```
+> **Note (3.0.9 / VMS-4184):** Changed from `volume.name_id` to `volume.id`.
 
-### api.py: VmstoreVirtualDisks.get() (Lines 377-379)
+### api.py: VmstoreVirtualDisks.get()
 ```python
 class VmstoreVirtualDisks(VmstoreCollections):
     def __init__(self, proxy):
         self.root = 'virtualDisk'
-    
+
     def get(self, uuid):
         path = '%s?uuid=%s' % (self.root, uuid)
         return self.proxy.get(path)
@@ -164,7 +165,7 @@ class VmstoreVirtualDisks(VmstoreCollections):
 
 ### **Actual HTTP GET Request:**
 ```
-GET https://<vmstore-host>:<port>/api/v310/virtualDisk?uuid=<volume.name_id>
+GET https://<vmstore-host>:<port>/api/v310/virtualDisk?uuid=<volume.id>
 ```
 
 ---
@@ -279,14 +280,16 @@ https://vmstore.example.com:443/api/v310/snapshot?contain=my-volume-123
 
 ## Session and Authentication
 
-### Session Headers (api.py Lines 450-457)
+### Session Headers (api.py — `VmstoreProxy.__init__`)
 ```python
+client_version = 'Tintri-Cinder-Driver-%s' % nfs.VmstoreNfsDriver.VERSION
 self.headers = {
     'Content-Type': 'application/json',
     'X-XSS-Protection': '1',
-    'Tintri-Api-Client': 'Tintri-Cinder-Driver-3.0.8'
+    'Tintri-Api-Client': client_version  # e.g. 'Tintri-Cinder-Driver-3.0.10'
 }
 ```
+> **Note:** The version string is read from `VmstoreNfsDriver.VERSION` at runtime, not hardcoded.
 
 ### Authentication Flow (VmstoreRequest.auth(), Lines 273-285)
 1. POST to `/session/login` with credentials
@@ -357,9 +360,11 @@ Body: {
     "typeId": "com.tintri.api.rest.v310.dto.domain.beans.cinder.OpenStackHostRefreshSpec",
     "hostname": "<openstack-hostname>",
     "volumeFilePath": "<volume-path>",
-    "region": "<region>"
+    "region": "<region>",
+    "volumeId": "<volume.id>"
 }
 ```
+> **Note (3.0.9):** `volumeId` field added to payload.
 
 ---
 
@@ -473,32 +478,34 @@ DELETE https://<vmstore-host>:<port>/api/v310/snapshot/<snap_uuid>
 
 ### GET Requests
 
-| nfs.py Line | Collection Class | Method | API Path | Full URL |
-|-------------|------------------|--------|----------|----------|
-| 198 | VmstoreSnapshots | list() | `snapshot?contain=...` | `GET /api/v310/snapshot?contain=<name>` |
-| 269 | VmstoreAppliance | get() | `appliance` | `GET /api/v310/appliance` |
-| 434 | VmstoreVirtualDisks | get() | `virtualDisk?uuid=...` | `GET /api/v310/virtualDisk?uuid=<uuid>` |
-| 587 | VmstoreSnapshots | list() | `snapshot?contain=...` | `GET /api/v310/snapshot?contain=<volume_id>` |
-| 739 | VmstoreSnapshots | list() | `snapshot?contain=...` | `GET /api/v310/snapshot?contain=<snapshot_name>` |
+| Caller | Collection Class | Method | API Path | Notes |
+|--------|------------------|--------|----------|-------|
+| `_wait_for_snapshot` | VmstoreSnapshots | list() | `snapshot?contain=<name>[&vmUuid=<uuid>]` | Snapshot polling with backoff |
+| `check_for_setup_error` | VmstoreAppliance | get() | `appliance` | Liveness check |
+| `VmstoreProxy.update_lock` | VmstoreAppliance | get() | `appliance` | Called on init and every retry; not in nfs.py directly |
+| `_get_virtual_disk_with_retry` | VmstoreVirtualDisks | get() | `virtualDisk?uuid=<volume.id>` | Uses `volume.id` since 3.0.9 |
+| `_delete_volume_snapshots` | VmstoreSnapshots | list() | `snapshot?contain=<volume_id>` | Cleanup before volume delete |
+| `_delete_snapshot_locked` | VmstoreSnapshots | list() | `snapshot?contain=<snapshot_name>` | Find UUID for deletion |
 
 ### POST Requests
 
-| nfs.py Line | Collection Class | Method | API Path | Full URL |
-|-------------|------------------|--------|----------|----------|
-| 412 | VmstoreCinderRefresh | create() | `cinder/host/refresh` | `POST /api/v310/cinder/host/refresh` |
-| 718 | VmstoreSnapshots | create() | `cinder/snapshot` | `POST /api/v310/cinder/snapshot` |
-| 808 | VmstoreClones | create() | `cinder/clone` | `POST /api/v310/cinder/clone` |
-| 938 | VmstoreSnapshots | create() | `cinder/snapshot` | `POST /api/v310/cinder/snapshot` |
-| 979 | VmstoreClones | create() | `cinder/clone` | `POST /api/v310/cinder/clone` |
+| Caller | Collection Class | Method | API Path | Notes |
+|--------|------------------|--------|----------|-------|
+| `refresh_hypervisor` | VmstoreCinderRefresh | create() | `cinder/host/refresh` | Payload includes `volumeId` since 3.0.9 |
+| `_create_snapshot_locked` | VmstoreSnapshots | create() | `cinder/snapshot` | `deletionPolicy: DELETE_ON_EXPIRATION` |
+| `_create_volume_from_snapshot_locked` | VmstoreClones | create() | `cinder/clone` | Clone from snapshot |
+| `_create_cloned_volume_locked` | VmstoreSnapshots | create() | `cinder/snapshot` | `deletionPolicy: DELETE_ON_ZERO_CLONE_REFERENCES` |
+| `_create_cloned_volume_locked` | VmstoreClones | create() | `cinder/clone` | Clone from temp snapshot |
 
 ### DELETE Requests
 
-| nfs.py Line | Collection Class | Method | API Path | Full URL |
-|-------------|------------------|--------|----------|----------|
-| 595 | VmstoreSnapshots | delete() | `snapshot/<uuid>` | `DELETE /api/v310/snapshot/<snap_uuid>` |
-| 753 | VmstoreSnapshots | delete() | `snapshot/<uuid>` | `DELETE /api/v310/snapshot/<snap_uuid>` |
+| Caller | Collection Class | Method | API Path | Notes |
+|--------|------------------|--------|----------|-------|
+| `_delete_volume_snapshots` | VmstoreSnapshots | delete() | `snapshot/<uuid>` | Per-snapshot cleanup |
+| `_delete_snapshot_locked` | VmstoreSnapshots | delete() | `snapshot/<uuid>` | Cinder delete_snapshot path |
 
-### Notes:
+### Notes
 - **No PUT/PATCH operations** are used in nfs.py
-- All requests go through `VmstoreRequest` in api.py which handles retry logic, authentication, and error handling
-- POST/DELETE requests follow the same execution flow as GET requests through `VmstoreRequest.request()` at line 189
+- Line numbers are intentionally omitted — they shift with each release. Use method names as stable references.
+- All requests go through `VmstoreRequest` in api.py which handles retry logic, authentication, and pagination.
+- `VmstoreProxy.update_lock()` issues a `GET /appliance` outside of any nfs.py method — on proxy init and on each retry cycle.
