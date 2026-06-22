@@ -4,7 +4,7 @@
 
 |Vmstore version|CSI driver version|
 |---|---|
-|>=6.0.1.1|>=3.0.8|
+|>=6.0.1.1|>=3.0.10|
 
 ## Prerequisites
 
@@ -116,3 +116,115 @@ After requesting a snapshot, the driver polls until it appears. Backoff starts a
 ```bash
 sudo systemctl restart openstack-cinder-volume.service
 ```
+
+---
+
+## Testing
+
+The test strategy is described in [docs/testing-plan.md](./docs/testing-plan.md).
+At the moment, Level 1 and Level 2 from that plan are implemented.
+
+### Implemented levels
+
+| Level | Status | Description |
+|---|---|---|
+| Level 1 | Implemented | Unit tests for `nfs.py`, `api.py`, and `utils.py` with VMstore and Cinder dependencies mocked. |
+| Level 2 | Implemented | In-process Cinder functional tests using the official `cinder/tests/functional/` infrastructure with the VMstore REST API mocked in-process. |
+| Level 3 | Planned | Containerized multi-service integration environment. |
+| Level 4 | Planned | DevStack plus a real VMstore appliance for release validation. |
+
+### Test environment
+
+All automated tests are intended to run inside the test container. The host does
+not need a Python virtualenv or local dependency installation for the unit and
+functional suites.
+
+The container build does the following:
+
+- Clones the `cinder` repository into the image.
+- Installs Cinder test dependencies inside the image.
+- Copies the driver code from this repository into the cloned Cinder tree.
+- Copies the VMstore unit and functional tests into the cloned Cinder tree.
+
+### Run tests
+
+Build the test image:
+
+```bash
+docker compose -f test/docker-compose.yml build tests
+```
+
+Run Level 1 unit tests:
+
+```bash
+docker compose -f test/docker-compose.yml run --rm tests unit
+```
+
+Run Level 2 functional tests:
+
+```bash
+docker compose -f test/docker-compose.yml run --rm tests functional
+```
+
+Run both suites in sequence:
+
+```bash
+docker compose -f test/docker-compose.yml run --rm tests all
+```
+
+### What Level 2 covers
+
+The Level 2 suite runs against Cinder's official in-process functional harness.
+It starts the Cinder API, scheduler, and volume service in-process, uses SQLite,
+loads the real VMstore driver, and replaces only the external seams:
+
+- VMstore REST API calls are mocked in-process.
+- NFS mount handling is redirected to a temporary local directory.
+- File lifecycle operations still run for real inside that temporary directory.
+
+The current functional coverage includes:
+
+- Create and delete volume
+- Create and delete snapshot
+- Create volume from snapshot
+- Create cloned volume
+- Multiple independent volume lifecycles
+
+### Test Runtime notes
+
+**Note 01**
+
+Level 2 is slower than the unit suite because each test starts the in-process
+Cinder stack. In the current implementation, the full functional suite takes
+about 5 minutes and 23 seconds in the container. This is the main residual risk
+for pre-merge feedback time.
+
+**Note 02**
+
+  For this test setup, **warnings are expected**.
+
+```text
+warnings.warn(
+  /usr/local/lib/python3.10/site-packages/eventlet/__init__.py:83: DeprecationWarning: Using fork() is a bad idea, and there is no guarantee eventlet will work. See https://eventlet.readthedocs.io/en/latest/fork.html for more details.
+    warnings.warn(
+  /usr/local/lib/python3.10/site-packages/eventlet/__init__.py:83: DeprecationWarning: Using fork() is a bad idea, and there is no guarantee eventlet will work. See https://eventlet.readthedocs.io/en/latest/fork.html for more details. 
+```
+
+  They are coming from upstream Cinder’s current functional test infrastructure, not from the VMstore driver:
+
+  - cinder/cinder/service.py:543 is Cinder starting its in-process API/service stack with Eventlet-backed server code.
+  - eventlet ... Using fork() is a bad idea appears because the functional harness starts services in a way that triggers Eventlet’s deprecation warnings.
+
+  What they mean:
+
+  - OpenStack Cinder still uses Eventlet in parts of its test/runtime stack.
+  - Eventlet is deprecated upstream, so newer dependencies now emit warnings loudly.
+  - The tests can still pass correctly; these are warning-level signals about future migration work in Cinder, not evidence that your Level 2 tests are broken.
+
+  What matters for this repo:
+
+  - They do not indicate a VMstore driver defect.
+  - They do not invalidate the containerized unit/functional results.
+  - They are effectively noise from the upstream cinder/tests/functional harness you asked to rely on.
+
+
