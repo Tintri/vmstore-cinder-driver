@@ -219,12 +219,12 @@ warnings.warn(
 
   - OpenStack Cinder still uses Eventlet in parts of its test/runtime stack.
   - Eventlet is deprecated upstream, so newer dependencies now emit warnings loudly.
-  - The tests can still pass correctly; these are warning-level signals about future migration work in Cinder, not evidence that your Level 2 tests are broken.
+  - The tests can still pass correctly; these are warning-level signals about future migration work in Cinder, not evidence that our Level 2 tests are broken.
 
   What matters for this repo:
 
   - They do not indicate a VMstore driver defect.
   - They do not invalidate the containerized unit/functional results.
-  - They are effectively noise from the upstream cinder/tests/functional harness you asked to rely on.
+  - They are effectively noise from the upstream cinder/tests/functional harness we rely on.
 
 
