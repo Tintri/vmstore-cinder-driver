@@ -523,7 +523,6 @@ class VmstoreProxy(object):
             if attempt == 0:
                 attempt = self.retries
         interval = float(backoff * (2 ** (attempt - 1)))
-        sleep_seconds = int(interval)
-        LOG.debug('Waiting for %(interval)s seconds', {'interval': sleep_seconds})
-        greenthread.sleep(sleep_seconds)
+        LOG.debug('Waiting for %(interval)s seconds', {'interval': interval})
+        greenthread.sleep(interval)  # type: ignore # eventlet accepts float seconds
         return interval
