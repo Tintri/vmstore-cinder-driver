@@ -289,6 +289,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 self.vmstore.delay(retries)
             else:
                 time.sleep(retries)
+        # Mount the NFS share so _mounted_shares is populated before
+        # _report_driver_status calls get_volume_stats. Without this,
+        # the first stats report has zero capacity and the scheduler
+        # rejects the backend until a volume create triggers mounting.
+        self._ensure_shares_mounted()
 
     def _validate_required_options(self) -> None:
         """Validate that required configuration options are set."""
