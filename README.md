@@ -4,7 +4,7 @@
 
 |Vmstore version|CSI driver version|
 |---|---|
-|>=6.0.1.1|>=3.0.8|
+|>=6.0.1.1|>=3.0.10|
 
 ## Prerequisites
 
@@ -59,7 +59,7 @@ vmstore_qcow2_volumes = False
 |`vmstore_rest_protocol`|String|`https`|no|Vmstore RESTful API interface protocol.|
 |`vmstore_rest_port`|Integer|`443`|no|Vmstore RESTful API interface port.|
 |`nas_host`|String|-|yes|Vmstore data IP for volume mount, IO operations.|
-|`vmstore_user`|String|`2240`|yes|Username to connect to Vmstore REST API interface.|
+|`vmstore_user`|String|`admin`|yes|Username to connect to Vmstore REST API interface.|
 |`vmstore_password`|String|-|yes|User password to connect to Vmstore RESTful API interface.|
 |`vmstore_rest_connect_timeout`|Float|`30`|no|Specifies the time limit (in seconds) to establish connection to Vmstore REST API interface.|
 |`vmstore_rest_read_timeout`|Float|`300`|no|Specifies the time limit (in seconds) for Vmstore REST API interface to send a response.|
@@ -73,9 +73,158 @@ vmstore_qcow2_volumes = False
 |`vmstore_refresh_openstack_region`|String|``|no|OpenStack region for Vmstore hypervisor refresh call.|
 |`vmstore_openstack_hostname`|String|-|no|OpenStack controller hostname or IP. Used for VMstore hypervisor refresh. If not set, attempts to resolve from Keystone config.|
 |`vmstore_stats_cache_period`|Int|59|no|Period in seconds for caching volume statistics. Stats will be refreshed only if the cache is older than this value. Set to 0 to disable caching.|
+|`vmstore_get_vd_timeout`|Int|`8`|no|Maximum time in seconds to wait for a single virtual disk lookup attempt.|
+|`vmstore_virtual_disk_retries`|Int|`3`|no|Number of retries for virtual disk lookup before failing. Each retry triggers a hypervisor refresh and uses exponential backoff.|
+|`vmstore_snapshot_poll_timeout`|Int|`30`|no|Maximum total time in seconds to poll for a snapshot to appear in the VMstore index after creation.|
+|`vmstore_snapshot_poll_initial_delay`|Float|`0.5`|no|Initial delay in seconds between snapshot poll attempts. Doubles on each retry up to `vmstore_snapshot_max_delay`.|
+|`vmstore_snapshot_max_delay`|Float|`12.0`|no|Cap in seconds on the exponential backoff delay for snapshot polling.|
+|`vmstore_use_volume_locks`|Boolean|`True`|no|When True, coordination locks are scoped per volume, allowing concurrent operations on different volumes. Set to False for legacy backend-wide locking.|
+
+### Performance Tuning
+
+After a volume or snapshot is created, VMstore may take a moment to populate its internal index. The driver uses exponential backoff and retries to wait for this—controlled by the options below. These defaults are calibrated for a local-network deployment; high-latency or bursty environments benefit from higher values.
+
+#### Virtual disk rediscovery
+
+When a create or clone operation completes, the driver queries VMstore for the resulting virtual disk. If it is not yet visible, the driver fires a hypervisor refresh and retries with exponential backoff:
+
+- `vmstore_virtual_disk_retries` — how many times to retry before failing (default: 3)
+- `vmstore_get_vd_timeout` — per-attempt lookup timeout in seconds (default: 8)
+
+#### Snapshot polling
+
+After requesting a snapshot, the driver polls until it appears. Backoff starts at `vmstore_snapshot_poll_initial_delay` and doubles each cycle, capped at `vmstore_snapshot_max_delay`, until `vmstore_snapshot_poll_timeout` is reached:
+
+- `vmstore_snapshot_poll_timeout` — total polling window in seconds (default: 30)
+- `vmstore_snapshot_poll_initial_delay` — first poll delay in seconds (default: 0.5)
+- `vmstore_snapshot_max_delay` — maximum single sleep in seconds (default: 12.0)
+
+#### Concurrency
+
+`vmstore_use_volume_locks` (default True) scopes coordination locks per volume so that operations on different volumes can proceed in parallel. Set to False only if you need the legacy single-lock behaviour for compatibility with older deployments.
+
+#### Environment profiles
+
+| Environment | Suggested overrides |
+|---|---|
+| Standard LAN deployment | Defaults are appropriate |
+| High-latency or WAN-linked controller (e.g. PF9 multi-region) | `vmstore_snapshot_poll_timeout = 120`, `vmstore_virtual_disk_retries = 5`, `vmstore_rest_retry_count = 10` |
+| Large deployment with many concurrent volumes | Keep `vmstore_use_volume_locks = True`; raise `vmstore_stats_cache_period` to 120–300 |
 
 ### Restart Openstack Cinder service
 
 ```bash
 sudo systemctl restart openstack-cinder-volume.service
 ```
+
+---
+
+## Testing
+
+The test strategy is described in [docs/testing-plan.md](./docs/testing-plan.md).
+At the moment, Level 1 and Level 2 from that plan are implemented.
+
+### Implemented levels
+
+| Level | Status | Description |
+|---|---|---|
+| Level 1 | Implemented | Unit tests for `nfs.py`, `api.py`, and `utils.py` with VMstore and Cinder dependencies mocked. |
+| Level 2 | Implemented | In-process Cinder functional tests using the official `cinder/tests/functional/` infrastructure with the VMstore REST API mocked in-process. |
+| Level 3 | Planned | Containerized multi-service integration environment. |
+| Level 4 | Planned | DevStack plus a real VMstore appliance for release validation. |
+
+### Test environment
+
+All automated tests are intended to run inside the test container. The host does
+not need a Python virtualenv or local dependency installation for the unit and
+functional suites.
+
+The container build does the following:
+
+- Clones the `cinder` repository into the image.
+- Installs Cinder test dependencies inside the image.
+- Copies the driver code from this repository into the cloned Cinder tree.
+- Copies the VMstore unit and functional tests into the cloned Cinder tree.
+
+### Run tests
+
+Build the test image:
+
+```bash
+docker compose -f test/docker-compose.yml build tests
+```
+
+Run Level 1 unit tests:
+
+```bash
+docker compose -f test/docker-compose.yml run --rm tests unit
+```
+
+Run Level 2 functional tests:
+
+```bash
+docker compose -f test/docker-compose.yml run --rm tests functional
+```
+
+Run both suites in sequence:
+
+```bash
+docker compose -f test/docker-compose.yml run --rm tests all
+```
+
+### What Level 2 covers
+
+The Level 2 suite runs against Cinder's official in-process functional harness.
+It starts the Cinder API, scheduler, and volume service in-process, uses SQLite,
+loads the real VMstore driver, and replaces only the external seams:
+
+- VMstore REST API calls are mocked in-process.
+- NFS mount handling is redirected to a temporary local directory.
+- File lifecycle operations still run for real inside that temporary directory.
+
+The current functional coverage includes:
+
+- Create and delete volume
+- Create and delete snapshot
+- Create volume from snapshot
+- Create cloned volume
+- Multiple independent volume lifecycles
+
+### Test Runtime notes
+
+**Note 01**
+
+Level 2 is slower than the unit suite because each test starts the in-process
+Cinder stack. In the current implementation, the full functional suite takes
+about 5 minutes and 23 seconds in the container. This is the main residual risk
+for pre-merge feedback time.
+
+**Note 02**
+
+  For this test setup, **warnings are expected**.
+
+```text
+warnings.warn(
+  /usr/local/lib/python3.10/site-packages/eventlet/__init__.py:83: DeprecationWarning: Using fork() is a bad idea, and there is no guarantee eventlet will work. See https://eventlet.readthedocs.io/en/latest/fork.html for more details.
+    warnings.warn(
+  /usr/local/lib/python3.10/site-packages/eventlet/__init__.py:83: DeprecationWarning: Using fork() is a bad idea, and there is no guarantee eventlet will work. See https://eventlet.readthedocs.io/en/latest/fork.html for more details. 
+```
+
+  They are coming from upstream Cinder’s current functional test infrastructure, not from the VMstore driver:
+
+  - cinder/cinder/service.py:543 is Cinder starting its in-process API/service stack with Eventlet-backed server code.
+  - eventlet ... Using fork() is a bad idea appears because the functional harness starts services in a way that triggers Eventlet’s deprecation warnings.
+
+  What they mean:
+
+  - OpenStack Cinder still uses Eventlet in parts of its test/runtime stack.
+  - Eventlet is deprecated upstream, so newer dependencies now emit warnings loudly.
+  - The tests can still pass correctly; these are warning-level signals about future migration work in Cinder, not evidence that our Level 2 tests are broken.
+
+  What matters for this repo:
+
+  - They do not indicate a VMstore driver defect.
+  - They do not invalidate the containerized unit/functional results.
+  - They are effectively noise from the upstream cinder/tests/functional harness we rely on.
+
+

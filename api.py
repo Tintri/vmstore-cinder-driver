@@ -12,11 +12,21 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""VMstore REST API client for Cinder driver."""
+"""VMstore REST API client for Cinder driver.
+    
+    Version history:
+
+    .. code-block:: none
+        3.0-beta - Initial driver version.
+        3.0.6    - cache volume stats, filter list snapshots
+        3.0.8    - Fix BUG: lock uuid Encode
+        3.0.10   - Refactor -> Transport layer: proxy dispatch + request engine
+"""
 
 import hashlib
 import json
 import posixpath
+from typing import Any
 from urllib import parse as urlparse
 
 from eventlet import greenthread
@@ -25,7 +35,6 @@ import requests
 
 from cinder import exception
 from cinder.i18n import _
-from cinder.volume.drivers.vmstore import nfs
 
 LOG = logging.getLogger(__name__)
 
@@ -57,253 +66,15 @@ class VmstoreException(exception.VolumeDriverException):
         for key in defaults:
             if key not in kwargs:
                 kwargs[key] = defaults[key]
+        if (kwargs['causeDetails'] == defaults['causeDetails'] and
+                kwargs.get('message') and
+                kwargs['message'] != defaults['message']):
+            kwargs['causeDetails'] = kwargs['message']
         message = ('%(causeDetails)s (source: %(source)s, '
                    'typeId: %(typeId)s, code: %(code)s)') % kwargs
         self.code = kwargs['code']
         del kwargs['causeDetails']
         super(VmstoreException, self).__init__(message)
-
-
-class VmstoreRequest(object):
-    def __init__(self, proxy, method):
-        self.proxy = proxy
-        self.method = method
-        self.attempts = proxy.retries + 1
-        self.refresh_attempts = proxy.refresh_retries + 1
-        self.payload = None
-        self.error = None
-        self.path = None
-        self.time = 0
-        self.wait = 0
-        self.data = []
-        self.stat = {}
-        self.hooks = {
-            'response': self.hook
-        }
-        self.kwargs = {
-            'hooks': self.hooks,
-            'timeout': self.proxy.timeout
-        }
-
-    def __call__(self, path, payload=None):
-        info = '%(method)s %(url)s %(payload)s' % {
-            'method': self.method,
-            'url': self.proxy.url(path),
-            'payload': payload
-        }
-        LOG.debug('Start request: %(info)s', {'info': info})
-        self.path = path
-        self.payload = payload
-        attempts = self.attempts
-        if path == 'cinder/host/refresh':
-            attempts = self.refresh_attempts
-        for attempt in range(attempts):
-            if self.error:
-                self.delay(attempt)
-                if not self.proxy.update_host():
-                    continue
-                LOG.debug('Retry request %(info)s after %(attempt)s '
-                          'failed attempts, maximum retry attempts '
-                          '%(attempts)s, reason: %(error)s',
-                          {'info': info, 'attempt': attempt,
-                           'attempts': attempts,
-                           'error': self.error})
-            self.data = []
-            try:
-                response = self.request(self.method, self.path, self.payload)
-            except Exception as error:
-                if isinstance(error, VmstoreException):
-                    self.error = error
-                else:
-                    code = 'RESOURCE_NOT_FOUND'
-                    message = str(error)
-                    self.error = VmstoreException(message, code=code)
-                if 'cinder/host/refresh' in self.path:
-                    raise self.error
-                else:
-                    LOG.error('Failed request %(info)s: %(error)s',
-                              {'info': info, 'error': self.error})
-                continue
-            count = sum(self.stat.values())
-            if 'v310/appliance' not in response.request.url:
-                LOG.debug('Finish request %(info)s, '
-                          'response time: %(time)s seconds, '
-                          'wait time: %(wait)s seconds, '
-                          'requests count: %(count)s, '
-                          'requests statistics: %(stat)s, '
-                          'response content: %(content)s',
-                          {'info': info, 'time': self.time,
-                           'wait': self.wait, 'count': count,
-                           'stat': self.stat,
-                           'content': response.content})
-            content = None
-            if response.content:
-                content = json.loads(response.content)
-            if not response.ok:
-                if (content.get('message') and
-                        'does not exist' in content['message']):
-                    code = 'RESOURCE_NOT_FOUND'
-                    message = str(content['message'])
-                    raise VmstoreException(message, code=code)
-                if 'cinder/host/refresh' in self.path:
-                    return VmstoreException(content)
-                elif 'live VM is still present' in content.get('causeDetails'):
-                    LOG.info(
-                        'Could not delete snapshot with existing clones, '
-                        'will be cleaned up when the parent volume is deleted')
-                else:
-                    LOG.error('Failed request %(info)s, '
-                              'response content: %(content)s',
-                              {'info': info, 'content': content})
-                self.error = VmstoreException(content)
-                continue
-            is_created = response.status_code == requests.codes.created
-            if is_created and 'items' in content:
-                return content['items']
-            if isinstance(content, dict) and 'items' in content:
-                return self.data
-            return content
-        LOG.error('Failed request %(info)s, '
-                  'reached maximum retry attempts: '
-                  '%(attempts)s, reason: %(error)s',
-                  {'info': info, 'attempts': attempts,
-                   'error': self.error})
-        raise self.error
-
-    def request(self, method, path, payload):
-        if self.method not in ['get', 'delete', 'put', 'post']:
-            code = 'INVALID_ARGUMENT'
-            message = (_('Request method %(method)s not supported')
-                       % {'method': self.method})
-            raise VmstoreException(code=code, message=message)
-        if not path:
-            code = 'INVALID_ARGUMENT'
-            message = _('Request path is required')
-            raise VmstoreException(code=code, message=message)
-        url = self.proxy.url(path)
-        kwargs = dict(self.kwargs)
-        if payload:
-            if method in ['put', 'post']:
-                kwargs['data'] = json.dumps(payload)
-        return self.proxy.session.request(method, url, **kwargs)
-
-    def hook(self, response, **kwargs):
-        info = (_('session request %(method)s %(url)s %(body)s '
-                  'and session response %(code)s %(content)s')
-                % {'method': response.request.method,
-                   'url': response.request.url,
-                   'body': response.request.body,
-                   'code': response.status_code,
-                   'content': response.content})
-        if 'v310/appliance' not in response.request.url:
-            LOG.debug('Start request hook on %(info)s', {'info': info})
-        if response.status_code not in self.stat:
-            self.stat[response.status_code] = 0
-        self.stat[response.status_code] += 1
-        self.time += response.elapsed.total_seconds()
-        attempt = self.stat[response.status_code]
-        limit = self.attempts
-        if response.ok and not response.content:
-            return response
-        try:
-            content = json.loads(response.content)
-        except (TypeError, ValueError) as error:
-            code = 'INVALID_ARGUMENT'
-            message = (_('Failed request hook on %(info)s: '
-                         'JSON parser error: %(error)s')
-                       % {'info': info, 'error': error})
-            raise VmstoreException(code=code, message=message)
-        if response.ok and (content is None or content == 0):
-            return response
-        if attempt > limit and not response.ok:
-            return response
-        method = 'get'
-        if response.status_code == requests.codes.unauthorized:
-            if not self.auth():
-                raise VmstoreException(content)
-            request = response.request.copy()
-            request.headers.update(self.proxy.session.headers)
-            return self.proxy.session.send(request, **kwargs)
-        elif response.status_code == requests.codes.not_found:
-            if (response.request.method == 'DELETE' and
-                    'Failed to lookup' in content.get('causeDetails')):
-                message = content.get('causeDetails')
-                LOG.info('Did not find volume, ok for delete: %s', message)
-                response.status_code = 200
-            return response
-        elif response.status_code == requests.codes.server_error:
-            if 'code' in content and content['code'] == 'RESOURCE_BUSY':
-                raise VmstoreException(content)
-            return response
-        elif response.status_code == requests.codes.ok:
-            if 'items' not in content or not content['items']:
-                if 'v310/appliance' not in response.request.url:
-                    LOG.debug('Finish request hook on %(info)s: '
-                              'non-paginated content',
-                              {'info': info})
-                return response
-            data = content['items']
-            count = len(data)
-            LOG.debug('Continue request hook on %(info)s: '
-                      'add %(count)s data items to response',
-                      {'info': info, 'count': count})
-            if 'token' not in data:
-                for item in data:
-                    self.data.append(item)
-            path, payload = self.parse(content, 'next')
-            if not path:
-                LOG.debug('Finish request hook on %(info)s: '
-                          'no next page found',
-                          {'info': info})
-                return response
-            if self.payload:
-                payload.update(self.payload)
-            LOG.debug('Continue request hook with new request '
-                      '%(method)s %(path)s %(payload)s',
-                      {'method': method, 'path': path,
-                       'payload': payload})
-            return self.request(method, path, payload)
-
-        if 'v310/appliance' not in response.request.url:
-            LOG.debug('Finish request hook on %(info)s',
-                      {'info': info})
-        return response
-
-    def auth(self):
-        method = 'post'
-        path = '/session/login'
-        payload = {
-            'username': self.proxy.username,
-            "typeId": ("com.tintri.api.rest.vcommon.dto.rbac."
-                       "RestApiCredentials"),
-            'password': self.proxy.password
-        }
-        self.proxy.delete_bearer()
-        response = self.request(method, path, payload)
-        if 'JSESSIONID' in response.cookies:
-            token = response.cookies['JSESSIONID']
-            if token:
-                self.proxy.update_token(token)
-                return True
-        return False
-
-    def delay(self, attempt, sync=True):
-        self.wait += self.proxy.delay(attempt, sync)
-
-    @staticmethod
-    def parse(content, name):
-        if 'links' in content:
-            links = content['links']
-            if isinstance(links, list):
-                for link in links:
-                    if (isinstance(link, dict) and
-                            'href' in link and
-                            'rel' in link and
-                            link['rel'] == name):
-                        url = urlparse.urlparse(link['href'])
-                        payload = urlparse.parse_qs(url.query)
-                        return url.path, payload
-        return None, None
 
 
 class VmstoreCollections(object):
@@ -325,27 +96,23 @@ class VmstoreCollections(object):
     def get(self, payload):
         LOG.debug('Get properties of %(subj)s %(payload)s',
                   {'subj': self.subj, 'payload': payload})
-        path = self.root
-        return self.proxy.get(path, payload)
+        return self.proxy.get(self.root, payload)
 
     def set(self, payload=None):
         LOG.debug('Modify properties of %(subj)s %(payload)s',
                   {'subj': self.subj, 'payload': payload})
-        path = self.root
-        return self.proxy.put(path, payload)
+        return self.proxy.put(self.root, payload)
 
     def list(self, payload=None):
         LOG.debug('Getting list of %(subj)s: %(payload)s',
                   {'subj': self.subj, 'payload': payload})
-        path = self.root
-        return self.proxy.get(path, payload)
+        return self.proxy.get(self.root, payload)
 
     def create(self, payload=None):
         LOG.debug('Create %(subj)s: %(payload)s',
                   {'subj': self.subj, 'payload': payload})
-        path = self.root
         try:
-            return self.proxy.post(path, payload)
+            return self.proxy.post(self.root, payload)
         except VmstoreException as error:
             if error.code != 'RESOURCE_EXIST':
                 raise
@@ -388,23 +155,21 @@ class VmstoreSnapshots(VmstoreCollections):
         self.root = 'snapshot'
         self.subj = 'VolumeSnapshot'
 
-    def list(self, filters=None):
+    def list(self, payload=None):
         """List snapshots with optional filtering.
 
-        :param filters: Dictionary of filter parameters to apply.
-                        Example: {'uuid': 'abc-123', 'name': 'snapshot-1'}
+        :param payload: Dict of filter parameters (e.g. {'contain': name}).
+                        Keys and values are URL-encoded into the query string.
         :return: List of snapshots matching the filters
         """
         path = self.root
-        if filters and isinstance(filters, dict):
-            # Build query string from filters dictionary
+        if payload and isinstance(payload, dict):
             query_params = []
-            for key, value in filters.items():
+            for key, value in payload.items():
                 encoded_value = urlparse.quote_plus(str(value))
                 query_params.append('%s=%s' % (key, encoded_value))
             if query_params:
-                query_string = '&'.join(query_params)
-                path = '%s?%s' % (self.root, query_string)
+                path = '%s?%s' % (self.root, '&'.join(query_params))
         LOG.debug('Getting list of %(subj)s with path: %(path)s',
                   {'subj': self.subj, 'path': path})
         return self.proxy.get(path)
@@ -433,10 +198,19 @@ class VmstoreCinderRefresh(VmstoreCollections):
         self.root = 'cinder/host/refresh'
         self.subj = 'cinderRefresh'
 
+    def create(self, payload=None):
+        """Fire hypervisor refresh. Raises immediately on any error.
+
+        Overrides base create() to use _execute_strict: the refresh endpoint
+        has distinct semantics — any failure must surface to the caller rather
+        than being swallowed by the standard retry-and-log loop.
+        """
+        LOG.debug('Create %s: %s', self.subj, payload)
+        return self.proxy._execute_strict('post', self.root, payload)
+
 
 class VmstoreProxy(object):
-    def __init__(
-            self, proto, backend, conf):
+    def __init__(self, proto, backend, conf, client_version=None):
         self.clones = VmstoreClones(self)
         self.virtual_disk = VmstoreVirtualDisks(self)
         self.snapshots = VmstoreSnapshots(self)
@@ -444,8 +218,9 @@ class VmstoreProxy(object):
         self.cinder_refresh = VmstoreCinderRefresh(self)
         self.version = None
         self.lock = None
-        client_version = (
-            'Tintri-Cinder-Driver-%s' % nfs.VmstoreNfsDriver.VERSION)
+
+        if client_version is None:
+            client_version = 'Tintri-Cinder-Driver'
         self.headers = {
             'Content-Type': 'application/json',
             'X-XSS-Protection': '1',
@@ -473,8 +248,227 @@ class VmstoreProxy(object):
         self.token = ""
         self.update_lock()
 
-    def __getattr__(self, name):
-        return VmstoreRequest(self, name)
+    # ------------------------------------------------------------------
+    # Public HTTP interface — four explicit verbs
+    # ------------------------------------------------------------------
+
+    def get(self, path, payload=None):
+        return self._execute('get', path, payload)
+
+    def post(self, path, payload=None):
+        return self._execute('post', path, payload)
+
+    def delete(self, path, payload=None):
+        return self._execute('delete', path, payload)
+
+    def put(self, path, payload=None):
+        return self._execute('put', path, payload)
+
+    # ------------------------------------------------------------------
+    # Execution engine
+    # ------------------------------------------------------------------
+
+    def _execute(self, method, path, payload=None):
+        """Retry loop: up to retries+1 attempts with backoff and session refresh.
+
+        On each failure the error is logged and the session is refreshed before
+        the next attempt. After exhausting all attempts the last exception is
+        re-raised.
+        """
+        last_error = None
+        info = '%s %s' % (method.upper(), self.url(path))
+        for attempt in range(self.retries + 1):
+            if last_error:
+                self.delay(attempt)
+                self.update_host()
+                LOG.debug('Retry %s attempt %s/%s after: %s',
+                          info, attempt, self.retries, last_error)
+            try:
+                return self._attempt(method, path, payload)
+            except VmstoreException as exc:
+                last_error = exc
+                LOG.error('Failed %s: %s', info, exc)
+        LOG.error('Reached maximum %s retries for %s: %s',
+                  self.retries, info, last_error)
+        raise last_error or VmstoreException(
+            message=_('All %s retries exhausted for %s') % (self.retries, info))
+
+    def _execute_strict(self, method, path, payload=None):
+        """Execution for endpoints that must raise immediately on any error.
+
+        Uses refresh_retries as the attempt budget but raises on the first
+        failure without logging-and-continuing. Intended for VmstoreCinderRefresh
+        where the caller needs to handle the error explicitly.
+        """
+        last_error = None
+        for attempt in range(self.refresh_retries + 1):
+            if last_error:
+                self.delay(attempt)
+                self.update_host()
+            try:
+                response = self._send_raw(method, path, payload)
+            except Exception as exc:
+                raise VmstoreException(str(exc), code='RESOURCE_NOT_FOUND')
+            content = self._parse_content(response)
+            if not response.ok:
+                raise VmstoreException(content)
+            return content
+        raise last_error or VmstoreException(
+            message=_('Strict execution exhausted retries without a response'))
+
+    def _attempt(self, method, path, payload=None):
+        """Single attempt: send request, re-auth on 401, collect response."""
+        response = self._send_raw(method, path, payload)
+        if response.status_code == requests.codes.unauthorized:
+            if self._auth():
+                response = self._send_raw(method, path, payload)
+        return self._collect(method, response)
+
+    def _collect(self, method, response):
+        """Parse response and follow pagination links for GET requests.
+
+        Pagination uses an explicit loop rather than recursive hook callbacks,
+        making each page fetch visible and independently testable.
+        """
+        content = self._parse_content(response)
+        self._check_error(response, content)
+
+        # Normalised to success by _check_error (e.g. idempotent DELETE 404)
+        if not response.ok:
+            return None
+
+        # Some endpoints return None or 0 for success with no body
+        if content is None or content == 0:
+            return content
+
+        # POST 201 Created with items: return immediately, no pagination
+        if (response.status_code == requests.codes.created
+                and isinstance(content, dict)
+                and 'items' in content):
+            return content['items']
+
+        # Non-paginated response or non-GET verb: return content as-is
+        if (method != 'get'
+                or not isinstance(content, dict)
+                or 'items' not in content):
+            return content
+
+        # Paginated GET: explicit loop
+        results = list(content['items'])
+        next_path, next_payload = self._next_link(content)
+        while next_path:
+            r = self._send_raw('get', next_path, next_payload)
+            c = self._parse_content(r)
+            self._check_error(r, c)
+            if isinstance(c, dict):
+                results.extend(c.get('items', []))
+                next_path, next_payload = self._next_link(c)
+            else:
+                break
+        return results
+
+    # ------------------------------------------------------------------
+    # HTTP primitives
+    # ------------------------------------------------------------------
+
+    def _send_raw(self, method, path, payload=None):
+        """Send one HTTP request. No retry, no error handling, no side effects."""
+        if method not in ('get', 'post', 'put', 'delete'):
+            raise VmstoreException(
+                code='INVALID_ARGUMENT',
+                message=_('Request method %s not supported') % method)
+        if not path:
+            raise VmstoreException(
+                code='INVALID_ARGUMENT',
+                message=_('Request path is required'))
+        url = self.url(path)
+        kwargs: dict[str, Any] = {'timeout': self.timeout}
+        if payload and method in ('post', 'put'):
+            kwargs['data'] = json.dumps(payload)
+        if 'v310/appliance' not in url:
+            LOG.debug('%s %s %s', method.upper(), url, payload)
+        return self.session.request(method, url, **kwargs)
+
+    def _parse_content(self, response):
+        """Parse JSON response body. Returns None for empty responses."""
+        if not response.content:
+            return None
+        try:
+            return json.loads(response.content)
+        except (TypeError, ValueError) as exc:
+            raise VmstoreException(
+                code='INVALID_ARGUMENT',
+                message=_('JSON parse error on response: %s') % exc)
+
+    def _check_error(self, response, content):
+        """Raise VmstoreException for error responses, with documented exceptions.
+
+        Special cases (do NOT raise):
+          - DELETE 404 with 'Failed to lookup' — idempotent, treat as success.
+
+        Special cases (raise with typed code):
+          - 404 with 'does not exist' in message — RESOURCE_NOT_FOUND.
+          - 500 RESOURCE_BUSY — propagate immediately so caller can retry.
+
+        Snapshot-delete with active clones is logged before raising so the
+        collection-level handler in VmstoreCollections.delete() can catch it.
+        """
+        if response.ok:
+            return
+        # Idempotent DELETE: 404 "Failed to lookup" is success
+        if (response.status_code == requests.codes.not_found
+                and response.request.method == 'DELETE'
+                and 'Failed to lookup' in (
+                    (content or {}).get('causeDetails') or '')):
+            return
+        # Typed not-found
+        if (isinstance(content, dict)
+                and content.get('message')
+                and 'does not exist' in content['message']):
+            raise VmstoreException(content['message'], code='RESOURCE_NOT_FOUND')
+        # Resource busy — let the retry loop handle it
+        if (response.status_code == requests.codes.server_error
+                and isinstance(content, dict)
+                and content.get('code') == 'RESOURCE_BUSY'):
+            raise VmstoreException(content)
+        # Active-clone guard on snapshot delete
+        if (isinstance(content, dict)
+                and 'live VM is still present' in (
+                    content.get('causeDetails') or '')):
+            LOG.info('Could not delete snapshot with existing clones; '
+                     'will be cleaned up when the parent volume is deleted')
+        raise VmstoreException(content)
+
+    def _next_link(self, content):
+        """Return (path, payload) for the next page link, or (None, None)."""
+        for link in content.get('links', []):
+            if isinstance(link, dict) and link.get('rel') == 'next':
+                href = link.get('href', '')
+                parsed = urlparse.urlparse(href)
+                payload = urlparse.parse_qs(parsed.query)
+                return parsed.path, payload
+        return None, None
+
+    def _auth(self):
+        """Re-authenticate and update session token. Returns True on success."""
+        payload = {
+            'username': self.username,
+            'typeId': ('com.tintri.api.rest.vcommon.dto.rbac.'
+                       'RestApiCredentials'),
+            'password': self.password,
+        }
+        self.delete_bearer()
+        response = self._send_raw('post', '/session/login', payload)
+        if 'JSESSIONID' in response.cookies:
+            token = response.cookies['JSESSIONID']
+            if token:
+                self.update_token(token)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
 
     def delete_bearer(self):
         if 'Authorization' in self.session.headers:
@@ -493,8 +487,17 @@ class VmstoreProxy(object):
         self.update_bearer(self.token)
 
     def update_lock(self):
+        """Refresh the appliance UUID-based coordination lock.
+
+        Uses _attempt (single try, no retry) rather than the public get() to
+        avoid infinite recursion: _execute calls update_host() between retries,
+        which calls update_lock(), which must not re-enter _execute.
+        """
         try:
-            uuid = self.get('appliance')[0]['uuid']
+            result = self._attempt('get', 'appliance')
+            if not result:
+                return False
+            uuid = result[0]['uuid']
         except Exception:
             return False
 
@@ -509,8 +512,7 @@ class VmstoreProxy(object):
             path = ''
         netloc = '%s:%d/api/v310' % (self.host, self.port)
         components = (self.scheme, netloc, path, None, None)
-        url = urlparse.urlunsplit(components)
-        return url
+        return urlparse.urlunsplit(components)
 
     def delay(self, attempt, sync=True):
         backoff = self.backoff
@@ -521,7 +523,6 @@ class VmstoreProxy(object):
             if attempt == 0:
                 attempt = self.retries
         interval = float(backoff * (2 ** (attempt - 1)))
-        LOG.debug('Waiting for %(interval)s seconds',
-                  {'interval': interval})
-        greenthread.sleep(interval)
+        LOG.debug('Waiting for %(interval)s seconds', {'interval': interval})
+        greenthread.sleep(interval)  # type: ignore # eventlet accepts float seconds
         return interval

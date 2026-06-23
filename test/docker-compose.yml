@@ -1,0 +1,12 @@
+services:
+  tests:
+    build:
+      # Build context is the repo root so COPY has access to driver source files
+      context: ..
+      dockerfile: test/Dockerfile
+      args:
+        # Pin to a specific OpenStack release for reproducibility, e.g. stable/2024.1
+        CINDER_REF: master
+    environment:
+      OS_TEST_TIMEOUT: "120"
+      PYTHONDONTWRITEBYTECODE: "1"
