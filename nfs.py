@@ -392,7 +392,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                         ) % {'share': share_address}
                 raise exception.InvalidConfigurationValue(msg)
 
-            self.shares[share_address] = self.mount_options
+            self.shares[share_address] = getattr(
+                self.configuration, 'nas_mount_options', None)
 
         else:
             msg = 'nas_host or nas_share_path not configured.'

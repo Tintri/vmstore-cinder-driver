@@ -65,10 +65,13 @@ class VmstoreNfsDriverTestCase(test.TestCase):
         self.configuration.volume_dd_blocksize = '1M'
         self.configuration.nas_secure_file_operations = 'auto'
         self.configuration.nas_secure_file_permissions = 'auto'
+        self.configuration.nas_mount_options = None
+        self.configuration.nfs_mount_attempts = 1
 
         def safe_get_side_effect(key):
             config_map = {
                 'nfs_mount_options': 'lookupcache=pos,nolock,noacl,proto=tcp',
+                'nas_mount_options': None,
                 'volume_dd_blocksize': '1M',
                 'nas_secure_file_operations': 'auto',
                 'nas_secure_file_permissions': 'auto',
@@ -143,6 +146,27 @@ class VmstoreNfsDriverTestCase(test.TestCase):
         self.assertTrue(vol_dir.startswith('/mnt/vmstore/'))
         hash_part = os.path.basename(vol_dir)
         self.assertEqual(32, len(hash_part))
+
+    def test_load_shares_uses_nas_mount_options_not_global_nfs_options(self):
+        """Per-share options must not duplicate global RemoteFsClient options."""
+        driver = self._get_driver()
+
+        driver._load_shares()
+
+        self.assertEqual(
+            {'192.168.1.1:/tintri/test_share': None},
+            driver.shares)
+
+    def test_ensure_share_mounted_does_not_pass_duplicate_mount_flags(self):
+        """The mount call should rely on global options when no NAS override exists."""
+        driver = self._get_driver()
+        driver._remotefsclient.mount = mock.Mock()
+
+        driver._load_shares()
+        driver._ensure_share_mounted('192.168.1.1:/tintri/test_share')
+
+        driver._remotefsclient.mount.assert_called_once_with(
+            '192.168.1.1:/tintri/test_share', [])
 
 
 class VmstoreNfsDriverDeleteVolumeTestCase(test.TestCase):
