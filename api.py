@@ -13,7 +13,7 @@
 # under the License.
 
 """VMstore REST API client for Cinder driver.
-    
+
     Version history:
 
     .. code-block:: none
@@ -31,6 +31,7 @@ from urllib import parse as urlparse
 
 from eventlet import greenthread
 from oslo_log import log as logging
+from oslo_utils import strutils
 import requests
 
 from cinder import exception
@@ -191,6 +192,10 @@ class VmstoreAppliance(VmstoreCollections):
         self.root = 'appliance'
         self.subj = 'appliance'
 
+    def getAllIPs(self):
+        path = posixpath.join(self.root, 'default', 'ips')
+        return self.proxy.get(path)
+
 
 class VmstoreCinderRefresh(VmstoreCollections):
     def __init__(self, proxy):
@@ -209,6 +214,34 @@ class VmstoreCinderRefresh(VmstoreCollections):
         return self.proxy._execute_strict('post', self.root, payload)
 
 
+class VmstoreDatastore(VmstoreCollections):
+    def __init__(self, proxy):
+        super(VmstoreDatastore, self).__init__(proxy)
+        self.root = 'datastore'
+        self.subj = 'datastore'
+
+    def getReplicationPaths(self):
+        path = posixpath.join(self.root, 'default', 'replicationPath')
+        return self.proxy.get(path)
+
+
+class VmstoreVirtualMachines(VmstoreCollections):
+    def __init__(self, proxy):
+        super(VmstoreVirtualMachines, self).__init__(proxy)
+        self.root = 'vm'
+        self.subj = 'VirtualMachines'
+
+
+class VmstoreTasks(VmstoreCollections):
+    def __init__(self, proxy):
+        super(VmstoreTasks, self).__init__(proxy)
+        self.root = 'task'
+        self.subj = 'Tasks'
+
+    def getTaskById(self, task_id):
+        path = posixpath.join(self.root, task_id)
+        return self.proxy.get(path)
+
 class VmstoreProxy(object):
     def __init__(self, proto, backend, conf, client_version=None):
         self.clones = VmstoreClones(self)
@@ -216,8 +249,15 @@ class VmstoreProxy(object):
         self.snapshots = VmstoreSnapshots(self)
         self.appliance = VmstoreAppliance(self)
         self.cinder_refresh = VmstoreCinderRefresh(self)
+        self.datastore = VmstoreDatastore(self)
+        self.virtual_machines = VmstoreVirtualMachines(self)
+        self.tasks = VmstoreTasks(self)
         self.version = None
         self.lock = None
+        # REST API minor version negotiated at login via fullApiVersion.
+        # Left None until fetched from /api/info; without it the appliance
+        # falls back to a very old schema (e.g. no ipCidr on appliance IPs).
+        self.api_version = None
 
         if client_version is None:
             client_version = 'Tintri-Cinder-Driver'
@@ -246,6 +286,10 @@ class VmstoreProxy(object):
         if not conf.driver_ssl_cert_verify:
             requests.packages.urllib3.disable_warnings()
         self.token = ""
+        # Log in up front so the session negotiates the appliance's preferred
+        # API version (fullApiVersion). This must happen before any request so
+        # responses use the modern schema rather than the basic-auth default.
+        self._auth()
         self.update_lock()
 
     # ------------------------------------------------------------------
@@ -386,7 +430,10 @@ class VmstoreProxy(object):
         if payload and method in ('post', 'put'):
             kwargs['data'] = json.dumps(payload)
         if 'v310/appliance' not in url:
-            LOG.debug('%s %s %s', method.upper(), url, payload)
+            # Mask password/secret-like keys so credentials never hit the logs.
+            safe_payload = (strutils.mask_dict_password(payload)
+                            if isinstance(payload, dict) else payload)
+            LOG.debug('%s %s %s', method.upper(), url, safe_payload)
         return self.session.request(method, url, **kwargs)
 
     def _parse_content(self, response):
@@ -450,21 +497,58 @@ class VmstoreProxy(object):
         return None, None
 
     def _auth(self):
-        """Re-authenticate and update session token. Returns True on success."""
+        """Re-authenticate and update session token. Returns True on success.
+
+        Sends fullApiVersion so the appliance serves the modern API schema
+        (e.g. ipCidr on appliance IPs). On success the session cookie becomes
+        the sole credential; basic auth is dropped so the negotiated version
+        governs every subsequent request.
+        """
         payload = {
             'username': self.username,
             'typeId': ('com.tintri.api.rest.vcommon.dto.rbac.'
                        'RestApiCredentials'),
             'password': self.password,
         }
+        version = self._get_preferred_api_version()
+        if version:
+            payload['fullApiVersion'] = version
         self.delete_bearer()
         response = self._send_raw('post', '/session/login', payload)
         if 'JSESSIONID' in response.cookies:
             token = response.cookies['JSESSIONID']
             if token:
                 self.update_token(token)
+                # Rely on the versioned session cookie, not basic auth, so the
+                # appliance keeps using the fullApiVersion we negotiated.
+                self.session.auth = None
                 return True
         return False
+
+    def _get_preferred_api_version(self):
+        """Return the appliance's preferred REST API version from /api/info.
+
+        The value is cached after the first successful lookup. Returns None on
+        any failure so login can still proceed (falling back to the default
+        API version). Note /api/info lives outside the /api/v310 base path, so
+        the URL is built directly rather than via url().
+        """
+        if self.api_version:
+            return self.api_version
+        netloc = '%s:%d' % (self.host, self.port)
+        info_url = urlparse.urlunsplit(
+            (self.scheme, netloc, '/api/info', None, None))
+        try:
+            response = self.session.get(info_url, timeout=self.timeout)
+            content = self._parse_content(response)
+            if isinstance(content, dict) and content.get('preferredVersion'):
+                self.api_version = content['preferredVersion']
+                LOG.info('Using VMstore preferred API version %s',
+                         self.api_version)
+        except Exception as exc:
+            LOG.warning('Could not fetch preferred API version from '
+                        '%(url)s: %(err)s', {'url': info_url, 'err': exc})
+        return self.api_version
 
     # ------------------------------------------------------------------
     # Session management

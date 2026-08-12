@@ -120,6 +120,22 @@ VMSTORE_PERF_OPTS = [
                 default=12.0,
                 help='Maximum delay for snapshot operations (seconds). '
                      'Uses exponential backoff up to this value.'),
+    cfg.IntOpt('vmstore_task_timeout',
+               default=86400,
+               help='Maximum time to wait for a VMstore async task (such as '
+                    'a remote replication clone) to complete, in seconds. '
+                    'Defaults to 24 hours.'),
+    cfg.IntOpt('vmstore_task_poll_interval',
+               default=5,
+               help='Interval in seconds between polls when waiting for a '
+                    'VMstore async task to complete.'),
+    cfg.BoolOpt('cross_backend_clone_use_repl_path',
+                default=False,
+                help='When creating a volume from a snapshot that resides on a '
+                     'different VMstore backend, use a VMstore replication path '
+                     'to remotely clone the data. When False (the default), the '
+                     'clone is created on the source backend and the file is '
+                     'moved to the destination backend instead.'),
 ]
 
 VMSTORE_NFS_OPTS += (
