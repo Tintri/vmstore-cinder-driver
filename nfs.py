@@ -77,10 +77,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 operations to aid in troubleshooting. Add configuration options
                 for tuning backoff parameters and timeouts. Ensure that locks are
                 not held during backoff sleep periods to allow better concurrency.
-        3.0.7b - Fix lock_key parameter in create_snapshot.   
+        3.0.7b - Fix lock_key parameter in create_snapshot.
         3.0.7c - Fix create_volume_from_snapshot to use unique clone name.
-        3.0.7d - Fix BUG: wrong volume name (should use unique clone name), 
-                 Fix BUG: Handle None from Virtual Disk Api Call ( _get_virtual_disk_with_retry ), 
+        3.0.7d - Fix BUG: wrong volume name (should use unique clone name),
+                 Fix BUG: Handle None from Virtual Disk Api Call ( _get_virtual_disk_with_retry ),
                    logs error and raises exception VmstoreException NotFound instead of AttributeError,
                  Add Option for max delay in snapshot polling to avoid excessively long waits in case of issues,
                  Refactor: add TINTRI_PATH_PREFIX constant
@@ -94,12 +94,16 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  [VMS-4127] Update README and added extra documentation to repository.
                  Fix BUG: _get_provisioned_capacity was passing nas_path instead of host:path
                     to _get_mount_point_for_share, causing incorrect mount resolution.
-                 Refactor: _get_virtual_disk_with_retry uses configuration vmstore_snapshot_poll_initial_delay 
+                 Refactor: _get_virtual_disk_with_retry uses configuration vmstore_snapshot_poll_initial_delay
                     and vmstore_get_vd_timeout for consistency
                  Refactor: Removed custom implementations of copy_image_to_volume, copy_volume_to_image,  _mount_share,
-                    _ensure_share_mounted, _local_volume_dir, _do_create_volume, extend_volume methods, 
+                    _ensure_share_mounted, _local_volume_dir, _do_create_volume, extend_volume methods,
                     reducing code duplication and potential maintenance overhead.
-                 Refactor: _update_volume_stats to call super() to stay in the Cinder parent stats chain. 
+                 Refactor: _update_volume_stats to call super() to stay in the Cinder parent stats chain.
+                 [VMTS-120] Support for create volume from snapshot with snapshot on different backend, even
+                 with snapshot_same_host=false
+
+
 
     """
 
@@ -228,16 +232,20 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # Fall back to backend-wide lock for compatibility
         return self.vmstore.lock
 
-    def _wait_for_snapshot(self, snapshot_name, vm_uuid=None, timeout=None):
+    def _wait_for_snapshot(self, snapshot_name, vm_uuid=None, timeout=None, vmstore_proxy=None):
         """Poll for snapshot with exponential backoff.
 
         :param snapshot_name: Name/description of snapshot to find
         :param vm_uuid: Optional VM UUID for filtering
         :param timeout: Maximum time to wait in seconds (uses config default)
+        :param vmstore_proxy: Optional VmstoreProxy to use (defaults to self.vmstore)
         :returns: snapshot UUID or None
         """
         if timeout is None:
             timeout = self.configuration.vmstore_snapshot_poll_timeout
+
+        if vmstore_proxy is None:
+            vmstore_proxy = self.vmstore
 
         max_delay = self.configuration.vmstore_snapshot_max_delay  # Cap backoff at configured max delay
         delay = self.configuration.vmstore_snapshot_poll_initial_delay
@@ -250,7 +258,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             if vm_uuid:
                 filters['vmUuid'] = vm_uuid
 
-            snapshots = self.vmstore.snapshots.list(filters)
+            snapshots = vmstore_proxy.snapshots.list(filters)
 
             for snap in snapshots:
                 if snap.get('description') == snapshot_name:
@@ -272,6 +280,66 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         LOG.warning('Snapshot %(name)s not found after %(timeout)s seconds', {'name': snapshot_name, 'timeout': timeout})
         return None
+
+    def _parse_provider_location(self, provider_location):
+        """Parse provider_location to extract nas_host and nas_path.
+
+        :param provider_location: String in format "host:/path"
+        :returns: Tuple of (nas_host, nas_path) or (None, None) if invalid
+        """
+        if not provider_location:
+            return None, None
+
+        parts = provider_location.split(':', 1)
+        if len(parts) != 2:
+            LOG.warning('Invalid provider_location format: %s', provider_location)
+            return None, None
+
+        return parts[0], parts[1]
+
+    def _get_source_backend_info(self, snapshot):
+        """Get backend configuration and share info for snapshot's source volume.
+
+        :param snapshot: Snapshot reference
+        :returns: Tuple of (backend_config, source_share) or (None, None) if source is current backend
+        """
+        source_volume = snapshot.volume
+        if not source_volume or not source_volume.provider_location:
+            LOG.warning('Snapshot %(snap)s source volume has no provider_location',
+                        {'snap': snapshot['name']})
+            return None, None
+
+        source_nas_host, source_nas_path = self._parse_provider_location(
+            source_volume.provider_location)
+
+        if not source_nas_host:
+            LOG.error('Failed to parse provider_location: %s',
+                      source_volume.provider_location)
+            return None, None
+
+        # If source is on current backend, no cross-backend handling needed
+        if source_nas_host == self.nas_host:
+            LOG.debug('Snapshot %(snap)s is on current backend %(host)s',
+                      {'snap': snapshot['name'], 'host': self.nas_host})
+            return None, None
+
+        # Find the backend config for the source
+        backend_config = utils.find_backend_config_by_nas_host(source_nas_host)
+
+        if not backend_config:
+            LOG.error('No backend configuration found for nas_host %(host)s',
+                      {'host': source_nas_host})
+            return None, None
+
+        source_share = '%(host)s:%(path)s' % {
+            'host': source_nas_host,
+            'path': source_nas_path
+        }
+
+        LOG.info('Snapshot %(snap)s resides on different backend: %(host)s',
+                 {'snap': snapshot['name'], 'host': source_nas_host})
+
+        return backend_config, source_share
 
     def do_setup(self, ctxt) -> None:
         LOG.info('VmstoreNfsDriver do_setup for context: %s', ctxt)
@@ -740,7 +808,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             msg = f'Virtual disk for volume {volume["name"]} not found, cannot create snapshot'
             LOG.error(msg)
             raise api.VmstoreException(code='NotFound', message=msg)
-        
+
         lock_key = self._get_snapshot_lock_key(snapshot.id)
         self._create_snapshot_locked(snapshot, vd, lock_key)
 
@@ -854,6 +922,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def _create_volume_from_snapshot_locked(self, volume, snapshot, lock_key):
         """Create new volume from snapshot with coordination lock.
 
+        Supports cross-backend snapshots by detecting if the snapshot resides
+        on a different VMstore backend and using the appropriate API connection.
+        For cross-backend scenarios, creates the clone on the source VMstore
+        and then moves the data to the destination backend.
+
         :param volume: reference of volume to be created
         :param snapshot: reference of source snapshot
         :param lock_key: coordination lock key
@@ -861,7 +934,293 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.info('Creating volume %(vol)s from snapshot %(snap)s with lock %(lock)s',
                  {'vol': volume['name'], 'snap': snapshot['name'], 'lock': lock_key})
 
-        # Optimized snapshot lookup with exponential backoff
+        # Check if snapshot is from a different backend
+        source_config, source_share = self._get_source_backend_info(snapshot)
+
+        # Delegate to appropriate handler based on backend
+        if source_config:
+            # Cross-backend scenario
+            self._create_volume_from_snapshot_cross_backend(
+                volume, snapshot, source_config, source_share, lock_key)
+        else:
+            # Same-backend scenario
+            self._create_volume_from_snapshot_same_backend(volume, snapshot, lock_key)
+
+        # Async refresh - don't block waiting for hypervisor
+        self.refresh_hypervisor(volume)
+        volume.provider_location = self._get_share_path()
+        return {'provider_location': volume.provider_location}
+
+    def _clone_on_source_move_file(self, volume, snapshot, source_config,
+                                   source_share, source_proxy, lock_key):
+        """Create volume by cloning on source backend and moving file.
+
+        This is the fallback method when replication paths are not available.
+        Creates clone on source VMstore, then moves file to destination.
+
+        :param volume: reference of volume to be created
+        :param snapshot: reference of source snapshot
+        :param source_config: configuration of the source backend
+        :param source_share: source NFS share string
+        :param source_proxy: VmstoreProxy for the source backend
+        :param lock_key: coordination lock key
+        """
+        msg = (f'No replication paths found from source backend '
+               f'{source_config.nas_host} to destination backend '
+               f'{self.nas_host}. Falling back to clone on source backend '
+               f'and manual file copy.')
+        LOG.info(msg)
+
+        # Ensure both source and destination NFS shares are mounted
+        try:
+            self._ensure_share_mounted(source_share)
+        except Exception as e:
+            LOG.error('Failed to mount source share %(share)s: %(err)s',
+                    {'share': source_share, 'err': e})
+            raise
+
+        # Ensure destination share is mounted
+        dest_share = self._get_share_path()
+        try:
+            self._ensure_share_mounted(dest_share)
+        except Exception as e:
+            LOG.error('Failed to mount destination share %(share)s: %(err)s',
+                    {'share': dest_share, 'err': e})
+            raise
+
+        # Use source proxy to find snapshot
+        snap_uuid = self._wait_for_snapshot(snapshot['name'],
+                                            vmstore_proxy=source_proxy)
+
+        if not snap_uuid:
+            msg = (f'Snapshot {snapshot["name"]} not found on source '
+                f'backend {source_config.nas_host}')
+            LOG.error(msg)
+            raise api.VmstoreException(code='NotFound', message=msg)
+
+        # Create clone on SOURCE backend (where snapshot resides)
+        # Use source backend's nas_path to construct clone path
+        source_vmstore_subdir = source_config.nas_share_path.removeprefix(
+            self.TINTRI_PATH_PREFIX)
+        clone_name = f'{snapshot["name"]}-vol-{volume.name_id}'
+        clone_path = os.path.join(source_vmstore_subdir, clone_name)
+
+        payload = {
+            'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                    'beans.cinder.CinderCloneSpec'),
+            'tintriSnapshotUuid': snap_uuid,
+            'destinationPaths': clone_path,
+        }
+
+        LOG.debug(
+            'Creating clone from snapshot %(snap)s to %(path)s on source '
+            'backend %(src)s with lock %(lock)s)',
+            {'snap': snapshot['name'], 'path': clone_path,
+            'src': source_config.nas_host, 'lock': lock_key})
+
+        # Use SOURCE proxy to create the clone (must be on same VMstore as snapshot)
+        source_proxy.clones.create(payload)
+
+        # Now move the clone from source share to destination share
+        source_mount_dir = self._get_mount_point_for_share(source_share)
+        dest_mount_dir = self._get_mount_point_for_share(dest_share)
+
+        # Source clone paths
+        source_temp_clone_dir = os.path.join(source_mount_dir, clone_name)
+        source_temp_clone_path = os.path.join(source_temp_clone_dir,
+                                            snapshot['volume_name'])
+
+        # Destination path
+        dest_volume_path = os.path.join(dest_mount_dir, volume['name'])
+
+        LOG.info(
+            'Moving clone from source %(src)s to destination %(dst)s',
+            {'src': source_temp_clone_path, 'dst': dest_volume_path})
+
+        # Move/copy the clone from source to destination. The source and
+        # destination shares are separate NFS mounts (different filesystems),
+        # so os.rename would raise EXDEV (Errno 18: Invalid cross-device link).
+        # shutil.move falls back to copy+delete across filesystems.
+        try:
+            shutil.move(source_temp_clone_path, dest_volume_path)
+            os.rmdir(source_temp_clone_dir)
+        except OSError as exc:
+            LOG.error(
+                'Failed to rename clone from %(src)s to %(dst)s: %(err)s — '
+                'attempting cleanup of temp directory %(dir)s',
+                {'src': source_temp_clone_path, 'dst': dest_volume_path,
+                'err': exc, 'dir': source_temp_clone_dir})
+            shutil.rmtree(source_temp_clone_dir, ignore_errors=True)
+            raise
+
+        LOG.info(
+            'Successfully moved clone from %(src)s to %(dst)s with lock %(lock)s',
+            {'src': source_config.nas_host, 'dst': self.nas_host, 'lock': lock_key})
+
+    def _replicate_and_clone_volume(self, volume, snapshot, source_config,
+                                    source_proxy, replication_paths, lock_key):
+        """Create volume using VMstore replication path for remote clone.
+
+        Uses VMstore replication infrastructure to clone from source to destination.
+
+        :param volume: reference of volume to be created
+        :param snapshot: reference of source snapshot
+        :param source_config: configuration of the source backend
+        :param source_proxy: VmstoreProxy for the source backend
+        :param replication_paths: list of replication paths from source to destination
+        :param lock_key: coordination lock key
+        """
+        LOG.info('Replication paths found from source backend '
+                 '%(src)s to destination backend %(dst)s',
+                 {'src': source_config.nas_host, 'dst': self.nas_host})
+        # Use first repl path to do remote clone from source to destination
+        replication_path = replication_paths[0]
+        # DatastoreReplicationPath exposes a flat 'id' string, not the nested
+        # {'uuid': {'uuid': ...}} shape used by snapshot/VM/task objects.
+        replication_path_id = replication_path['id']
+        snap_uuid = self._wait_for_snapshot(snapshot['name'],
+                                            vmstore_proxy=source_proxy)
+        if not snap_uuid:
+            msg = f'Snapshot {snapshot["name"]} not found on source backend {source_config.nas_host}'
+            LOG.error(msg)
+            raise api.VmstoreException(code='NotFound', message=msg)
+
+        # Name of destination directory on destination backend where cloned file will be created.
+        # The VMstore remoteCopyInfo.directoryName is relative to the datastore root
+        # (/tintri), so it keeps the share subdir prefix. For volume id = 123 and
+        # nas_path = /tintri/cinder, destination_dir = cinder/clone-dst-123.
+        clone_dir_name = f'clone-dst-{volume.id}'
+        destination_dir = f'{self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)}/{clone_dir_name}'
+
+        payload = {
+            'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                    'beans.vm.VirtualMachineCloneSpec'),
+            'snapshotId': snap_uuid,
+            'remoteCopyInfo': {
+                'typeId': ('com.tintri.api.rest.v310.dto.domain.'
+                        'beans.vm.VirtualMachineCloneSpec$RemoteCopyInfo'),
+                'replicationPathId': replication_path_id,
+                'directoryName': destination_dir
+            }
+        }
+
+        LOG.debug(
+            'Creating remote clone from snapshot %(snap)s to %(path)s '
+            'using replication path %(repl_path_id)s with lock %(lock)s)',
+            {'snap': snapshot['name'], 'path': destination_dir,
+            'repl_path_id': replication_path_id, 'lock': lock_key})
+
+        # invoke the remote clone API
+        task = source_proxy.virtual_machines.create(payload)
+        task_id = task['uuid']['uuid']
+
+        LOG.debug('Remote clone task created: %s', task_id)
+
+        # Wait for the task to complete
+        timeout = self.configuration.vmstore_task_timeout
+        poll_interval = self.configuration.vmstore_task_poll_interval
+        utils.wait_for_task_completion(
+            source_proxy, task_id, timeout, poll_interval)
+
+        LOG.debug('Remote clone task %s completed successfully', task_id)
+
+        # Make sure that the destination directory exists on the destination backend
+        # and contains exactly one file. The local NFS mount already points at the
+        # share (e.g. /tintri/cinder), so the clone is visible directly under it
+        # using clone_dir_name, without the datastore-root subdir prefix.
+        dest_mount_dir = self._get_mount_point_for_share(self._get_share_path())
+        dest_clone_dir = os.path.join(dest_mount_dir, clone_dir_name)
+        dest_cloned_file_path = os.path.join(dest_clone_dir, snapshot['volume_name'])
+        if not os.path.exists(dest_cloned_file_path):
+            msg = f'Destination clone directory {dest_clone_dir} does not exist or'
+            f' does not contain the cloned file {snapshot["volume_name"]}'
+            LOG.error(msg)
+            raise api.VmstoreException(code='CloneFailed', message=msg)
+
+        # Rename the file in the destination clone directory to the volume name
+        dest_volume_path = os.path.join(dest_mount_dir, volume['name'])
+        try:
+            os.rename(dest_cloned_file_path, dest_volume_path)
+            os.rmdir(dest_clone_dir)
+        except OSError as exc:
+            LOG.error(
+                'Failed to rename clone from %(src)s to %(dst)s: %(err)s',
+                {'src': dest_cloned_file_path, 'dst': dest_volume_path,
+                 'err': exc})
+            raise
+
+        LOG.debug(
+            'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
+            {'src': dest_cloned_file_path, 'dst': dest_volume_path,
+            'lock': lock_key})
+
+    def _create_volume_from_snapshot_cross_backend(self, volume, snapshot,
+                                                     source_config, source_share, lock_key):
+        """Create volume from snapshot on a different backend.
+
+        By default the clone is created on the source VMstore and the file is
+        moved to the destination. When the backend option
+        cross_backend_clone_use_repl_path is True and a VMstore replication
+        path from the source to the destination exists, that path is used to
+        remotely clone the data instead. If the option is disabled or no
+        replication path is available, the clone-and-move-file fallback is
+        used.
+
+        :param volume: reference of volume to be created
+        :param snapshot: reference of source snapshot
+        :param source_config: configuration of the source backend
+        :param source_share: source NFS share string
+        :param lock_key: coordination lock key
+        """
+        LOG.info('Cross-backend volume creation: snapshot on %(src)s, '
+                 'creating volume on %(dst)s',
+                 {'src': source_config.nas_host, 'dst': self.nas_host})
+
+        # Create a temporary VmstoreProxy for the source backend
+        source_proxy = api.VmstoreProxy(
+            self.driver_volume_type,
+            source_config.volume_backend_name,
+            source_config
+        )
+
+        # Use the replication-path remote clone only when it is enabled per
+        # backend configuration and a replication path actually exists.
+        # Otherwise fall back to cloning on the source and moving the file.
+        replication_paths = None
+        if self.configuration.cross_backend_clone_use_repl_path:
+            replication_paths = utils.get_replication_paths(
+                source_proxy, self.vmstore)
+            if not replication_paths:
+                LOG.warning('cross_backend_clone_use_repl_path is enabled but '
+                            'no replication paths were found from source '
+                            'backend %(src)s to destination backend %(dst)s; '
+                            'falling back to clone-and-move-file.',
+                            {'src': source_config.nas_host,
+                             'dst': self.nas_host})
+
+        if not replication_paths:
+            self._clone_on_source_move_file(
+                volume, snapshot, source_config, source_share,
+                source_proxy, lock_key)
+            return
+
+        self._replicate_and_clone_volume(
+            volume, snapshot, source_config, source_proxy,
+            replication_paths, lock_key)
+
+    def _create_volume_from_snapshot_same_backend(self, volume, snapshot, lock_key):
+        """Create volume from snapshot on the same backend.
+
+        Uses original logic for same-backend operations.
+
+        :param volume: reference of volume to be created
+        :param snapshot: reference of source snapshot
+        :param lock_key: coordination lock key
+        """
+        LOG.debug('Snapshot %(snap)s is on current backend',
+                  {'snap': snapshot['name']})
+
+        # Use current proxy to find snapshot
         snap_uuid = self._wait_for_snapshot(snapshot['name'])
 
         if not snap_uuid:
@@ -869,6 +1228,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             LOG.error(msg)
             raise api.VmstoreException(code='NotFound', message=msg)
 
+        # Create clone on current backend
         vmstore_subdir = self.nas_path.removeprefix(self.TINTRI_PATH_PREFIX)
         clone_name = f'{snapshot["name"]}-vol-{volume.name_id}'
         clone_path = os.path.join(vmstore_subdir, clone_name)
@@ -884,6 +1244,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'Creating clone from snapshot %(snap)s to %(path)s '
             'with lock %(lock)s',
             {'snap': snapshot['name'], 'path': clone_path, 'lock': lock_key})
+
+        # Use current backend's proxy to create the clone
         self.vmstore.clones.create(payload)
 
         # File system operations (no lock needed for these)
@@ -903,16 +1265,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  'err': exc, 'dir': temp_clone_dir})
             shutil.rmtree(temp_clone_dir, ignore_errors=True)
             raise
+
         LOG.debug(
             'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
             {'src': temp_clone_path, 'dst': clone_destination,
              'lock': lock_key})
-
-        # Async refresh - don't block waiting for hypervisor
-        self.refresh_hypervisor(volume)
-        volume.provider_location = self._get_share_path()
-
-        return {'provider_location': volume.provider_location}
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume.
@@ -932,7 +1289,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             msg = f'Virtual disk for source volume {src_vref["name"]} not found, cannot create clone'
             LOG.error(msg)
             raise api.VmstoreException(code='NotFound', message=msg)
-        
+
         lock_key = self._get_volume_lock_key(volume.id)
         result = self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
         self._extend_volume_for_cloned_volume(volume, src_vref['size'])
@@ -1064,7 +1421,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         if original_size is None:
             raise exception.VolumeDriverException(
                 message=_("Original source volume size cannot be None"))
-        
+
         LOG.debug(
             "Checking whether cloned volume %s needs resize. "
             "New size: %s, original size: %s.",

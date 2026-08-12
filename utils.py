@@ -22,6 +22,13 @@ from keystoneauth1 import session
 from oslo_config import cfg
 from oslo_log import log as logging
 
+from socket import getaddrinfo
+import ipaddress
+import time
+
+from cinder.volume import configuration as config
+from cinder.volume.drivers.vmstore import options
+
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
@@ -116,3 +123,145 @@ def get_keystone_hostname():
         LOG.error("Failed to parse Keystone hostname from config: %(err)s",
                   {'err': e})
         return None
+
+def find_backend_config_by_nas_host(nas_host):
+    """Find the first backend configuration whose nas_host matches.
+
+    Iterates over every backend listed in ``enabled_backends`` and returns
+    the config group for the first one whose ``nas_host`` option matches.
+    Backends without a ``nas_host`` option (e.g. non-NFS backends) are
+    skipped.
+
+    :param nas_host: NAS host to match against each backend's configuration.
+    :returns: A ``cinder.volume.configuration.Configuration`` wrapper for the
+        matching backend, or None if no backend matches. The wrapper overlays
+        the backend group, the shared conf group and opt defaults, so options
+        such as ``vmstore_rest_port`` resolve to their defaults rather than
+        ``None`` (unlike the raw ``CONF[backend_name]`` group).
+    """
+    for backend_name in CONF.enabled_backends:
+        backend_conf = CONF[backend_name]
+        try:
+            if backend_conf.nas_host == nas_host:
+                conf = config.Configuration(options.VMSTORE_NFS_OPTS,
+                                            config_group=backend_name)
+                return conf
+        except cfg.NoSuchOptError:
+            continue
+    return None
+
+def get_all_ips(vmstoreProxy):
+    """Get all IPs from VMstore.
+    Proxy objects contain information needed to make API calls to the VMstore,
+    including authentication and endpoint information.
+
+    :param vmstoreProxy: Proxy for the VMstore
+    :returns: Set of all IP address objects as ipaddress.ip_address objects
+    """
+    if not vmstoreProxy:
+        return None
+
+    allIPs = vmstoreProxy.appliance.getAllIPs()
+    if not allIPs:
+        return None
+
+    allIPsList = set()
+
+    for ip in allIPs:
+        cidr = ip['ipCidr']
+        ipAddress = cidr.split('/')[0]
+        allIPsList.add(ipaddress.ip_address(ipAddress))
+
+    return allIPsList
+
+def get_replication_paths(sourceVMStoreProxy, destinationVMStoreProxy):
+    """Get the replication paths from source to destination VMstore.
+    Proxy objects contain information needed to make API calls to the VMstore,
+    including authentication and endpoint information.
+
+    :param sourceVMStoreProxy: Proxy for the source VMstore
+    :param destinationVMStoreProxy: Proxy for the destination VMstore
+    :returns: List of replication paths
+    """
+
+    if not sourceVMStoreProxy or not destinationVMStoreProxy:
+        return None
+
+    allReplicationPaths = sourceVMStoreProxy.datastore.getReplicationPaths()
+    if not allReplicationPaths:
+        return None
+
+    allDestinationIPs = get_all_ips(destinationVMStoreProxy)
+    if not allDestinationIPs:
+        return None
+
+    replicationPaths = []
+
+    for path in allReplicationPaths:
+        ipOrHostnameFromReplPath = path['destinationIp']
+        # ipOrHostnameFromReplPath could be hostname or IP address.
+        # If it is hostname, resolve it to IP address.
+        allIPsFromReplPath = resolve_hostname(ipOrHostnameFromReplPath)
+        if not allIPsFromReplPath:
+            continue
+
+        for ip in allIPsFromReplPath:
+            # Check if the IP address from the replication path is
+            # in the set of all destination IPs
+            # If it is, add the replication path to the list of
+            # replication paths and break out of the loop
+            if ip in allDestinationIPs:
+                replicationPaths.append(path)
+                break
+
+    return replicationPaths
+
+def resolve_hostname(hostnameOrIp):
+    """Resolve the hostname to IP addresses. Handles both ipv4 and ipv6.
+    If the hostnameOrIp is already an IP address, return it as is.
+
+    :param hostnameOrIp: Hostname or IP address
+    :returns: Set of ipaddress.ip_address objects or None
+    """
+    if not hostnameOrIp:
+        return None
+
+    allIPs = set()
+    try:
+        ipAddresses = getaddrinfo(hostnameOrIp, None)
+        for ip in ipAddresses:
+            ip_str = ip[4][0]
+            clean_ip_str = ip_str.split('%')[0]
+            allIPs.add(ipaddress.ip_address(clean_ip_str))
+    except Exception as e:
+        LOG.error("Failed to resolve hostname %(host)s: %(err)s",
+                  {'host': hostnameOrIp, 'err': e})
+
+    return allIPs
+
+def wait_for_task_completion(vmstoreProxy, taskUuid, timeout=1800, poll_interval=5):
+    """Wait for the task to complete.
+
+    :param vmstoreProxy: Proxy for the VMstore
+    :param taskUuid: UUID of the task
+    :param timeout: Timeout in seconds, default is 30 minutes
+    :param poll_interval: Poll interval in seconds, default is 5 seconds
+    :returns: True if the task completed successfully, False otherwise
+    """
+    if not vmstoreProxy or not taskUuid:
+        return False
+
+    task = vmstoreProxy.tasks.getTaskById(taskUuid)
+    if not task:
+        return False
+
+    deadline = time.monotonic() + timeout
+    while not task['jobDone']:
+        if time.monotonic() >= deadline:
+            raise Exception(
+                f"Task {taskUuid} did not complete within the timeout "
+                f"period of {timeout} seconds")
+        time.sleep(poll_interval)
+        task = vmstoreProxy.tasks.getTaskById(taskUuid)
+
+    return True
