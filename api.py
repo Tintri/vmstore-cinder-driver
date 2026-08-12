@@ -31,6 +31,7 @@ from urllib import parse as urlparse
 
 from eventlet import greenthread
 from oslo_log import log as logging
+from oslo_utils import strutils
 import requests
 
 from cinder import exception
@@ -386,7 +387,10 @@ class VmstoreProxy(object):
         if payload and method in ('post', 'put'):
             kwargs['data'] = json.dumps(payload)
         if 'v310/appliance' not in url:
-            LOG.debug('%s %s %s', method.upper(), url, payload)
+            # Mask password/secret-like keys so credentials never hit the logs.
+            safe_payload = (strutils.mask_dict_password(payload)
+                            if isinstance(payload, dict) else payload)
+            LOG.debug('%s %s %s', method.upper(), url, safe_payload)
         return self.session.request(method, url, **kwargs)
 
     def _parse_content(self, response):
