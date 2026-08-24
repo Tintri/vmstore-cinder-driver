@@ -100,6 +100,13 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     _ensure_share_mounted, _local_volume_dir, _do_create_volume, extend_volume methods, 
                     reducing code duplication and potential maintenance overhead.
                  Refactor: _update_volume_stats to call super() to stay in the Cinder parent stats chain. 
+                 [VMS-1277] Perf: collapse the three per-refresh walks of the share root into a single
+                    os.scandir() pass. _get_capacity_info, _get_provisioned_capacity and the
+                    total_volumes count previously each walked the directory and the first two
+                    each issued one stat() per volume file. _scan_share() now does one pass and
+                    memoises it for the rest of the refresh, halving the stat round trips when
+                    nfs_sparsed_volumes is enabled. _get_capacity_info never reads the memo, so
+                    capacity checks on the volume-create path still see current allocation.
 
     """
 
@@ -159,6 +166,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # Stats caching
         self._stats_cache = None
         self._stats_cache_timestamp = 0
+        # Share scan memo: (mount_point, volume_count, provisioned_bytes),
+        # valid only for the duration of one _update_volume_stats call.
+        self._share_scan = None
 
     @staticmethod
     def get_driver_options():
@@ -489,19 +499,64 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             {'name': volume['name'], 'retries': max_retries})
         return None
 
+    def _scan_share(self, mount_point: str) -> tuple[int, int]:
+        """Walk the share root once and collect both volume metrics.
+
+        A single pass yields everything the stats chain needs: how many
+        Cinder volumes exist and the sum of their logical sizes. Scanning is
+        the expensive part on a VMstore NFS share (one stat round trip per
+        volume file), so the result is memoised in self._share_scan for
+        _cached_scan to reuse within the same stats refresh.
+
+        :param mount_point: local mount point of the share
+        :returns: (volume_count, provisioned_bytes); (0, 0) if unreadable
+        """
+        volume_count = 0
+        provisioned_bytes = 0
+        try:
+            with os.scandir(mount_point) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if (not name.startswith('volume-') or
+                            name.endswith('.info')):
+                        continue
+                    volume_count += 1
+                    try:
+                        provisioned_bytes += entry.stat().st_size
+                    except OSError:
+                        # Volume unlinked mid-scan; skip its size.
+                        continue
+        except OSError:
+            LOG.warning('Unable to scan share root %s for volume files',
+                        mount_point)
+            return 0, 0
+
+        self._share_scan = (mount_point, volume_count, provisioned_bytes)
+        return volume_count, provisioned_bytes
+
+    def _cached_scan(self, mount_point: str) -> tuple[int, int]:
+        """Return the current refresh's scan, scanning only if there is none.
+
+        Only safe for callers that run inside _update_volume_stats, which
+        clears the memo before delegating to the parent chain. Callers on the
+        volume-create path must use _scan_share directly so that capacity
+        checks always see current allocation.
+        """
+        scan = self._share_scan
+        if scan is not None and scan[0] == mount_point:
+            return scan[1], scan[2]
+        return self._scan_share(mount_point)
+
     def _get_provisioned_capacity(self) -> float:
+        """Sum of logical sizes of volume files, in GiB.
+
+        NfsDriver._update_volume_stats calls this immediately after the
+        _get_capacity_info loop, so the shared scan is normally already
+        memoised and this adds no filesystem work.
+        """
         share_string = self._get_share_path()
         mount_point = self._get_mount_point_for_share(share_string)
-        provisioned_bytes = 0
-        if os.path.exists(mount_point):
-            for filename in os.listdir(mount_point):
-                if (filename.startswith('volume-') and
-                        not filename.endswith('.info')):
-                    filepath = os.path.join(mount_point, filename)
-                    try:
-                        provisioned_bytes += os.stat(filepath).st_size
-                    except OSError:
-                        continue
+        _volume_count, provisioned_bytes = self._cached_scan(mount_point)
         return round(provisioned_bytes / float(units.Gi), 2)
 
     def _get_capacity_info(self, nfs_share: str) -> tuple[float, float, float]:
@@ -526,16 +581,12 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # st_size reports logical/promised size for thin-provisioned files on
         # VMstore NFS. VMstore snapshots are appliance-internal and not visible
         # as NFS files, so volume-* at the share root is a complete inventory.
-        provisioned_bytes = 0
-        if os.path.exists(mount_point):
-            for filename in os.listdir(mount_point):
-                if (filename.startswith('volume-') and
-                        not filename.endswith('.info')):
-                    filepath = os.path.join(mount_point, filename)
-                    try:
-                        provisioned_bytes += os.stat(filepath).st_size
-                    except OSError:
-                        continue
+        #
+        # Always scan rather than reuse the memo: the parent class also calls
+        # this from _find_share and _is_share_eligible on the volume-create
+        # path, where a stale total_allocated would weaken the
+        # oversubscription check.
+        _volume_count, provisioned_bytes = self._scan_share(mount_point)
 
         return total_size, total_available, provisioned_bytes
 
@@ -569,20 +620,23 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def _update_volume_stats(self) -> None:
         LOG.info('VmstoreNfsDriver _update_volume_stats')
 
+        # Drop any memo from a previous refresh (or from a capacity check on
+        # the create path) so this refresh scans the share exactly once.
+        self._share_scan = None
+
         # Run the standard NFS stats chain. Our overridden _get_capacity_info
         # and _get_provisioned_capacity are called here, so no du is invoked.
+        # _get_capacity_info performs the single scan; _get_provisioned_capacity
+        # and the volume count below reuse it.
         super()._update_volume_stats()
         data = self._stats
 
-        # Count total volumes — not tracked by the parent chain
+        # Volume count is not tracked by the parent chain, but
+        # _get_capacity_info already counted while summing sizes, so reuse
+        # that scan instead of walking the share a second time.
         share_string = self._get_share_path()
         mount_path = self._get_mount_point_for_share(share_string)
-        total_volumes = 0
-        if os.path.exists(mount_path):
-            for filename in os.listdir(mount_path):
-                if (filename.startswith('volume-') and
-                        not filename.endswith('.info')):
-                    total_volumes += 1
+        total_volumes, _provisioned_bytes = self._cached_scan(mount_path)
 
         location_info = '%(driver)s:%(host)s:%(path)s' % {
             'driver': self.nas_driver,
