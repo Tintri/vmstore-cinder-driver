@@ -15,6 +15,8 @@
 """Unit tests for VMstore NFS driver."""
 
 import os
+import shutil
+import tempfile
 from unittest import mock
 
 from oslo_utils import units
@@ -408,3 +410,145 @@ class VmstoreNfsDriverShareTestCase(test.TestCase):
         self.assertRaises(
             exception.InvalidConfigurationValue,
             driver._load_shares)
+
+    def _build_share(self, root):
+        """Populate a fake share root with volume files and noise."""
+        sizes = {'volume-aaa': 4096, 'volume-bbb': 8192, 'volume-ccc': 0}
+        for name, size in sizes.items():
+            with open(os.path.join(root, name), 'wb') as handle:
+                handle.write(b'\0' * size)
+        # Noise that must not be counted.
+        for name in ('volume-aaa.info', 'volumes-other', 'unrelated'):
+            with open(os.path.join(root, name), 'w') as handle:
+                handle.write('x')
+        os.mkdir(os.path.join(root, 'clone-src-dst'))
+        return sum(sizes.values()), len(sizes)
+
+    def test_scan_share_counts_and_sums(self):
+        """_scan_share returns volume count and summed logical sizes."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        expected_bytes, expected_count = self._build_share(root)
+
+        driver = self._get_driver()
+        count, provisioned = driver._scan_share(root)
+
+        self.assertEqual(expected_count, count)
+        self.assertEqual(expected_bytes, provisioned)
+
+    def test_scan_share_missing_mount_point(self):
+        """_scan_share degrades to zeros when the share is not mounted."""
+        driver = self._get_driver()
+        self.assertEqual((0, 0), driver._scan_share('/no/such/mount/point'))
+
+    def test_scan_share_memoises_result(self):
+        """_scan_share stores the scan for _cached_scan to reuse."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        expected_bytes, expected_count = self._build_share(root)
+
+        driver = self._get_driver()
+        driver._scan_share(root)
+
+        self.assertEqual((root, expected_count, expected_bytes),
+                         driver._share_scan)
+
+    def test_cached_scan_reuses_memo_without_rescanning(self):
+        """_cached_scan serves the memo instead of walking the share again."""
+        driver = self._get_driver()
+        driver._share_scan = ('/mnt/share', 7, 4096)
+
+        with mock.patch.object(driver, '_scan_share') as mock_scan:
+            self.assertEqual((7, 4096), driver._cached_scan('/mnt/share'))
+        mock_scan.assert_not_called()
+
+    def test_cached_scan_ignores_memo_for_a_different_mount(self):
+        """A memo for another mount point must not be reused."""
+        driver = self._get_driver()
+        driver._share_scan = ('/mnt/other', 7, 4096)
+
+        with mock.patch.object(driver, '_scan_share',
+                               return_value=(1, 512)) as mock_scan:
+            self.assertEqual((1, 512), driver._cached_scan('/mnt/share'))
+        mock_scan.assert_called_once_with('/mnt/share')
+
+    def test_get_capacity_info_never_uses_the_memo(self):
+        """Capacity checks on the create path must always rescan.
+
+        NfsDriver._find_share and _is_share_eligible call _get_capacity_info
+        while creating a volume; a stale total_allocated there would weaken
+        the oversubscription check.
+        """
+        driver = self._get_driver()
+        driver._share_scan = ('/mnt/share', 99, 99 * units.Gi)
+        driver._execute = mock.Mock(
+            return_value=('4096 26214400 13107200', ''))
+
+        with mock.patch.object(driver, '_get_mount_point_for_share',
+                               return_value='/mnt/share'), \
+                mock.patch.object(driver, '_scan_share',
+                                  return_value=(2, 8192)) as mock_scan:
+            _total, _avail, provisioned = driver._get_capacity_info(
+                '192.168.1.1:/tintri/test_share')
+
+        mock_scan.assert_called_once_with('/mnt/share')
+        self.assertEqual(8192, provisioned)
+
+    @mock.patch('cinder.objects.VolumeList.get_all_by_host')
+    def test_update_volume_stats_scans_share_once(self, mock_get_volumes):
+        """One stats refresh walks the share root exactly once.
+
+        _get_capacity_info performs the scan; _get_provisioned_capacity and
+        the total_volumes count reuse the memo.
+        """
+        mock_get_volumes.return_value = []
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        expected_bytes, expected_count = self._build_share(root)
+
+        driver = self._get_driver()
+        driver._mounted_shares = ['192.168.1.1:/tintri/test_share']
+        driver._execute = mock.Mock(
+            return_value=('4096 26214400 13107200', ''))
+
+        real_scandir = os.scandir
+        calls = []
+
+        def counting_scandir(path):
+            calls.append(path)
+            return real_scandir(path)
+
+        with mock.patch.object(driver, '_ensure_shares_mounted'), \
+                mock.patch.object(driver, '_get_mount_point_for_share',
+                                  return_value=root), \
+                mock.patch.object(vmstore_nfs.os, 'scandir',
+                                  side_effect=counting_scandir):
+            driver._update_volume_stats()
+
+        self.assertEqual(1, len(calls))
+        pool = driver._stats['pools'][0]
+        self.assertEqual(expected_count, pool['total_volumes'])
+        self.assertEqual(round(expected_bytes / float(units.Gi), 2),
+                         pool['provisioned_capacity_gb'])
+
+    @mock.patch('cinder.objects.VolumeList.get_all_by_host')
+    def test_update_volume_stats_drops_stale_memo(self, mock_get_volumes):
+        """Each refresh rescans rather than trusting the previous memo."""
+        mock_get_volumes.return_value = []
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        self._build_share(root)
+
+        driver = self._get_driver()
+        driver._mounted_shares = ['192.168.1.1:/tintri/test_share']
+        driver._execute = mock.Mock(
+            return_value=('4096 26214400 13107200', ''))
+        # A memo left over from an earlier refresh.
+        driver._share_scan = (root, 99, 99 * units.Gi)
+
+        with mock.patch.object(driver, '_ensure_shares_mounted'), \
+                mock.patch.object(driver, '_get_mount_point_for_share',
+                                  return_value=root):
+            driver._update_volume_stats()
+
+        self.assertEqual(3, driver._stats['pools'][0]['total_volumes'])
