@@ -398,6 +398,19 @@ class VmstoreNfsDriverShareTestCase(test.TestCase):
     @mock.patch('os_brick.remotefs.remotefs.RemoteFsClient')
     @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, '_check_snapshot_support')
     @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup')
+    def _get_driver(self, mock_do_setup, mock_check_snapshot, mock_remotefs):
+        """Create and return a driver instance."""
+        driver = vmstore_nfs.VmstoreNfsDriver(configuration=self.configuration)
+        driver.vmstore = mock.Mock()
+        driver._mounted_shares = ['192.168.1.1:/tintri/test_share']
+        driver.shares = {'192.168.1.1:/tintri/test_share': None}
+        driver.mount_point_base = '/mnt/vmstore'
+        driver.nas_path = '/tintri/test_share'
+        return driver
+
+    @mock.patch('os_brick.remotefs.remotefs.RemoteFsClient')
+    @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, '_check_snapshot_support')
+    @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup')
     def test_load_shares_invalid_format_raises(
             self, mock_do_setup, mock_check_snapshot, mock_remotefs):
         """Test _load_shares raises on invalid share format."""
