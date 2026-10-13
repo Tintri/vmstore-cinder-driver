@@ -26,6 +26,7 @@ from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import units
 
+from cinder.compute import nova
 from cinder import context
 from cinder import coordination
 from cinder import exception
@@ -33,6 +34,7 @@ from cinder.i18n import _
 from cinder.image import image_utils
 from cinder import interface
 from cinder import objects
+from cinder.objects import fields
 from cinder import utils as cinder_utils
 from cinder.volume.drivers import nfs
 from cinder.volume.drivers.vmstore import api
@@ -109,10 +111,19 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     memoises it for the rest of the refresh, halving the stat round trips when
                     nfs_sparsed_volumes is enabled. _get_capacity_info never reads the memo, so
                     capacity checks on the volume-create path still see current allocation.
+        3.0.11 - [VMTS-243]: Extend attached (in-use) volumes; reports
+                    online_extend_support. raw: the driver grows the file,
+                    then Nova resizes the guest disk. qcow2: the driver never
+                    modifies the file while a VM may hold it (the share is
+                    mounted nolock, so qemu's lock is invisible here);
+                    Nova/qemu resizes it, or the driver does once Nova
+                    confirms every attached instance is shut off.
+                    initialize_connection grows a file smaller than the
+                    volume size before a new attach. See docs/adr/0004.
 
     """
 
-    VERSION = '3.0.10'
+    VERSION = '3.0.11'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -180,8 +191,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def initialize_connection(self, volume, connector):
         """Allow connection to connector and return connection info.
 
-        NO LOCK NEEDED - This is a read-only operation on the file system.
-        Multiple concurrent connections can be initialized safely.
+        NO LOCK NEEDED in the normal case - this is a read-only operation on
+        the file system and concurrent connections can be initialized safely.
+        The exception is a file smaller than the volume size (an online
+        extend that Nova did not apply); _reconcile_size_before_attach grows
+        it under the volume lock before the new consumer opens it.
 
         :param volume: volume reference
         :param connector: connector reference
@@ -199,6 +213,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         if info.file_format not in ['raw', 'qcow2']:
             msg = _('nfs volume must be a valid raw or qcow2 image.')
             raise exception.InvalidVolume(reason=msg)
+
+        if info.virtual_size < int(volume['size']) * units.Gi:
+            self._reconcile_size_before_attach(
+                volume, path_to_vol, info.file_format,
+                self._get_volume_lock_key(volume['id']))
 
         data = {
             'export': self._get_share_path(),
@@ -728,7 +747,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'total_volumes': total_volumes,
             'multiattach': False,
             'QoS_support': False,
-            'online_extend_support': False,
+            'online_extend_support': True,
             'consistencygroup_support': False,
             'consistent_group_snapshot_enabled': False,
         }
@@ -1486,3 +1505,212 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 volume['id'], new_size
             )
             self.extend_volume(volume, new_size)
+
+    def extend_volume(self, volume, new_size):
+        """Extend a volume, including one attached to an instance.
+
+        Detached volumes keep the parent NfsDriver behaviour (qemu-img
+        resize). Attached volumes are handled by _extend_attached_volume;
+        the reasoning is in docs/adr/0004.
+
+        :param volume: volume reference
+        :param new_size: new size in GiB
+        """
+        if not self._is_volume_attached(volume):
+            return super().extend_volume(volume, new_size)
+
+        lock_key = self._get_volume_lock_key(volume.id)
+        self._extend_attached_volume(volume, int(new_size), lock_key)
+
+    @coordination.synchronized('{lock_key}')
+    def _extend_attached_volume(self, volume, new_size: int, lock_key) -> None:
+        """Extend an attached volume with coordination lock.
+
+        Everything is validated before the file is touched, so a failed
+        extend leaves the volume at its original size.
+
+        raw: grow the file here; Cinder then sends Nova the volume-extended
+        event and Nova's virDomainBlockResize makes the guest see it.
+        qcow2: the virtual size lives in the image header. The share is
+        mounted nolock, so a qemu process on a compute host holding the
+        file is invisible from this host, and rewriting the header under it
+        corrupts the image. Leave it to Nova/qemu unless Nova confirms that
+        every attached instance is shut off.
+
+        :param volume: volume reference
+        :param new_size: new size in GiB
+        :param lock_key: coordination lock key
+        """
+        LOG.info('Extending attached volume %(vol)s from %(old)sG to '
+                 '%(new)sG with lock %(lock)s',
+                 {'vol': volume.id, 'old': volume.size, 'new': new_size,
+                  'lock': lock_key})
+        if new_size <= volume.size:
+            raise exception.ExtendVolumeError(
+                reason=_('New size %(new)sG must be larger than the current '
+                         'size %(old)sG of volume %(vol)s')
+                % {'new': new_size, 'old': volume.size, 'vol': volume.id})
+
+        if not self._is_share_eligible(volume.provider_location,
+                                       new_size - volume.size):
+            raise exception.ExtendVolumeError(
+                reason=_('Insufficient space to extend volume %(vol)s to '
+                         '%(new)sG') % {'vol': volume.id, 'new': new_size})
+
+        path = os.path.join(self._local_volume_dir(volume), volume.name)
+        file_format = self._qemu_img_info(path, volume.name).file_format
+
+        if file_format == 'raw':
+            self._grow_volume_file(volume, path, 'raw', new_size)
+        elif file_format == 'qcow2':
+            self._extend_attached_qcow2(volume, path, new_size)
+        else:
+            raise exception.ExtendVolumeError(
+                reason=_('Cannot extend attached volume %(vol)s with '
+                         'format %(fmt)s') % {'vol': volume.id,
+                                              'fmt': file_format})
+
+    def _extend_attached_qcow2(self, volume, path: str, new_size: int) -> None:
+        """Extend an attached qcow2 volume without racing a running qemu.
+
+        :param volume: volume reference
+        :param path: local path of the volume file
+        :param new_size: new size in GiB
+        """
+        instance_uuids = self._attached_instance_uuids(volume)
+        if not self._instances_shut_off(instance_uuids):
+            LOG.info('Volume %(vol)s is a qcow2 file attached to %(inst)s, '
+                     'which may be running; leaving the resize to Nova '
+                     '(virDomainBlockResize). If Nova skips it, the file is '
+                     'grown before the next attach.',
+                     {'vol': volume.id, 'inst': instance_uuids})
+            return
+
+        self._grow_volume_file(volume, path, 'qcow2', new_size)
+        if not self._instances_shut_off(instance_uuids):
+            LOG.error('An instance attached to volume %(vol)s (%(inst)s) '
+                      'left the shut-off state while its qcow2 file was '
+                      'being resized offline. Check the image with '
+                      '"qemu-img check" before trusting it.',
+                      {'vol': volume.id, 'inst': instance_uuids})
+
+    def _grow_volume_file(self, volume, path: str, file_format: str,
+                          new_size: int) -> None:
+        """Grow a raw or qcow2 volume file and verify its virtual size.
+
+        raw is grown with truncate, which only changes the file length and is
+        safe while a VM writes to the file. qcow2 must only be grown while no
+        qemu process holds the file.
+
+        :param volume: volume reference
+        :param path: local path of the volume file
+        :param file_format: 'raw' or 'qcow2'
+        :param new_size: new size in GiB
+        """
+        LOG.info('Growing %(fmt)s file of volume %(vol)s to %(new)sG',
+                 {'fmt': file_format, 'vol': volume.id, 'new': new_size})
+        if file_format == 'raw':
+            self._execute('truncate', '-s', '%dG' % new_size, path,
+                          run_as_root=self._execute_as_root)
+        else:
+            image_utils.resize_image(path, new_size,
+                                     run_as_root=self._execute_as_root,
+                                     file_format=file_format)
+
+        virtual_size = self._qemu_img_info(path, volume.name).virtual_size
+        if virtual_size != new_size * units.Gi:
+            raise exception.ExtendVolumeError(
+                reason=_('Resizing volume %(vol)s file failed: virtual size '
+                         'is %(actual)s bytes, expected %(new)sG')
+                % {'vol': volume.id, 'actual': virtual_size, 'new': new_size})
+
+    @staticmethod
+    def _attached_instance_uuids(volume):
+        """Return the instances a volume is attached to.
+
+        :param volume: volume reference
+        :returns: list of instance UUIDs, or None if any attachment has no
+                  instance (for example a host attachment), because then
+                  nobody can confirm the file is not open
+        """
+        uuids = []
+        for attachment in volume.volume_attachment or []:
+            if attachment.attach_status != fields.VolumeAttachStatus.ATTACHED:
+                continue
+            if not attachment.instance_uuid:
+                return None
+            uuids.append(attachment.instance_uuid)
+        return uuids
+
+    def _instances_shut_off(self, instance_uuids) -> bool:
+        """Check with Nova that every instance is shut off and idle.
+
+        Any doubt (check disabled, no instances known, Nova error, a task in
+        progress such as powering-on) returns False, which means the caller
+        must not touch the volume file.
+
+        :param instance_uuids: list of instance UUIDs, or None
+        :returns: True only if Nova reports all of them SHUTOFF
+        """
+        if not self.configuration.vmstore_online_extend_nova_check:
+            return False
+        if not instance_uuids:
+            return False
+
+        nova_api = nova.API()
+        ctxt = context.get_admin_context()
+        timeout = self.configuration.vmstore_nova_api_timeout
+        for instance_uuid in instance_uuids:
+            try:
+                server = nova_api.get_server(ctxt, instance_uuid,
+                                             privileged_user=True,
+                                             timeout=timeout)
+            except Exception as error:
+                LOG.warning('Could not get the power state of instance '
+                            '%(inst)s from Nova: %(err)s',
+                            {'inst': instance_uuid, 'err': error})
+                return False
+            status = getattr(server, 'status', None)
+            # Admin-only extended attribute; if it is not visible we cannot
+            # rule out a power-on in progress, so treat it as unknown.
+            task_state = getattr(server, 'OS-EXT-STS:task_state', '<unknown>')
+            LOG.debug('Instance %(inst)s status %(status)s task_state '
+                      '%(task)s', {'inst': instance_uuid, 'status': status,
+                                   'task': task_state})
+            if status != 'SHUTOFF' or task_state is not None:
+                return False
+        return True
+
+    @coordination.synchronized('{lock_key}')
+    def _reconcile_size_before_attach(self, volume, path: str,
+                                      file_format: str, lock_key) -> None:
+        """Grow a volume file that is smaller than the volume size.
+
+        This happens when Nova skipped or failed the guest-side resize of an
+        online extend (for example a qcow2 volume on a shut-off instance).
+        It is only safe while no other consumer has the file open, so it is
+        skipped if the volume has any attachment in the attached state.
+
+        :param volume: volume reference
+        :param path: local path of the volume file
+        :param file_format: 'raw' or 'qcow2'
+        :param lock_key: coordination lock key
+        """
+        # Re-read under the lock: a concurrent attach may have fixed it.
+        info = self._qemu_img_info(path, volume['name'])
+        if info.virtual_size >= int(volume['size']) * units.Gi:
+            return
+        if any(attachment.attach_status == fields.VolumeAttachStatus.ATTACHED
+               for attachment in volume.volume_attachment or []):
+            LOG.warning('Volume %(vol)s file is %(actual)s bytes, smaller '
+                        'than its size %(size)sG, but it is already '
+                        'attached elsewhere; not resizing.',
+                        {'vol': volume['id'], 'actual': info.virtual_size,
+                         'size': volume['size']})
+            return
+        LOG.warning('Volume %(vol)s file is %(actual)s bytes, smaller than '
+                    'its size %(size)sG (an online extend was not applied '
+                    'by Nova); growing it before attach.',
+                    {'vol': volume['id'], 'actual': info.virtual_size,
+                     'size': volume['size']})
+        self._grow_volume_file(volume, path, file_format, int(volume['size']))
