@@ -17,10 +17,10 @@
 import hashlib
 import os
 import re
+import shutil
 import time
 from typing import List
 
-from os_brick import encryptors
 from os_brick.remotefs import remotefs
 from oslo_concurrency import processutils
 from oslo_log import log as logging
@@ -28,7 +28,6 @@ from oslo_utils import units
 
 from cinder import context
 from cinder import coordination
-from cinder import db
 from cinder import exception
 from cinder.i18n import _
 from cinder.image import image_utils
@@ -86,12 +85,25 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  Add Option for max delay in snapshot polling to avoid excessively long waits in case of issues,
                  Refactor: add TINTRI_PATH_PREFIX constant
         3.0.8 - Release version for April 2026
-        3.0.9 - Fixes VMS-4184: Pass volume.id while querying virtual disk information. Also, populate
-                volumeId parameter in payload to /host/refresh API in refresh_hypervisor function.
+        3.0.9  - [VMS-4184]: Pass volume.id while querying virtual disk information. Also, populate
+                    volumeId parameter in payload to /host/refresh API in refresh_hypervisor function.
+        3.0.10 - [VMS-4243]: (PCD-4852) Call extend_volume when creating a volume from a
+                    snapshot or clone and specifying a larger size for the new volume.
+                 [VMS-4180]: Added _get_capacity_info and _get_provisioned_capacity overrides to avoid
+                    the expensive du traversal. Uses os.stat() per volume file instead.
+                 [VMS-4127] Update README and added extra documentation to repository.
+                 Fix BUG: _get_provisioned_capacity was passing nas_path instead of host:path
+                    to _get_mount_point_for_share, causing incorrect mount resolution.
+                 Refactor: _get_virtual_disk_with_retry uses configuration vmstore_snapshot_poll_initial_delay 
+                    and vmstore_get_vd_timeout for consistency
+                 Refactor: Removed custom implementations of copy_image_to_volume, copy_volume_to_image,  _mount_share,
+                    _ensure_share_mounted, _local_volume_dir, _do_create_volume, extend_volume methods, 
+                    reducing code duplication and potential maintenance overhead.
+                 Refactor: _update_volume_stats to call super() to stay in the Cinder parent stats chain. 
 
     """
 
-    VERSION = '3.0.9'
+    VERSION = '3.0.10'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -104,7 +116,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def __init__(self, execute=processutils.execute, *args, **kwargs):
 
         self._remotefsclient = None
-        super(VmstoreNfsDriver, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         if not self.configuration:
             code = 'ENODATA'
             message = (_('%(product_name)s %(storage_protocol)s '
@@ -117,7 +129,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         root_helper = cinder_utils.get_root_helper()
         mount_point_base = self.configuration.vmstore_mount_point_base
         self.mount_point_base = os.path.realpath(mount_point_base)
-        self.mount_options = self.configuration.safe_get('nfs_mount_options')
+        self.mount_options = (
+            self.configuration.safe_get('nfs_mount_options') or '')
         self._mounted_shares = []
 
         required_mount_opts = [
@@ -151,6 +164,47 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def get_driver_options():
         LOG.info('VmstoreNfsDriver get_driver_options')
         return options.VMSTORE_NFS_OPTS
+
+    def initialize_connection(self, volume, connector):
+        """Allow connection to connector and return connection info.
+
+        NO LOCK NEEDED - This is a read-only operation on the file system.
+        Multiple concurrent connections can be initialized safely.
+
+        :param volume: volume reference
+        :param connector: connector reference
+        :returns: dictionary of connection information
+        """
+        LOG.info('Initialize volume connection for volume %(vol)s with '
+                 'connector %(conn)s', {'vol': volume['name'], 'conn': connector})
+        LOG.debug('Initialize volume connection for %(volume)s',
+                  {'volume': volume['name']})
+        volume_name = volume['name']
+        volume_dir = self._local_volume_dir(volume)
+        path_to_vol = os.path.join(volume_dir, volume_name)
+        info = self._qemu_img_info(path_to_vol, volume_name)
+
+        if info.file_format not in ['raw', 'qcow2']:
+            msg = _('nfs volume must be a valid raw or qcow2 image.')
+            raise exception.InvalidVolume(reason=msg)
+
+        data = {
+            'export': self._get_share_path(),
+            'name': volume_name,
+            'format': info.file_format
+        }
+        encryption_key_id = volume.get('encryption_key_id', None)
+        data['encrypted'] = encryption_key_id is not None
+
+        if self.mount_options:
+            data['options'] = '-o %s' % self.mount_options
+        info = {
+            'driver_volume_type': self.driver_volume_type,
+            'mount_point_base': self.mount_point_base,
+            'data': data
+        }
+        LOG.debug('conn_info: %s', info)
+        return info
 
     def _get_volume_lock_key(self, volume_id):
         """Generate volume-specific lock key.
@@ -223,10 +277,23 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.info('VmstoreNfsDriver do_setup for context: %s', ctxt)
         self.ctxt = ctxt
         self._validate_required_options()
+        max_retries = self.configuration.vmstore_rest_retry_count
         retries = 0
         while not self._do_setup():
             retries += 1
-            self.vmstore.delay(retries)
+            if retries > max_retries:
+                raise exception.VolumeBackendAPIException(
+                    data=_('Failed to initialize VMstore backend after '
+                           '%d retries') % max_retries)
+            if self.vmstore:
+                self.vmstore.delay(retries)
+            else:
+                time.sleep(retries)
+        # Mount the NFS share so _mounted_shares is populated before
+        # _report_driver_status calls get_volume_stats. Without this,
+        # the first stats report has zero capacity and the scheduler
+        # rejects the backend until a volume create triggers mounting.
+        self._ensure_shares_mounted()
 
     def _validate_required_options(self) -> None:
         """Validate that required configuration options are set."""
@@ -246,9 +313,12 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def _do_setup(self) -> bool:
         LOG.info('VmstoreNfsDriver _do_setup')
         try:
-            self.vmstore = api.VmstoreProxy(self.driver_volume_type,
-                                            self.backend_name,
-                                            self.configuration)
+            self.vmstore = api.VmstoreProxy(
+                self.driver_volume_type,
+                self.backend_name,
+                self.configuration,
+                client_version='Tintri-Cinder-Driver-%s' % self.VERSION,
+            )
         except api.VmstoreException as error:
             LOG.error('Failed to initialize RESTful API for backend '
                       '%(backend_name)s on host %(host)s: %(error)s',
@@ -260,9 +330,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     def check_for_setup_error(self) -> None:
         LOG.info('Checking for setup error')
+        max_retries = self.configuration.vmstore_rest_retry_count
         retries = 0
         while not self._check_for_setup_error():
             retries += 1
+            if retries > max_retries:
+                raise exception.VolumeBackendAPIException(
+                    data=_('VMstore appliance not accessible after '
+                           '%d retries') % max_retries)
             self.vmstore.delay(retries)
 
     def _check_for_setup_error(self):
@@ -308,10 +383,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 self.configuration.nas_share_path)):
             LOG.debug('Using nas_host and nas_share_path configuration.')
 
-            nas_host = self.configuration.nas_host
-            nas_share_path = self.configuration.nas_share_path
-
-            share_address = '%s:%s' % (nas_host, nas_share_path)
+            share_address = self._get_share_path()
 
             if not re.match(self.SHARE_FORMAT_REGEX, share_address):
                 msg = _('Share %(share)s ignored due to invalid format. '
@@ -320,7 +392,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                         ) % {'share': share_address}
                 raise exception.InvalidConfigurationValue(msg)
 
-            self.shares[share_address] = self.mount_options
+            self.shares[share_address] = getattr(
+                self.configuration, 'nas_mount_options', None)
 
         else:
             msg = 'nas_host or nas_share_path not configured.'
@@ -336,49 +409,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :returns: mount point
         """
         LOG.info('VmstoreNfsDriver _mount_share for share: %s', share)
-        attempts = max(1, self.configuration.nfs_mount_attempts)
-        for attempt in range(1, attempts + 1):
-            try:
-                self._remotefsclient.mount(share)
-            except Exception as error:
-                LOG.debug('Mount attempt %(attempt)s failed: %(error)s, '
-                          'retrying mount NFS share %(share)s',
-                          {'attempt': attempt, 'error': error,
-                           'share': share})
-                if attempt == attempts:
-                    LOG.error('Failed to mount NFS share %(share)s '
-                              'after %(attempt)s attempts: %(error)s',
-                              {'share': share, 'attempt': attempt,
-                               'error': error})
-                    raise
-                self.vmstore.delay(attempt)
-            else:
-                mntpoint = self._get_mount_point_for_share(share)
-                LOG.debug('NFS share %(share)s has been mounted at '
-                          '%(mntpoint)s after %(attempt)s attempts',
-                          {'share': share, 'mntpoint': mntpoint,
-                           'attempt': attempt})
-                return mntpoint
-
-    def _ensure_share_mounted(self, nfs_share) -> None:
-        LOG.info('VmstoreNfsDriver _ensure_share_mounted for share: %s', nfs_share)
-        num_attempts = max(1, self.configuration.nfs_mount_attempts)
-        for attempt in range(num_attempts):
-            try:
-                self._remotefsclient.mount(nfs_share)
-                self._mounted_shares.append(nfs_share)
-                return
-            except Exception as e:
-                if attempt == (num_attempts - 1):
-                    LOG.error('Mount failure for %(share)s after '
-                              '%(count)d attempts.',
-                              {'share': nfs_share,
-                               'count': num_attempts})
-                    raise exception.NfsException(str(e))
-                LOG.debug('Mount attempt %(attempt)d failed: %(exc)s.\n'
-                          'Retrying mount ...',
-                          {'attempt': attempt, 'exc': e})
-                time.sleep(1)
+        return super()._mount_share(share)
 
     def refresh_hypervisor(self, volume):
         """Refresh VMstore hypervisor for the given volume.
@@ -431,7 +462,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :returns: Virtual disk info or None
         """
         max_retries = self.configuration.vmstore_virtual_disk_retries
-        delay = 0.5
+        delay = self.configuration.vmstore_snapshot_poll_initial_delay
+        max_delay = self.configuration.vmstore_get_vd_timeout
         for attempt in range(max_retries):
             vd = self.vmstore.virtual_disk.get(volume.id)
             if vd:
@@ -448,13 +480,155 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                 # Try refresh call
                 LOG.info('VirtualDisk for %s not found, sleeping %d', volume.id, delay)
                 self.refresh_hypervisor(volume)
-                time.sleep(delay)
+                sleep_time = min(delay, max_delay)
+                time.sleep(sleep_time)
                 delay *= 2  # Exponential backoff
 
         LOG.warning(
             'Virtual disk for %(name)s not found after %(retries)s retries',
             {'name': volume['name'], 'retries': max_retries})
         return None
+
+    def _get_provisioned_capacity(self) -> float:
+        share_string = self._get_share_path()
+        mount_point = self._get_mount_point_for_share(share_string)
+        provisioned_bytes = 0
+        if os.path.exists(mount_point):
+            for filename in os.listdir(mount_point):
+                if (filename.startswith('volume-') and
+                        not filename.endswith('.info')):
+                    filepath = os.path.join(mount_point, filename)
+                    try:
+                        provisioned_bytes += os.stat(filepath).st_size
+                    except OSError:
+                        continue
+        return round(provisioned_bytes / float(units.Gi), 2)
+
+    def _get_capacity_info(self, nfs_share: str) -> tuple[float, float, float]:
+        """Calculate available space on the NFS share.
+
+        Overrides base class to calculate provisioned capacity for thin
+        provisioning support instead of actual disk usage (du).
+
+        :param nfs_share: example 172.18.194.100:/var/nfs
+        :returns: (total_size, total_available, provisioned_capacity)
+        """
+        mount_point = self._get_mount_point_for_share(nfs_share)
+
+        # Get filesystem capacity using stat
+        df, _ = self._execute('stat', '-f', '-c', '%S %b %a', mount_point,
+                              run_as_root=self._execute_as_root)
+        block_size, blocks_total, blocks_avail = map(float, df.split())
+        total_available = block_size * blocks_avail
+        total_size = block_size * blocks_total
+
+        # Provisioned capacity: sum of logical sizes of volume files.
+        # st_size reports logical/promised size for thin-provisioned files on
+        # VMstore NFS. VMstore snapshots are appliance-internal and not visible
+        # as NFS files, so volume-* at the share root is a complete inventory.
+        provisioned_bytes = 0
+        if os.path.exists(mount_point):
+            for filename in os.listdir(mount_point):
+                if (filename.startswith('volume-') and
+                        not filename.endswith('.info')):
+                    filepath = os.path.join(mount_point, filename)
+                    try:
+                        provisioned_bytes += os.stat(filepath).st_size
+                    except OSError:
+                        continue
+
+        return total_size, total_available, provisioned_bytes
+
+    def get_volume_stats(self, refresh=False) -> dict:
+        """Get volume stats.
+
+        Stats are cached based on vmstore_stats_cache_period configuration.
+        """
+        LOG.info('VmstoreNfsDriver get_volume_stats, refresh: %s', refresh)
+
+        cache_period = self.configuration.vmstore_stats_cache_period
+        current_time = time.time()
+        cache_age = current_time - self._stats_cache_timestamp
+
+        if (not self._stats_cache or refresh or
+                cache_period == 0 or cache_age >= cache_period):
+            LOG.debug('Updating volume stats: cache_age=%.2f, '
+                      'cache_period=%d',
+                      cache_age, cache_period)
+            self._update_volume_stats()
+            self._stats_cache = self._stats
+            self._stats_cache_timestamp = current_time
+        else:
+            LOG.debug('Using cached volume stats: cache_age=%.2f, '
+                      'cache_period=%d',
+                      cache_age, cache_period)
+            self._stats = self._stats_cache
+
+        return self._stats
+
+    def _update_volume_stats(self) -> None:
+        LOG.info('VmstoreNfsDriver _update_volume_stats')
+
+        # Run the standard NFS stats chain. Our overridden _get_capacity_info
+        # and _get_provisioned_capacity are called here, so no du is invoked.
+        super()._update_volume_stats()
+        data = self._stats
+
+        # Count total volumes — not tracked by the parent chain
+        share_string = self._get_share_path()
+        mount_path = self._get_mount_point_for_share(share_string)
+        total_volumes = 0
+        if os.path.exists(mount_path):
+            for filename in os.listdir(mount_path):
+                if (filename.startswith('volume-') and
+                        not filename.endswith('.info')):
+                    total_volumes += 1
+
+        location_info = '%(driver)s:%(host)s:%(path)s' % {
+            'driver': self.nas_driver,
+            'host': self.nas_host,
+            'path': self.nas_path
+        }
+        display_name = 'Capabilities of %(product)s %(protocol)s driver' % {
+            'product': self.product_name,
+            'protocol': self.storage_protocol
+        }
+
+        # There will always be exactly 1 pool for NFS driver.
+        # VMstore always uses thin provisioning regardless of nfs_sparsed_volumes.
+        pool = {
+            'pool_name': share_string,
+            'total_capacity_gb': data['total_capacity_gb'],
+            'free_capacity_gb': data['free_capacity_gb'],
+            'reserved_percentage': data['reserved_percentage'],
+            'provisioned_capacity_gb': data['provisioned_capacity_gb'],
+            'max_over_subscription_ratio': data['max_over_subscription_ratio'],
+            'thin_provisioning_support': True,
+            'thick_provisioning_support': False,
+            'total_volumes': total_volumes,
+            'multiattach': False,
+            'QoS_support': False,
+            'online_extend_support': False,
+            'consistencygroup_support': False,
+            'consistent_group_snapshot_enabled': False,
+        }
+
+        self._stats = {
+            'backend_state': 'up',
+            'driver_version': self.VERSION,
+            'vendor_name': self.vendor_name,
+            'storage_protocol': self.storage_protocol,
+            'volume_backend_name': self.backend_name,
+            'location_info': location_info,
+            'display_name': display_name,
+            'sparse_copy_volume': True,
+            'pools': [pool],
+        }
+        LOG.debug('Updated volume backend statistics for host %(host)s '
+                  'and volume backend %(backend_name)s: %(stats)s',
+                  {'host': self.host,
+                   'backend_name': self.backend_name,
+                   'stats': self._stats})
 
     def create_volume(self, volume: objects.Volume) -> dict:
         """Creates a volume.
@@ -471,81 +645,13 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.debug('Creating volume %(vol)s', {'vol': volume.name_id})
         self._ensure_shares_mounted()
 
-        volume.provider_location = self._find_share(volume)
+        volume.provider_location = self._get_share_path()
 
         LOG.info('casted to %s', volume.provider_location)
 
         self._do_create_volume(volume)
         self.refresh_hypervisor(volume)
         return {'provider_location': volume.provider_location}
-
-    def _do_create_volume(self, volume: objects.Volume) -> None:
-        """Create a volume on given remote share.
-
-        :param volume: volume reference
-        """
-        LOG.info('VmstoreNfsDriver _do_create_volume for volume: %s',
-                 volume.name_id)
-        volume_path = self.local_path(volume)
-        volume_size = volume.size
-
-        encrypted = volume.encryption_key_id is not None
-
-        if encrypted:
-            encryption = self.check_encryption_provider(
-                volume,
-                volume.obj_context)
-
-            self._create_encrypted_volume_file(volume_path,
-                                               volume_size,
-                                               encryption,
-                                               volume.obj_context)
-        elif getattr(self.configuration,
-                     self.driver_prefix + '_qcow2_volumes', False):
-            # QCOW2 volumes are inherently sparse, so this setting
-            # will override the _sparsed_volumes setting.
-            self._create_qcow2_file(volume_path, volume_size)
-            self.format = 'qcow2'
-        elif getattr(self.configuration,
-                     self.driver_prefix + '_sparsed_volumes', False):
-            self._create_sparsed_file(volume_path, volume_size)
-        else:
-            self._create_regular_file(volume_path, volume_size)
-
-        self._set_rw_permissions(volume_path)
-        volume.admin_metadata['format'] = self.format
-        with volume.obj_as_admin():
-            volume.save()
-
-    def check_encryption_provider(
-        self,
-        volume: 'objects.Volume',
-        context: context.RequestContext,
-    ) -> dict:
-        """Check that this is a LUKS encryption provider.
-
-        :returns: encryption dict
-        """
-        LOG.info('VmstoreNfsDriver check_encryption_provider for volume: %s',
-                 volume.id)
-
-        encryption = db.volume_encryption_metadata_get(context, volume.id)
-
-        if 'provider' not in encryption:
-            message = _("Invalid encryption spec.")
-            raise exception.VolumeDriverException(message=message)
-
-        provider = encryption['provider']
-        if provider in encryptors.LEGACY_PROVIDER_CLASS_TO_FORMAT_MAP:
-            provider = encryptors.LEGACY_PROVIDER_CLASS_TO_FORMAT_MAP[provider]
-            encryption['provider'] = provider
-
-        if 'cipher' not in encryption or 'key_size' not in encryption:
-            msg = _('encryption spec must contain "cipher" and '
-                    '"key_size"')
-            raise exception.VolumeDriverException(message=msg)
-
-        return encryption
 
     def delete_volume(self, volume):
         """Deletes a logical volume."""
@@ -610,60 +716,6 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         nas_share_path = self.configuration.nas_share_path
 
         return '%s:%s' % (nas_host, nas_share_path)
-
-    def initialize_connection(self, volume, connector):
-        """Allow connection to connector and return connection info.
-
-        NO LOCK NEEDED - This is a read-only operation on the file system.
-        Multiple concurrent connections can be initialized safely.
-
-        :param volume: volume reference
-        :param connector: connector reference
-        :returns: dictionary of connection information
-        """
-        LOG.info('Initialize volume connection for volume %(vol)s with '
-                 'connector %(conn)s', {'vol': volume['name'], 'conn': connector})
-        LOG.debug('Initialize volume connection for %(volume)s',
-                  {'volume': volume['name']})
-        volume_name = volume['name']
-        volume_dir = self._local_volume_dir(volume)
-        path_to_vol = os.path.join(volume_dir, volume_name)
-        info = self._qemu_img_info(path_to_vol, volume_name)
-
-        if info.file_format not in ['raw', 'qcow2']:
-            msg = _('nfs volume must be a valid raw or qcow2 image.')
-            raise exception.InvalidVolume(reason=msg)
-
-        data = {
-            'export': self._get_share_path(),
-            'name': volume_name,
-            'format': info.file_format
-        }
-        encryption_key_id = volume.get('encryption_key_id', None)
-        data['encrypted'] = encryption_key_id is not None
-
-        if self.mount_options:
-            data['options'] = '-o %s' % self.mount_options
-        info = {
-            'driver_volume_type': self.driver_volume_type,
-            'mount_point_base': self.mount_point_base,
-            'data': data
-        }
-        LOG.debug('conn_info: %s', info)
-        return info
-
-    def _local_volume_dir(self, volume):
-        """Get volume dir (mounted locally fs path) for given volume.
-
-        :param volume: volume reference
-        """
-        LOG.info('VmstoreNfsDriver _local_volume_dir for volume: %s',
-                 volume.name_id)
-        share = volume.provider_location
-        if isinstance(share, str):
-            share = share.encode('utf-8')
-        path = hashlib.md5(share, usedforsecurity=False).hexdigest()
-        return os.path.join(self.mount_point_base, path)
 
     def _check_snapshot_support(self, setup_checking=False):
         LOG.info('VmstoreNfsDriver _check_snapshot_support, '
@@ -762,6 +814,29 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             else:
                 raise
 
+    def copy_image_to_volume(self,
+                             context: context.RequestContext,
+                             volume: objects.Volume,
+                             image_service,
+                             image_id: str,
+                             disable_sparse: bool = False) -> None:
+        """Fetch the image from image_service and write it to the volume."""
+        LOG.info('VmstoreNfsDriver copy_image_to_volume, volume: %s, image_id: %s',
+                 volume.id, image_id)
+        super().copy_image_to_volume(
+            context, volume, image_service, image_id, disable_sparse)
+
+    def copy_volume_to_image(self,
+                             context: context.RequestContext,
+                             volume: objects.Volume,
+                             image_service,
+                             image_meta: dict) -> None:
+        """Copy the volume to the specified image."""
+        LOG.info('VmstoreNfsDriver copy_volume_to_image, volume: %s, image_id: %s',
+                 volume.id, image_meta.get('id'))
+        super().copy_volume_to_image(
+            context, volume, image_service, image_meta)
+
     def create_volume_from_snapshot(self, volume, snapshot):
         """Create new volume from other's snapshot on appliance.
 
@@ -771,7 +846,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param snapshot: reference of source snapshot
         """
         lock_key = self._get_snapshot_lock_key(snapshot.id)
-        return self._create_volume_from_snapshot_locked(volume, snapshot, lock_key)
+        result = self._create_volume_from_snapshot_locked(volume, snapshot, lock_key)
+        self._extend_volume_for_cloned_volume(volume, snapshot['volume_size'])
+        return result
 
     @coordination.synchronized('{lock_key}')
     def _create_volume_from_snapshot_locked(self, volume, snapshot, lock_key):
@@ -815,8 +892,17 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         temp_clone_path = os.path.join(temp_clone_dir, snapshot['volume_name'])
         clone_destination = os.path.join(mount_dir, volume['name'])
 
-        os.rename(temp_clone_path, clone_destination)
-        os.rmdir(temp_clone_dir)
+        try:
+            os.rename(temp_clone_path, clone_destination)
+            os.rmdir(temp_clone_dir)
+        except OSError as exc:
+            LOG.error(
+                'Failed to rename clone from %(src)s to %(dst)s: %(err)s — '
+                'attempting cleanup of temp directory %(dir)s',
+                {'src': temp_clone_path, 'dst': clone_destination,
+                 'err': exc, 'dir': temp_clone_dir})
+            shutil.rmtree(temp_clone_dir, ignore_errors=True)
+            raise
         LOG.debug(
             'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
             {'src': temp_clone_path, 'dst': clone_destination,
@@ -824,56 +910,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
-        volume.provider_location = self._find_share(volume)
+        volume.provider_location = self._get_share_path()
+
         return {'provider_location': volume.provider_location}
-
-    def copy_image_to_volume(self,
-                             context: context.RequestContext,
-                             volume: objects.Volume,
-                             image_service,
-                             image_id: str,
-                             disable_sparse: bool = False) -> None:
-        """Fetch the image from image_service and write it to the volume."""
-
-        LOG.info('Copying image %(image)s to volume %(vol)s',
-                 {'image': image_id, 'vol': volume.name_id})
-        volpath = self.local_path(volume)
-        image_utils.fetch_to_raw(context,
-                                 image_service,
-                                 image_id,
-                                 volpath,
-                                 self.configuration.volume_dd_blocksize,
-                                 size=volume.size,
-                                 run_as_root=self._execute_as_root,
-                                 disable_sparse=disable_sparse)
-
-        image_utils.resize_image(volpath, volume.size,
-                                 run_as_root=self._execute_as_root)
-
-        data = image_utils.qemu_img_info(volpath,
-                                         run_as_root=self._execute_as_root)
-        virt_size = data.virtual_size // units.Gi
-        if virt_size != volume.size:
-            raise exception.ImageUnacceptable(
-                image_id=image_id,
-                reason=(_("Expected volume size was %d") % volume.size)
-                + (_(" but size is now %d") % virt_size))
-
-    def copy_volume_to_image(self,
-                             context: context.RequestContext,
-                             volume: objects.Volume,
-                             image_service,
-                             image_meta: dict) -> None:
-        """Copy the volume to the specified image."""
-        LOG.info('Copying volume %(vol)s to image %(image)s',
-                 {'vol': volume.name_id, 'image': image_meta.get('id')})
-        volpath = self.local_path(volume)
-        volume_utils.upload_volume(context,
-                                   image_service,
-                                   image_meta,
-                                   volpath,
-                                   volume,
-                                   run_as_root=self._execute_as_root)
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume.
@@ -895,7 +934,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             raise api.VmstoreException(code='NotFound', message=msg)
         
         lock_key = self._get_volume_lock_key(volume.id)
-        return self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
+        result = self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
+        self._extend_volume_for_cloned_volume(volume, src_vref['size'])
+        return result
 
     @coordination.synchronized('{lock_key}')
     def _create_cloned_volume_locked(self, volume, src_vref, vd, lock_key):
@@ -986,8 +1027,17 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         temp_clone_path = os.path.join(temp_clone_dir, src_name)
         clone_destination = os.path.join(mount_dir, volume['name'])
 
-        os.rename(temp_clone_path, clone_destination)
-        os.rmdir(temp_clone_dir)
+        try:
+            os.rename(temp_clone_path, clone_destination)
+            os.rmdir(temp_clone_dir)
+        except OSError as exc:
+            LOG.error(
+                'Failed to rename clone from %(src)s to %(dst)s: %(err)s — '
+                'attempting cleanup of temp directory %(dir)s',
+                {'src': temp_clone_path, 'dst': clone_destination,
+                 'err': exc, 'dir': temp_clone_dir})
+            shutil.rmtree(temp_clone_dir, ignore_errors=True)
+            raise
         LOG.debug(
             'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
             {'src': temp_clone_path, 'dst': clone_destination,
@@ -995,7 +1045,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
-        volume.provider_location = self._find_share(volume)
+        volume.provider_location = self._get_share_path()
 
         LOG.info(
             'Successfully created cloned volume %(vol)s from %(src)s '
@@ -1003,158 +1053,27 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             {'vol': volume['name'], 'src': src_name, 'lock': lock_key})
         return {'provider_location': volume.provider_location}
 
-    def extend_volume(self, volume, new_size):
-        """Extend an existing volume to the new size."""
-        LOG.info('Extending volume %(vol)s to new size %(size)s GB.',
-                 {'vol': volume.name_id, 'size': new_size})
-        if self._is_volume_attached(volume):
-            msg = (_("Cannot extend volume %s while it is attached.")
-                   % volume.name_id)
-            raise exception.ExtendVolumeError(msg)
+    def _extend_volume_for_cloned_volume(self, volume, original_size: int) -> None:
+        """Extend cloned volume if the requested size is larger than source."""
+        new_size = volume['size']
 
-        LOG.info('Extending volume %(vol)s to new size %(size)s GB.',
-                 {'vol': volume.name_id, 'size': new_size})
-        extend_by = int(new_size) - volume.size
-        if not self._is_share_eligible(volume.provider_location,
-                                       extend_by):
-            raise exception.ExtendVolumeError(reason='Insufficient space to'
-                                              ' extend volume %s to %sG'
-                                              % (volume.name_id, new_size))
-        # Use the active image file because this volume might have snapshot(s).
-        active_file = self.get_active_image_from_info(volume)
-        active_file_path = os.path.join(self._local_volume_dir(volume),
-                                        active_file)
-        LOG.info('Resizing file to %sG...', new_size)
-        file_format = None
-        admin_metadata = objects.Volume.get_by_id(
-            context.get_admin_context(), volume.id).admin_metadata
+        if new_size is None:
+            raise exception.VolumeDriverException(
+                message=_("New cloned volume size cannot be None"))
 
-        if admin_metadata and 'format' in admin_metadata:
-            file_format = admin_metadata['format']
-        image_utils.resize_image(
-            active_file_path, new_size,
-            run_as_root=self._execute_as_root,
-            file_format=file_format)
-        if file_format == 'qcow2' and not self._is_file_size_equal(
-                active_file_path, new_size):
-            raise exception.ExtendVolumeError(
-                reason='Resizing image file failed.')
+        if original_size is None:
+            raise exception.VolumeDriverException(
+                message=_("Original source volume size cannot be None"))
+        
+        LOG.debug(
+            "Checking whether cloned volume %s needs resize. "
+            "New size: %s, original size: %s.",
+            volume['id'], new_size, original_size
+        )
 
-    def _get_provisioned_capacity(self):
-        mount_path = self._get_mount_point_for_share(self.nas_path)
-        provisioned_bytes = 0
-
-        for filename in os.listdir(mount_path):
-            # Only count cinder volume files to avoid counting temp files or snapshots
-            if filename.startswith('volume-'):
-                filepath = os.path.join(mount_path, filename)
-                try:
-                    # .st_size returns the 'apparent size' (provisioned capacity)
-                    provisioned_bytes += os.stat(filepath).st_size
-                except OSError:
-                    continue
-
-        return provisioned_bytes / float(units.Gi)
-
-    def get_volume_stats(self, refresh=False) -> dict:
-        """Get volume stats.
-
-        Stats are cached based on vmstore_stats_cache_period configuration.
-        """
-        LOG.info('VmstoreNfsDriver get_volume_stats, refresh: %s',
-                 refresh)
-
-        cache_period = self.configuration.vmstore_stats_cache_period
-        current_time = time.time()
-        cache_age = current_time - self._stats_cache_timestamp
-
-        # Update stats if:
-        # 1. No stats cached yet, OR
-        # 2. Cache is disabled (cache_period == 0), OR
-        # 3. Cache has expired
-        if (not self._stats_cache or cache_period == 0 or cache_age >= cache_period):
-            LOG.debug('Updating volume stats: cache_age=%.2f, '
-                      'cache_period=%d',
-                      cache_age, cache_period)
-            self._update_volume_stats()
-            self._stats_cache = self._stats
-            self._stats_cache_timestamp = current_time
-        else:
-            LOG.debug('Using cached volume stats: cache_age=%.2f, '
-                      'cache_period=%d',
-                      cache_age, cache_period)
-            self._stats = self._stats_cache
-
-        return self._stats
-
-    def _update_volume_stats(self) -> None:
-        LOG.info('VmstoreNfsDriver _update_volume_stats')
-        self._ensure_shares_mounted()
-        share_string = "%s:%s" % (self.nas_host, self.nas_path)
-        mount_path = self._get_mount_point_for_share(share_string)
-
-        provisioned_bytes = 0
-        total_volumes = 0
-
-        if os.path.exists(mount_path):
-            for filename in os.listdir(mount_path):
-                # Count base volumes, excluding metadata/info files
-                if filename.startswith('volume-') and not filename.endswith('.info'):
-                    filepath = os.path.join(mount_path, filename)
-                    try:
-                        stat = os.stat(filepath)
-                        # Logical size (The "promised" capacity)
-                        provisioned_bytes += stat.st_size
-                        total_volumes += 1
-                    except OSError:
-                        continue
-
-        capacity, free, _used = self._get_capacity_info(share_string)
-
-        max_osr = self.configuration.safe_get('max_over_subscription_ratio')
-        reserved = self.configuration.safe_get('reserved_percentage') or 0
-
-        location_info = '%(driver)s:%(host)s:%(path)s' % {
-            'driver': self.nas_driver,
-            'host': self.nas_host,
-            'path': self.nas_path
-        }
-        display_name = 'Capabilities of %(product)s %(protocol)s driver' % {
-            'product': self.product_name,
-            'protocol': self.storage_protocol
-        }
-
-        # There will always be exactly 1 pool for NFS driver
-        pool = {
-            'pool_name': share_string,
-            'total_capacity_gb': capacity / float(units.Gi),
-            'free_capacity_gb': free / float(units.Gi),
-            'reserved_percentage': reserved,
-            'provisioned_capacity_gb': provisioned_bytes / float(units.Gi),
-            'max_over_subscription_ratio': max_osr,
-            'thin_provisioning_support': True,
-            'thick_provisioning_support': False,
-            'total_volumes': total_volumes,
-            'multiattach': False,
-            'QoS_support': False,
-            'online_extend_support': False,
-            'consistencygroup_support': False,
-            'consistent_group_snapshot_enabled': False,
-        }
-
-        self._stats = {
-            'backend_state': 'up',
-            'driver_version': self.VERSION,
-            'vendor_name': self.vendor_name,
-            'storage_protocol': self.storage_protocol,
-            'volume_backend_name': self.backend_name,
-            'location_info': location_info,
-            'display_name': display_name,
-            'sparse_copy_volume': True,
-            'pools': [pool],
-        }
-        LOG.debug('Updated volume backend statistics for host %(host)s '
-                  'and volume backend %(backend_name)s: %(stats)s',
-                  {'host': self.host,
-                   'backend_name': self.backend_name,
-                   'stats': self._stats})
+        if new_size > original_size:
+            LOG.debug(
+                "Resize the new volume %s to %s.",
+                volume['id'], new_size
+            )
+            self.extend_volume(volume, new_size)
