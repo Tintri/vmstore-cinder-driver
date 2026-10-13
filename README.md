@@ -79,6 +79,9 @@ vmstore_qcow2_volumes = False
 |`vmstore_snapshot_poll_initial_delay`|Float|`0.5`|no|Initial delay in seconds between snapshot poll attempts. Doubles on each retry up to `vmstore_snapshot_max_delay`.|
 |`vmstore_snapshot_max_delay`|Float|`12.0`|no|Cap in seconds on the exponential backoff delay for snapshot polling.|
 |`vmstore_use_volume_locks`|Boolean|`True`|no|When True, coordination locks are scoped per volume, allowing concurrent operations on different volumes. Set to False for legacy backend-wide locking.|
+|`cross_backend_clone_use_repl_path`|Boolean|`False`|no|Controls how a volume is created from a snapshot that resides on a different VMstore backend. When False (default), the clone is created on the source backend and the file is moved to the destination. When True, the driver attempts to use a VMstore replication path to remotely clone the data, and falls back to the file-move workflow if no replication path from the source to the destination backend exists.|
+|`vmstore_task_timeout`|Int|`86400`|no|Maximum time in seconds to wait for a VMstore async task (such as a replication-path remote clone) to complete. Defaults to 24 hours.|
+|`vmstore_task_poll_interval`|Int|`5`|no|Interval in seconds between polls while waiting for a VMstore async task to complete.|
 
 ### Performance Tuning
 
@@ -102,6 +105,13 @@ After requesting a snapshot, the driver polls until it appears. Backoff starts a
 #### Concurrency
 
 `vmstore_use_volume_locks` (default True) scopes coordination locks per volume so that operations on different volumes can proceed in parallel. Set to False only if you need the legacy single-lock behaviour for compatibility with older deployments.
+
+#### Cross-backend clone
+
+When a volume is created from a snapshot that lives on a *different* VMstore backend, the driver clones the data across backends. Two workflows are available, selected per backend by `cross_backend_clone_use_repl_path`:
+
+- **File move (default, `False`)** — the driver clones the snapshot on the source VMstore, then moves the resulting file to the destination share. This works between any two backends with no additional VMstore configuration.
+- **Replication path (`True`)** — the driver uses the VMstore's native replication infrastructure to remotely clone the snapshot directly to the destination. This requires a configured replication path from the source to the destination VMstore; if none exists, the driver logs a warning and falls back to the file-move workflow above. The wait for the remote clone task is bounded by `vmstore_task_timeout` and polled every `vmstore_task_poll_interval` seconds.
 
 #### Environment profiles
 
