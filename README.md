@@ -141,8 +141,8 @@ functional suites.
 
 The container build does the following:
 
-- Clones the `cinder` repository into the image.
-- Installs Cinder test dependencies inside the image.
+- Clones the `cinder` repository into the image, at `stable/2025.1` by default (the release Platform9 PCD ships).
+- Installs Cinder test dependencies inside the image, pinned with the matching OpenStack upper-constraints.
 - Copies the driver code from this repository into the cloned Cinder tree.
 - Copies the VMstore unit and functional tests into the cloned Cinder tree.
 
@@ -152,6 +152,12 @@ Build the test image:
 
 ```bash
 docker compose -f test/docker-compose.yml build tests
+```
+
+To test against another Cinder branch, set `CINDER_REF` when building (the matching upper-constraints file is picked automatically):
+
+```bash
+CINDER_REF=master docker compose -f test/docker-compose.yml build tests
 ```
 
 Run Level 1 unit tests:

@@ -5,8 +5,9 @@ services:
       context: ..
       dockerfile: test/Dockerfile
       args:
-        # Pin to a specific OpenStack release for reproducibility, e.g. stable/2024.1
-        CINDER_REF: master
+        # Cinder branch to test against. Defaults to the release Platform9 PCD
+        # ships; override with e.g. CINDER_REF=master docker compose ... build
+        CINDER_REF: ${CINDER_REF:-stable/2025.1}
     environment:
       OS_TEST_TIMEOUT: "120"
       PYTHONDONTWRITEBYTECODE: "1"
