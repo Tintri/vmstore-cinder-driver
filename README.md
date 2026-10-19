@@ -128,8 +128,11 @@ When a volume is created from a snapshot that lives on a *different* VMstore bac
 Since 3.0.11 the driver reports `online_extend_support`, so `cinder extend` (API microversion 3.42 or later) works on `in-use` volumes. The guest sees the new size without a restart; growing the partition and filesystem inside the guest is still up to the user.
 
 - **raw volumes:** the driver grows the file, then Nova resizes the guest disk.
-- **qcow2 volumes:** the driver never modifies the file while an instance may be using it (VMstore shares are mounted `nolock`, so the Cinder host cannot see qemu's lock). Nova/qemu resizes it. If the instance is shut off, Nova skips the resize; the driver then resizes the file itself after Nova confirms the instance is shut off (`vmstore_online_extend_nova_check`), and in any case grows it before the volume's next attach.
-- A failed extend leaves the volume at its original size and data; Cinder marks it `error_extending`, and an administrator can recover it with `cinder reset-state --state in-use <volume>`.
+- **qcow2 volumes:** the driver never modifies the file while an instance may be using it (VMstore shares are mounted `nolock`, so the Cinder host cannot see qemu's lock). Nova/qemu resizes it. If the instance is shut off, Nova skips the resize; the driver then resizes the file itself after Nova confirms the instance is shut off (`vmstore_online_extend_nova_check`). Otherwise the file is grown before the volume's next attach (attach, unshelve or cold migration); starting or rebooting the instance does not apply it, and the driver logs a warning.
+- For a running instance, Cinder reports success once it has notified Nova; if Nova's resize then fails, the error is only in Nova's instance actions and logs.
+- The driver never shrinks a file: an extend to a size smaller than the current file fails.
+- A failed extend leaves the volume at its original size and data; Cinder marks it `error_extending`, and an administrator can recover it with `cinder reset-state --state in-use <volume>`. The exception is an instance started while its qcow2 file was being resized offline: the extend fails after the resize, and the image should be checked with `qemu-img check` first.
+- Known issue: extending a *detached* volume created from an image fails with `Image is not in qcow2 format` (parent driver behaviour, see ADR-0004).
 
 Design and lab evidence: [docs/adr/0004-online-extend-of-attached-volumes.md](docs/adr/0004-online-extend-of-attached-volumes.md).
 
