@@ -215,20 +215,24 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         volume_dir = self._local_volume_dir(volume)
         path_to_vol = os.path.join(volume_dir, volume_name)
         info = self._qemu_img_info(path_to_vol, volume_name)
+        # The format Nova opens the file with: a guest-written qcow2 header
+        # must not turn a raw volume into a qcow2 one (VMTS-252).
+        file_format = self._volume_file_format(volume, info.file_format)
 
-        if info.file_format not in ['raw', 'qcow2']:
+        if file_format not in ['raw', 'qcow2']:
             msg = _('nfs volume must be a valid raw or qcow2 image.')
             raise exception.InvalidVolume(reason=msg)
 
-        if info.virtual_size < volume.size * units.Gi:
+        if (self._volume_file_size(path_to_vol, file_format, info)
+                < volume.size * units.Gi):
             self._reconcile_size_before_attach(
-                volume, path_to_vol, info.file_format,
+                volume, path_to_vol, file_format,
                 self._get_volume_lock_key(volume.id))
 
         data = {
             'export': self._get_share_path(),
             'name': volume_name,
-            'format': info.file_format
+            'format': file_format
         }
         encryption_key_id = volume.encryption_key_id
         data['encrypted'] = encryption_key_id is not None
@@ -1888,24 +1892,25 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         :param volume: volume reference
         :param path: local path of the volume file
-        :param file_format: 'raw' or 'qcow2'
+        :param file_format: format to handle the file as ('raw' or 'qcow2')
         :param lock_key: coordination lock key
         """
         # Re-read under the lock: a concurrent attach may have fixed it.
         info = self._qemu_img_info(path, volume.name)
-        if info.virtual_size >= volume.size * units.Gi:
+        actual = self._volume_file_size(path, file_format, info)
+        if actual >= volume.size * units.Gi:
             return
         if any(attachment.attach_status == fields.VolumeAttachStatus.ATTACHED
                for attachment in volume.volume_attachment or []):
             LOG.warning('Volume %(vol)s file is %(actual)s bytes, smaller '
                         'than its size %(size)sG, but it is already '
                         'attached elsewhere; not resizing.',
-                        {'vol': volume.id, 'actual': info.virtual_size,
+                        {'vol': volume.id, 'actual': actual,
                          'size': volume.size})
             return
         LOG.warning('Volume %(vol)s file is %(actual)s bytes, smaller than '
                     'its size %(size)sG (an online extend was not applied '
                     'by Nova); growing it before attach.',
-                    {'vol': volume.id, 'actual': info.virtual_size,
+                    {'vol': volume.id, 'actual': actual,
                      'size': volume.size})
         self._grow_volume_file(volume, path, file_format, volume.size, info)

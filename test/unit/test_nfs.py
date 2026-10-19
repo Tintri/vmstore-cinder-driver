@@ -1094,7 +1094,9 @@ class VmstoreNfsDriverReconcileOnAttachTestCase(_ExtendTestBase):
     def test_raw_smaller_than_volume_grown_before_first_attach(self):
         """A raw file smaller than the volume is truncated up."""
         self.mock_qemu_img_info.return_value = _img_info('raw', 10)
-        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+        # attach check, locked re-check, grow, verify
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 10 * units.Gi,
+                                               10 * units.Gi, 20 * units.Gi]
 
         self._connect(self._volume(size=20, attachments=[]))
 
@@ -1119,6 +1121,33 @@ class VmstoreNfsDriverReconcileOnAttachTestCase(_ExtendTestBase):
         self._connect(self._volume(size=20, attachments=[]))
 
         self.mock_resize_image.assert_not_called()
+
+    def test_recorded_raw_wins_over_qcow2_probe(self):
+        """A guest-written qcow2 header is not reported to Nova."""
+        self.mock_recorded_format.return_value = 'raw'
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 1)
+        self.mock_raw_file_size.return_value = 20 * units.Gi
+
+        info = self._connect(self._volume(size=20, attachments=[]))
+
+        self.assertEqual('raw', info['data']['format'])
+        self.mock_resize_image.assert_not_called()
+        self.driver._execute.assert_not_called()
+
+    def test_recorded_raw_planted_header_not_resized_as_qcow2(self):
+        """A small planted header does not trigger a qcow2 resize."""
+        self.mock_recorded_format.return_value = 'raw'
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 1)
+        # attach check, locked re-check, grow, verify
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 10 * units.Gi,
+                                               10 * units.Gi, 20 * units.Gi]
+
+        info = self._connect(self._volume(size=20, attachments=[]))
+
+        self.assertEqual('raw', info['data']['format'])
+        self.mock_resize_image.assert_not_called()
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
 
     def test_attachment_list_none_is_no_attachment(self):
         """volume_attachment may be None (not loaded); grow the file."""
