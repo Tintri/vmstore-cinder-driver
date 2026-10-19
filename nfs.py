@@ -1648,8 +1648,12 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         for attachment in volume.volume_attachment or []:
             if attachment.attach_status != fields.VolumeAttachStatus.ATTACHED:
                 continue
-            data = (attachment.connection_info or {}).get('data') or {}
-            if data.get('format') == 'raw':
+            # The volume manager stores the 'data' keys initialize_connection
+            # returned at the top level of the attachment's connection_info.
+            info = attachment.connection_info or {}
+            opened = (info.get('format')
+                      or (info.get('data') or {}).get('format'))
+            if opened == 'raw':
                 sources['attached'] = 'raw'
         for source, recorded in sources.items():
             if recorded == 'raw':
