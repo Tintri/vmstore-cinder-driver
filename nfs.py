@@ -1597,8 +1597,12 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         for attachment in volume.volume_attachment or []:
             if attachment.attach_status != fields.VolumeAttachStatus.ATTACHED:
                 continue
-            data = (attachment.connection_info or {}).get('data') or {}
-            if data.get('format') == 'raw' and probed_format != 'raw':
+            # The volume manager stores the 'data' keys initialize_connection
+            # returned at the top level of the attachment's connection_info.
+            info = attachment.connection_info or {}
+            opened = (info.get('format')
+                      or (info.get('data') or {}).get('format'))
+            if opened == 'raw' and probed_format != 'raw':
                 LOG.warning('Volume %(vol)s was attached as raw but its file '
                             'now probes as %(fmt)s, which the guest may have '
                             'written; handling it as raw.',

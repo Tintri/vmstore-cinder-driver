@@ -739,8 +739,9 @@ class VmstoreNfsDriverExtendVolumeTestCase(_ExtendTestBase):
         """A qcow2 header the guest wrote into a raw volume is ignored."""
         self.mock_qemu_img_info.return_value = _img_info('qcow2', 1)
         self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+        # Stored as the volume manager does: 'data' keys at the top level.
         volume = self._volume(attachments=[_attachment(
-            connection_info={'data': {'format': 'raw'}})])
+            connection_info={'driver_volume_type': 'nfs', 'format': 'raw'})])
 
         with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
             self.driver.extend_volume(volume, 20)
@@ -756,7 +757,7 @@ class VmstoreNfsDriverExtendVolumeTestCase(_ExtendTestBase):
         self.mock_qemu_img_info.return_value = _img_info('raw', 10)
         self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
         volume = self._volume(attachments=[_attachment(
-            connection_info={'data': {'format': 'qcow2'}})])
+            connection_info={'driver_volume_type': 'nfs', 'format': 'qcow2'})])
 
         self.driver.extend_volume(volume, 20)
 
