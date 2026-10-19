@@ -1,29 +1,41 @@
-FROM python:3.10-slim
+# Python 3.12 satisfies both stable/2025.1 (3.9 to 3.12) and current Cinder
+# master (3.11 or later).
+FROM python:3.12-slim
 
 # System deps for building Python packages with C extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     gcc \
+    libc6-dev \
     libssl-dev \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone OpenStack Cinder. Pin CINDER_REF for reproducibility;
-# override at build time with: docker compose build --build-arg CINDER_REF=stable/2024.1
-ARG CINDER_REF=master
+# Clone OpenStack Cinder. Defaults to the release Platform9 PCD ships;
+# override at build time with: docker compose build --build-arg CINDER_REF=master
+ARG CINDER_REF=stable/2025.1
 RUN git clone --depth 1 --branch ${CINDER_REF} \
     https://github.com/openstack/cinder /cinder
 
-# Install cinder test dependencies.
+# Install cinder test dependencies, pinned with the OpenStack upper-constraints
+# that match CINDER_REF (stable/2025.1 -> .../upper/2025.1, master -> .../upper/master).
+# Without them pip resolves the newest libraries, which break older Cinder
+# branches (for example oslo.utils dropping secretutils.md5).
+# Set UPPER_CONSTRAINTS_URL to use a different constraints file.
+# setuptools is listed explicitly because Python 3.12 images no longer ship it.
+# Stable branches still import pkg_resources (removed in newer setuptools), so
+# they get setuptools<80; master gets the current release.
 # We use PYTHONPATH rather than pip install -e . to avoid a setuptools
 # compatibility issue (AttributeError: get_requires_for_build_editable).
 WORKDIR /cinder
-# cursive (OpenStack image-signature library) calls ec.SECT571K1() which was
-# removed in cryptography 42. Pin via a local constraint file.
-RUN echo "cryptography<42" > /tmp/pin.txt
-RUN pip install --no-cache-dir --upgrade pip \
+ARG UPPER_CONSTRAINTS_URL=
+RUN UC="${UPPER_CONSTRAINTS_URL:-https://releases.openstack.org/constraints/upper/${CINDER_REF#stable/}}" \
+    && case "${CINDER_REF}" in master) ST="setuptools" ;; *) ST="setuptools<80" ;; esac \
+    && echo "Using upper-constraints: ${UC}, ${ST}" \
+    && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
-       -c /tmp/pin.txt \
+       -c "${UC}" \
+       "${ST}" \
        stestr \
        -r requirements.txt \
        -r test-requirements.txt
