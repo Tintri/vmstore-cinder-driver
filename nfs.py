@@ -123,6 +123,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     confirms every attached instance is shut off.
                     initialize_connection grows a file smaller than the
                     volume size before a new attach. See docs/adr/0004.
+                 - [VMTS-252]: Detached extend no longer trusts the recorded
+                    format, which is qcow2 for volumes created from an
+                    image; copy_image_to_volume now records raw.
 
     """
 
@@ -967,6 +970,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  volume.id, image_id)
         super().copy_image_to_volume(
             context, volume, image_service, image_id, disable_sparse)
+        # fetch_to_raw replaced the file _do_create_volume made, which
+        # recorded qcow2, with a raw one (VMTS-252).
+        volume.admin_metadata['format'] = 'raw'
+        with volume.obj_as_admin():
+            volume.save()
 
     def copy_volume_to_image(self,
                              context: context.RequestContext,
@@ -1512,18 +1520,53 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def extend_volume(self, volume, new_size):
         """Extend a volume, including one attached to an instance.
 
-        Detached volumes keep the parent NfsDriver behaviour (qemu-img
-        resize). Attached volumes are handled by _extend_attached_volume;
-        the reasoning is in docs/adr/0004.
+        Detached volumes are handled by _extend_detached_volume, attached
+        ones by _extend_attached_volume; the reasoning is in docs/adr/0004.
 
         :param volume: volume reference
         :param new_size: new size in GiB
         """
-        if not self._is_volume_attached(volume):
-            return super().extend_volume(volume, new_size)
-
         lock_key = self._get_volume_lock_key(volume.id)
+        if not self._is_volume_attached(volume):
+            self._extend_detached_volume(volume, int(new_size), lock_key)
+            return
+
         self._extend_attached_volume(volume, int(new_size), lock_key)
+
+    @coordination.synchronized('{lock_key}')
+    def _extend_detached_volume(self, volume, new_size: int, lock_key) -> None:
+        """Extend a detached volume with coordination lock.
+
+        Replaces the parent NfsDriver.extend_volume, which passes
+        admin_metadata['format'] to qemu-img resize. That is qcow2 for a
+        volume created from an image, whose file is raw, so the resize
+        failed (VMTS-252). No VM holds the file, so qcow2 is resized here.
+
+        :param volume: volume reference
+        :param new_size: new size in GiB
+        :param lock_key: coordination lock key
+        """
+        LOG.info('Extending volume %(vol)s from %(old)sG to %(new)sG with '
+                 'lock %(lock)s', {'vol': volume.id, 'old': volume.size,
+                                   'new': new_size, 'lock': lock_key})
+        if not self._is_share_eligible(volume.provider_location,
+                                       new_size - volume.size):
+            raise exception.ExtendVolumeError(
+                reason=_('Insufficient space to extend volume %(vol)s to '
+                         '%(new)sG') % {'vol': volume.id, 'new': new_size})
+
+        # Use the active image file, as the parent does, in case a volume
+        # still has a snapshot info file.
+        path = os.path.join(self._local_volume_dir(volume),
+                            self.get_active_image_from_info(volume))
+        info = self._qemu_img_info(path, volume.name)
+        file_format = self._volume_file_format(volume, info.file_format)
+        if file_format not in ('raw', 'qcow2'):
+            raise exception.ExtendVolumeError(
+                reason=_('Cannot extend volume %(vol)s with format '
+                         '%(fmt)s') % {'vol': volume.id, 'fmt': file_format})
+
+        self._grow_volume_file(volume, path, file_format, new_size, info)
 
     @coordination.synchronized('{lock_key}')
     def _extend_attached_volume(self, volume, new_size: int, lock_key) -> None:
@@ -1564,7 +1607,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         path = os.path.join(self._local_volume_dir(volume), volume.name)
         info = self._qemu_img_info(path, volume.name)
-        file_format = self._attached_file_format(volume, info.file_format)
+        file_format = self._volume_file_format(volume, info.file_format)
 
         if file_format == 'raw':
             self._grow_volume_file(volume, path, 'raw', new_size, info)
@@ -1576,35 +1619,56 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                          'format %(fmt)s') % {'vol': volume.id,
                                               'fmt': file_format})
 
-    @staticmethod
-    def _attached_file_format(volume, probed_format: str) -> str:
-        """Return the format to handle an attached volume file as.
+    def _volume_file_format(self, volume, probed_format: str) -> str:
+        """Return the format to handle a volume file as.
 
         qemu-img info probes data the guest can write: a guest can put a
         qcow2 header at the start of a raw volume, but cannot make a qcow2
         file look raw, because the qcow2 header is outside what the guest
-        sees. So raw wins if either the probe or the format Nova opened the
-        file with (the attachment's connection_info) says raw.
+        sees. So raw wins if the probe, the format recorded for the volume
+        (admin_metadata['format']) or the format Nova opened the file with
+        (the connection_info of an attached attachment) says raw.
 
-        admin_metadata['format'] is not used: _do_create_volume records
-        qcow2 before copy_image_to_volume converts a volume created from an
-        image to raw, so it is wrong for those volumes.
+        A recorded qcow2 is not trusted: _do_create_volume records qcow2
+        before copy_image_to_volume replaces the file of a volume created
+        from an image with a raw one, and volumes created before 3.0.11
+        still carry that record (VMTS-252).
 
         :param volume: volume reference
         :param probed_format: format reported by qemu-img info
         :returns: the format to handle the file as
         """
+        if probed_format == 'raw':
+            return 'raw'
+        sources = {'recorded': self._recorded_format(volume)}
         for attachment in volume.volume_attachment or []:
             if attachment.attach_status != fields.VolumeAttachStatus.ATTACHED:
                 continue
             data = (attachment.connection_info or {}).get('data') or {}
-            if data.get('format') == 'raw' and probed_format != 'raw':
-                LOG.warning('Volume %(vol)s was attached as raw but its file '
-                            'now probes as %(fmt)s, which the guest may have '
-                            'written; handling it as raw.',
-                            {'vol': volume.id, 'fmt': probed_format})
+            if data.get('format') == 'raw':
+                sources['attached'] = 'raw'
+        for source, recorded in sources.items():
+            if recorded == 'raw':
+                LOG.warning('Volume %(vol)s file probes as %(fmt)s, which '
+                            'the guest may have written, but its %(src)s '
+                            'format is raw; handling it as raw.',
+                            {'vol': volume.id, 'fmt': probed_format,
+                             'src': source})
                 return 'raw'
         return probed_format
+
+    @staticmethod
+    def _recorded_format(volume):
+        """Return admin_metadata['format'] of a volume, or None.
+
+        Read with an admin context, as the parent NfsDriver.extend_volume
+        does, because admin metadata is not loaded for other users.
+
+        :param volume: volume reference
+        """
+        admin_metadata = objects.Volume.get_by_id(
+            context.get_admin_context(), volume.id).admin_metadata
+        return (admin_metadata or {}).get('format')
 
     def _extend_attached_qcow2(self, volume, path: str, new_size: int,
                                info) -> None:

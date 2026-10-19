@@ -651,6 +651,10 @@ class _ExtendTestBase(test.TestCase):
         self.mock_resize_image = self._patch(vmstore_nfs.image_utils,
                                              'resize_image')
         self.mock_raw_file_size = self._patch_driver('_raw_file_size')
+        self.mock_recorded_format = self._patch_driver('_recorded_format',
+                                                       return_value=None)
+        self._patch_driver('get_active_image_from_info',
+                           return_value='volume-1')
         self.mock_nova_api = self._patch(vmstore_nfs.nova, 'API')
         self.mock_get_server = self.mock_nova_api.return_value.get_server
         self.path = '/mnt/share/volume-1'
@@ -677,16 +681,99 @@ class _ExtendTestBase(test.TestCase):
 class VmstoreNfsDriverExtendVolumeTestCase(_ExtendTestBase):
     """Test cases for extend_volume, including attached volumes (VMTS-243)."""
 
+    def _detached(self):
+        return self._volume(attach_status='detached', attachments=[])
+
     @mock.patch.object(vmstore_nfs.nfs.NfsDriver, 'extend_volume')
-    def test_detached_volume_uses_parent(self, mock_parent_extend):
-        """Detached volumes keep the parent qemu-img resize behaviour."""
-        volume = self._volume(attach_status='detached', attachments=[])
+    def test_detached_raw_from_image_recorded_qcow2_grown_as_raw(
+            self, mock_parent_extend):
+        """VMTS-252: a raw file recorded as qcow2 is grown as raw."""
+        self.mock_recorded_format.return_value = 'qcow2'
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
 
-        self.driver.extend_volume(volume, 20)
+        self.driver.extend_volume(self._detached(), 20)
 
-        mock_parent_extend.assert_called_once_with(volume, 20)
-        self.driver._execute.assert_not_called()
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
+        self.mock_resize_image.assert_not_called()
+        mock_parent_extend.assert_not_called()
         self.mock_nova_api.assert_not_called()
+
+    def test_detached_qcow2_resized_offline(self):
+        """No VM holds a detached file, so qcow2 is resized directly."""
+        self.mock_recorded_format.return_value = 'qcow2'
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+
+        self.driver.extend_volume(self._detached(), 20)
+
+        self.mock_resize_image.assert_called_once_with(
+            self.path, 20, run_as_root=True, file_format='qcow2')
+        self.mock_nova_api.assert_not_called()
+
+    def test_detached_probe_qcow2_recorded_raw_is_raw(self):
+        """A qcow2 header in a volume recorded as raw is ignored."""
+        self.mock_recorded_format.return_value = 'raw'
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 1)
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+
+        self.driver.extend_volume(self._detached(), 20)
+
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
+        self.mock_resize_image.assert_not_called()
+
+    def test_detached_uses_active_image(self):
+        """The active image from a snapshot info file is the one grown."""
+        self.driver.get_active_image_from_info.return_value = 'volume-1.snap'
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+
+        self.driver.extend_volume(self._detached(), 20)
+
+        self.mock_resize_image.assert_called_once_with(
+            '/mnt/share/volume-1.snap', 20, run_as_root=True,
+            file_format='qcow2')
+
+    def test_detached_insufficient_space_raises(self):
+        """Validation fails before the file is touched."""
+        self.mock_share_eligible.return_value = False
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._detached(), 20)
+        self.driver._execute.assert_not_called()
+        self.mock_resize_image.assert_not_called()
+
+    def test_detached_file_already_larger_is_never_shrunk(self):
+        """The no-shrink check also covers detached volumes."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.return_value = 30 * units.Gi
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._detached(), 20)
+        self.driver._execute.assert_not_called()
+
+    def test_detached_unsupported_format_raises(self):
+        """Only raw and qcow2 files can be extended."""
+        self.mock_qemu_img_info.return_value = _img_info('vmdk', 10)
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._detached(), 20)
+        self.driver._execute.assert_not_called()
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_probe_qcow2_recorded_raw_is_raw(self):
+        """The recorded format also counts for attached volumes."""
+        self.mock_recorded_format.return_value = 'raw'
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 1)
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
+        self.mock_get_server.assert_not_called()
 
     def test_attached_raw_grows_file_and_verifies(self):
         """Attached raw: truncate the file, then check its length."""
@@ -1045,6 +1132,40 @@ class VmstoreNfsDriverReconcileOnAttachTestCase(_ExtendTestBase):
 
         self.mock_resize_image.assert_called_once_with(
             self.path, 20, run_as_root=True, file_format='qcow2')
+
+
+class VmstoreNfsDriverCopyImageFormatTestCase(_ExtendTestBase):
+    """copy_image_to_volume records the raw format it writes (VMTS-252)."""
+
+    @mock.patch.object(vmstore_nfs.nfs.NfsDriver, 'copy_image_to_volume')
+    def test_copy_image_records_raw(self, mock_parent_copy):
+        volume = mock.MagicMock(id='vol-1', admin_metadata={'format': 'qcow2'})
+
+        self.driver.copy_image_to_volume(mock.sentinel.ctxt, volume,
+                                         mock.sentinel.image_service,
+                                         'image-1')
+
+        mock_parent_copy.assert_called_once_with(
+            mock.sentinel.ctxt, volume, mock.sentinel.image_service,
+            'image-1', False)
+        self.assertEqual('raw', volume.admin_metadata['format'])
+        volume.obj_as_admin.assert_called_once_with()
+        volume.save.assert_called_once_with()
+
+    def test_recorded_format_read_as_admin(self):
+        """_recorded_format reads admin metadata with an admin context."""
+        with mock.patch.object(vmstore_nfs.objects.Volume, 'get_by_id') as get:
+            get.return_value.admin_metadata = {'format': 'qcow2'}
+            self.assertEqual(
+                'qcow2',
+                vmstore_nfs.VmstoreNfsDriver._recorded_format(
+                    self._volume()))
+            get.return_value.admin_metadata = {}
+            self.assertIsNone(
+                vmstore_nfs.VmstoreNfsDriver._recorded_format(
+                    self._volume()))
+        self.assertTrue(get.call_args[0][0].is_admin)
+        self.assertEqual('vol-1', get.call_args[0][1])
 
 
 class VmstoreNfsDriverOnlineExtendStatsTestCase(_ExtendTestBase):
