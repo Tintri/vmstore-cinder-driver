@@ -30,3 +30,11 @@ _Avoid_: NFS snapshot, filesystem snapshot
 
 **Temp Clone Directory**: A transient subdirectory (e.g., `clone-<src>-<vol-uuid>/` or `<snapshot-name>-vol-<uuid>/`) created on the NFS share during a VMstore clone operation. Renamed to `volume-<uuid>` and the directory removed before the clone operation returns. Not counted toward provisioned capacity.
 _Avoid_: staging directory, clone workspace
+
+### Volume resize
+
+**Online Extend**: Growing a Cinder volume while it is attached to an instance. For a raw volume the driver grows the file and Nova makes the guest see it; for a qcow2 volume only Nova/qemu may grow the file, unless Nova confirms every attached instance is shut off (see ADR-0004).
+_Avoid_: live resize, hot extend
+
+**Virtual Size**: The disk size a volume file presents to the guest (`qemu-img info` virtual size). For raw files it equals the file length; for qcow2 it is stored in the image header and can be larger than the file.
+_Avoid_: file size (for qcow2), provisioned capacity

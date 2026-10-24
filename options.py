@@ -87,6 +87,18 @@ VMSTORE_NFS_OPTS = [
                help='Period in seconds for caching volume statistics. '
                     'Stats will be refreshed only if the cache is older '
                     'than this value. Set to 0 to disable caching.'),
+    cfg.BoolOpt('vmstore_online_extend_nova_check',
+                default=True,
+                help='When extending an attached qcow2 volume, ask Nova '
+                     'whether every attached instance is shut off and, if '
+                     'so, resize the file in the driver. Requires the [nova] '
+                     'section credentials. If disabled, attached qcow2 '
+                     'volumes are always left to Nova to resize, and a file '
+                     'Nova did not resize is grown before its next attach.'),
+    cfg.IntOpt('vmstore_nova_api_timeout',
+               default=30,
+               help='Timeout in seconds for the Nova API call used by '
+                    'vmstore_online_extend_nova_check.'),
 ]
 
 VMSTORE_DATASET_OPTS = [

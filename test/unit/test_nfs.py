@@ -565,3 +565,502 @@ class VmstoreNfsDriverShareTestCase(test.TestCase):
             driver._update_volume_stats()
 
         self.assertEqual(3, driver._stats['pools'][0]['total_volumes'])
+
+
+class _FakeVolume(dict):
+    """Volume stand-in that supports both item and attribute access."""
+
+    __getattr__ = dict.__getitem__
+
+
+def _attachment(status='attached', instance_uuid='inst-1',
+                connection_info=None):
+    return mock.Mock(attach_status=status, instance_uuid=instance_uuid,
+                     connection_info=connection_info)
+
+
+def _img_info(file_format, size_gib):
+    return mock.Mock(file_format=file_format, virtual_size=size_gib * units.Gi)
+
+
+def _server(status, task_state=None, power_state=None,
+            hide_task_state=False, hide_power_state=False):
+    """Nova server; power_state defaults to match status (4 = SHUTDOWN)."""
+    server = mock.Mock(spec=['status'])
+    server.status = status
+    if power_state is None:
+        power_state = 4 if status == 'SHUTOFF' else 1
+    if not hide_task_state:
+        setattr(server, 'OS-EXT-STS:task_state', task_state)
+    if not hide_power_state:
+        setattr(server, 'OS-EXT-STS:power_state', power_state)
+    return server
+
+
+class _ExtendTestBase(test.TestCase):
+    """Driver factory shared by the online-extend test cases."""
+
+    def setUp(self):
+        set_vmstore_overrides()
+        super(_ExtendTestBase, self).setUp()
+        self.configuration = mock.Mock()
+        for key, value in VMSTORE_CONFIG.items():
+            setattr(self.configuration, key, value)
+        self.configuration.reserved_percentage = 0
+        self.configuration.max_over_subscription_ratio = 1.0
+        self.configuration.nfs_sparsed_volumes = True
+        self.configuration.nfs_qcow2_volumes = False
+        self.configuration.nfs_mount_point_base = '/mnt/vmstore'
+        self.configuration.nfs_mount_options = None
+        self.configuration.vmstore_use_volume_locks = True
+        self.configuration.vmstore_online_extend_nova_check = True
+        self.configuration.vmstore_nova_api_timeout = 30
+
+        def safe_get_side_effect(key):
+            return {
+                'nfs_mount_options': 'lookupcache=pos,nolock,noacl,proto=tcp',
+                'volume_dd_blocksize': '1M',
+                'nas_secure_file_operations': 'auto',
+                'nas_secure_file_permissions': 'auto',
+                'vmstore_openstack_hostname': None,
+            }.get(key)
+
+        self.configuration.safe_get = mock.Mock(
+            side_effect=safe_get_side_effect)
+
+        patchers = [
+            mock.patch('os_brick.remotefs.remotefs.RemoteFsClient'),
+            mock.patch.object(vmstore_nfs.VmstoreNfsDriver,
+                              '_check_snapshot_support'),
+            mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup'),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.driver = vmstore_nfs.VmstoreNfsDriver(
+            configuration=self.configuration)
+        self.driver.vmstore = mock.Mock()
+        self.driver.vmstore.lock = 'fake-lock'
+        self.driver._execute = mock.Mock()
+        self.driver._execute_as_root = True
+        self.mock_qemu_img_info = self._patch_driver('_qemu_img_info')
+        self._patch_driver('_local_volume_dir', return_value='/mnt/share')
+        self.mock_share_eligible = self._patch_driver(
+            '_is_share_eligible', return_value=True)
+        self.mock_resize_image = self._patch(vmstore_nfs.image_utils,
+                                             'resize_image')
+        self.mock_raw_file_size = self._patch_driver('_raw_file_size')
+        self.mock_nova_api = self._patch(vmstore_nfs.nova, 'API')
+        self.mock_get_server = self.mock_nova_api.return_value.get_server
+        self.path = '/mnt/share/volume-1'
+
+    def _patch(self, target, attribute, **kwargs):
+        patcher = mock.patch.object(target, attribute, **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def _patch_driver(self, attribute, **kwargs):
+        return self._patch(self.driver, attribute, **kwargs)
+
+    @staticmethod
+    def _volume(size=10, attachments=None, attach_status='attached'):
+        if attachments is None:
+            attachments = [_attachment()]
+        return _FakeVolume(
+            id='vol-1', name='volume-1', size=size,
+            provider_location='192.168.1.1:/tintri/test_share',
+            attach_status=attach_status, volume_attachment=attachments,
+            encryption_key_id=None)
+
+
+class VmstoreNfsDriverExtendVolumeTestCase(_ExtendTestBase):
+    """Test cases for extend_volume, including attached volumes (VMTS-243)."""
+
+    @mock.patch.object(vmstore_nfs.nfs.NfsDriver, 'extend_volume')
+    def test_detached_volume_uses_parent(self, mock_parent_extend):
+        """Detached volumes keep the parent qemu-img resize behaviour."""
+        volume = self._volume(attach_status='detached', attachments=[])
+
+        self.driver.extend_volume(volume, 20)
+
+        mock_parent_extend.assert_called_once_with(volume, 20)
+        self.driver._execute.assert_not_called()
+        self.mock_nova_api.assert_not_called()
+
+    def test_attached_raw_grows_file_and_verifies(self):
+        """Attached raw: truncate the file, then check its length."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
+        self.mock_resize_image.assert_not_called()
+        self.mock_get_server.assert_not_called()
+
+    def test_attached_raw_size_check_failure_raises(self):
+        """A file that did not reach the new size fails the extend."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.return_value = 10 * units.Gi
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._volume(), 20)
+
+    def test_attached_raw_file_already_larger_is_never_shrunk(self):
+        """A file larger than the new size (DB size behind it) is refused."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.return_value = 30 * units.Gi
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._volume(), 20)
+        self.driver._execute.assert_not_called()
+
+    def test_attached_raw_file_already_at_new_size_is_left_alone(self):
+        """A retried extend whose file already has the new size succeeds."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.return_value = 20 * units.Gi
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.driver._execute.assert_not_called()
+
+    def test_attached_qcow2_file_already_larger_is_never_shrunk(self):
+        """The no-shrink check also covers the offline qcow2 resize."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 30)
+        self.mock_get_server.return_value = _server('SHUTOFF')
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._volume(), 20)
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_probe_qcow2_but_attached_as_raw_is_raw(self):
+        """A qcow2 header the guest wrote into a raw volume is ignored."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 1)
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+        # Stored as the volume manager does: 'data' keys at the top level.
+        volume = self._volume(attachments=[_attachment(
+            connection_info={'driver_volume_type': 'nfs', 'format': 'raw'})])
+
+        with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self.driver.extend_volume(volume, 20)
+
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
+        self.mock_resize_image.assert_not_called()
+        self.mock_get_server.assert_not_called()
+        mock_log.warning.assert_called_once()
+
+    def test_attached_probe_raw_wins_over_attached_as_qcow2(self):
+        """A guest cannot make a qcow2 file probe as raw: raw wins."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+        volume = self._volume(attachments=[_attachment(
+            connection_info={'driver_volume_type': 'nfs', 'format': 'qcow2'})])
+
+        self.driver.extend_volume(volume, 20)
+
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
+
+    def test_attached_new_size_must_be_larger(self):
+        """No file change when the requested size is not larger."""
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._volume(size=20), 20)
+        self.driver._execute.assert_not_called()
+        self.mock_qemu_img_info.assert_not_called()
+
+    def test_attached_insufficient_space_raises_before_touching_file(self):
+        """Validation fails before the file is touched."""
+        self.mock_share_eligible.return_value = False
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._volume(), 20)
+        self.mock_share_eligible.assert_called_once_with(
+            '192.168.1.1:/tintri/test_share', 10)
+        self.driver._execute.assert_not_called()
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_unsupported_format_raises(self):
+        """Only raw and qcow2 files can be extended while attached."""
+        self.mock_qemu_img_info.return_value = _img_info('vmdk', 10)
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._volume(), 20)
+        self.driver._execute.assert_not_called()
+
+    def test_attached_qcow2_running_instance_left_to_nova(self):
+        """Attached qcow2 on a running instance: never touch the file."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_get_server.return_value = _server('ACTIVE')
+
+        with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_get_server.assert_called_once_with(
+            mock.ANY, 'inst-1', privileged_user=True, timeout=30)
+        self.mock_resize_image.assert_not_called()
+        self.driver._execute.assert_not_called()
+        mock_log.warning.assert_not_called()
+
+    def test_attached_qcow2_shut_off_instance_resized_offline(self):
+        """Nova confirms SHUTOFF: the driver resizes the qcow2 file."""
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+        self.mock_get_server.return_value = _server('SHUTOFF')
+
+        with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_resize_image.assert_called_once_with(
+            self.path, 20, run_as_root=True, file_format='qcow2')
+        # Checked before the resize and again after it.
+        self.assertEqual(2, self.mock_get_server.call_count)
+        mock_log.error.assert_not_called()
+
+    def test_attached_qcow2_instance_started_during_resize_raises(self):
+        """An instance leaving SHUTOFF during the resize fails the extend."""
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+        self.mock_get_server.side_effect = [
+            _server('SHUTOFF'), _server('SHUTOFF', 'powering-on')]
+
+        self.assertRaises(exception.ExtendVolumeError,
+                          self.driver.extend_volume, self._volume(), 20)
+        self.mock_resize_image.assert_called_once()
+
+    def test_attached_qcow2_nova_error_after_resize_only_warns(self):
+        """If Nova cannot answer the re-check, the extend still succeeds."""
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+        self.mock_get_server.side_effect = [
+            _server('SHUTOFF'), exception.APITimeout(service='Nova')]
+
+        with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_resize_image.assert_called_once()
+        self.assertEqual(2, mock_log.warning.call_count)  # Nova error + ask
+
+    def test_attached_qcow2_shut_off_but_powering_on_not_touched(self):
+        """A task in progress (powering-on) means the file may be opened."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_get_server.return_value = _server('SHUTOFF', 'powering-on')
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_qcow2_hidden_task_state_not_touched(self):
+        """Without the task_state attribute the state is unknown."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_get_server.return_value = _server('SHUTOFF',
+                                                    hide_task_state=True)
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_qcow2_power_state_must_be_shutdown(self):
+        """SHUTOFF in the Nova DB is not enough if the hypervisor disagrees."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        for power_state in (1, 6):  # RUNNING, CRASHED
+            self.mock_get_server.return_value = _server(
+                'SHUTOFF', power_state=power_state)
+
+            self.driver.extend_volume(self._volume(), 20)
+
+            self.mock_resize_image.assert_not_called()
+
+    def test_attached_qcow2_hidden_power_state_not_touched(self):
+        """Without power_state the hypervisor state is unknown."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_get_server.return_value = _server('SHUTOFF',
+                                                    hide_power_state=True)
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_qcow2_orphan_attachment_skipped(self):
+        """An attachment whose server Nova does not know is ignored."""
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+        not_found = exception.ServerNotFound(uuid='a')
+        self.mock_get_server.side_effect = [not_found, _server('SHUTOFF'),
+                                            not_found, _server('SHUTOFF')]
+        volume = self._volume(attachments=[_attachment(instance_uuid='a'),
+                                           _attachment(instance_uuid='b')])
+
+        self.driver.extend_volume(volume, 20)
+
+        self.mock_resize_image.assert_called_once_with(
+            self.path, 20, run_as_root=True, file_format='qcow2')
+
+    def test_attached_qcow2_only_orphan_attachments_not_touched(self):
+        """Nothing confirmed shut off if no attached instance exists."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_get_server.side_effect = exception.ServerNotFound(
+            uuid='inst-1')
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_qcow2_nova_error_not_touched(self):
+        """A Nova failure falls back to leaving the resize to Nova."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_get_server.side_effect = exception.APITimeout(
+            service='Nova')
+
+        self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_qcow2_nova_check_disabled(self):
+        """With the Nova check disabled, attached qcow2 is never resized."""
+        self.configuration.vmstore_online_extend_nova_check = False
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+
+        with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self.driver.extend_volume(self._volume(), 20)
+
+        self.mock_nova_api.assert_not_called()
+        self.mock_resize_image.assert_not_called()
+        # The guest may keep the old size until the next attach.
+        mock_log.warning.assert_called_once()
+
+    def test_attached_qcow2_all_instances_must_be_shut_off(self):
+        """Every attached instance must be SHUTOFF, not just the first."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_get_server.side_effect = [_server('SHUTOFF'),
+                                            _server('ACTIVE')]
+        volume = self._volume(attachments=[_attachment(instance_uuid='a'),
+                                           _attachment(instance_uuid='b')])
+
+        self.driver.extend_volume(volume, 20)
+
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_qcow2_host_attachment_not_touched(self):
+        """An attachment without an instance cannot be confirmed idle."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        volume = self._volume(attachments=[_attachment(instance_uuid=None)])
+
+        self.driver.extend_volume(volume, 20)
+
+        self.mock_get_server.assert_not_called()
+        self.mock_resize_image.assert_not_called()
+
+    def test_attached_instance_uuids_ignores_non_attached(self):
+        """Attachments still being set up are not consumers yet."""
+        volume = self._volume(attachments=[
+            _attachment(instance_uuid='a'),
+            _attachment(status='attaching', instance_uuid=None)])
+
+        self.assertEqual(
+            ['a'], vmstore_nfs.VmstoreNfsDriver._attached_instance_uuids(
+                volume))
+
+    def test_attached_instance_uuids_empty_without_attached_rows(self):
+        """No attachment in the attached state gives [], not None."""
+        volume = self._volume(attachments=[_attachment(status='detached')])
+
+        self.assertEqual(
+            [], vmstore_nfs.VmstoreNfsDriver._attached_instance_uuids(
+                volume))
+
+
+class VmstoreNfsDriverReconcileOnAttachTestCase(_ExtendTestBase):
+    """initialize_connection grows a file Nova did not resize (VMTS-243)."""
+
+    def setUp(self):
+        super(VmstoreNfsDriverReconcileOnAttachTestCase, self).setUp()
+        self._patch_driver('_get_share_path',
+                           return_value='192.168.1.1:/tintri/test_share')
+
+    def _connect(self, volume):
+        return self.driver.initialize_connection(volume, {'host': 'compute'})
+
+    def test_no_resize_when_size_matches(self):
+        """The normal attach path stays read-only."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+
+        info = self._connect(self._volume(attachments=[]))
+
+        self.assertEqual('qcow2', info['data']['format'])
+        self.mock_resize_image.assert_not_called()
+        self.driver._execute.assert_not_called()
+
+    def test_qcow2_smaller_than_volume_grown_before_first_attach(self):
+        """A qcow2 file Nova did not resize is grown before attach."""
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+
+        self._connect(self._volume(size=20, attachments=[
+            _attachment(status='attaching')]))
+
+        self.mock_resize_image.assert_called_once_with(
+            self.path, 20, run_as_root=True, file_format='qcow2')
+
+    def test_raw_smaller_than_volume_grown_before_first_attach(self):
+        """A raw file smaller than the volume is truncated up."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+        self.mock_raw_file_size.side_effect = [10 * units.Gi, 20 * units.Gi]
+
+        self._connect(self._volume(size=20, attachments=[]))
+
+        self.driver._execute.assert_called_once_with(
+            'truncate', '-s', '20G', self.path, run_as_root=True)
+
+    def test_not_resized_while_attached_elsewhere(self):
+        """Another live attachment may have the file open: do not touch it."""
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+
+        with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self._connect(self._volume(size=20))
+
+        self.mock_resize_image.assert_not_called()
+        mock_log.warning.assert_called_once()
+
+    def test_concurrent_fix_detected_under_lock(self):
+        """If the file was grown meanwhile, the locked re-check skips it."""
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+
+        self._connect(self._volume(size=20, attachments=[]))
+
+        self.mock_resize_image.assert_not_called()
+
+    def test_attachment_list_none_is_no_attachment(self):
+        """volume_attachment may be None (not loaded); grow the file."""
+        self.mock_qemu_img_info.side_effect = [_img_info('qcow2', 10),
+                                               _img_info('qcow2', 10),
+                                               _img_info('qcow2', 20)]
+        volume = self._volume(size=20)
+        volume['volume_attachment'] = None
+
+        self._connect(volume)
+
+        self.mock_resize_image.assert_called_once_with(
+            self.path, 20, run_as_root=True, file_format='qcow2')
+
+
+class VmstoreNfsDriverOnlineExtendStatsTestCase(_ExtendTestBase):
+    """Volume stats advertise online extend (VMTS-243)."""
+
+    @mock.patch('cinder.objects.VolumeList.get_all_by_host', return_value=[])
+    def test_update_volume_stats_reports_online_extend(self, mock_get_volumes):
+        self.driver._mounted_shares = ['192.168.1.1:/tintri/test_share']
+        self.driver._execute.return_value = ('4096 26214400 13107200', '')
+        self._patch_driver('_ensure_shares_mounted')
+        self._patch_driver('_get_mount_point_for_share',
+                           return_value='/mnt/share')
+        self._patch_driver('_scan_share', return_value=(0, 0))
+
+        self.driver._update_volume_stats()
+
+        self.assertTrue(
+            self.driver._stats['pools'][0]['online_extend_support'])
