@@ -132,7 +132,7 @@ Since 3.0.12 the driver reports `online_extend_support`, so `cinder extend` (API
 - For a running instance, Cinder reports success once it has notified Nova; if Nova's resize then fails, the error is only in Nova's instance actions and logs.
 - The driver never shrinks a file: an extend to a size smaller than the current file fails.
 - A failed extend leaves the volume at its original size and data; Cinder marks it `error_extending`, and an administrator can recover it with `cinder reset-state --state in-use <volume>`. The exception is an instance started while its qcow2 file was being resized offline: the extend fails after the resize, and the image should be checked with `qemu-img check` first.
-- Before 3.0.11, extending a *detached* volume created from an image failed with `Image is not in qcow2 format` (VMTS-252); fixed, see ADR-0004.
+- Before 3.0.12, extending a *detached* volume created from an image could fail with `Image is not in qcow2 format` (VMTS-252). 3.0.11 records the right format for volumes created from then on; 3.0.12 also handles volumes created earlier. See ADR-0004.
 
 Design and lab evidence: [docs/adr/0004-online-extend-of-attached-volumes.md](docs/adr/0004-online-extend-of-attached-volumes.md).
 
