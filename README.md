@@ -125,7 +125,7 @@ When a volume is created from a snapshot that lives on a *different* VMstore bac
 
 ### Extending attached volumes
 
-Since 3.0.11 the driver reports `online_extend_support`, so `cinder extend` (API microversion 3.42 or later) works on `in-use` volumes. The guest sees the new size without a restart; growing the partition and filesystem inside the guest is still up to the user.
+Since 3.0.12 the driver reports `online_extend_support`, so `cinder extend` (API microversion 3.42 or later) works on `in-use` volumes. The guest sees the new size without a restart; growing the partition and filesystem inside the guest is still up to the user.
 
 - **raw volumes:** the driver grows the file, then Nova resizes the guest disk.
 - **qcow2 volumes:** the driver never modifies the file while an instance may be using it (VMstore shares are mounted `nolock`, so the Cinder host cannot see qemu's lock). Nova/qemu resizes it. If the instance is shut off, Nova skips the resize; the driver then resizes the file itself after Nova confirms the instance is shut off (`vmstore_online_extend_nova_check`). Otherwise the file is grown before the volume's next attach (attach, unshelve or cold migration); starting or rebooting the instance does not apply it, and the driver logs a warning.
