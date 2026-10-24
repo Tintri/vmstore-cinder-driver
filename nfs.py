@@ -100,8 +100,8 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     _ensure_share_mounted, _local_volume_dir, _do_create_volume, extend_volume methods, 
                     reducing code duplication and potential maintenance overhead.
                  Refactor: _update_volume_stats to call super() to stay in the Cinder parent stats chain. 
-        3.0.11 - [VMTS-252]: Record the real format of each volume file, based on a patch from
-                    Platform9. The upstream extend_volume passes the recorded format
+        3.0.11 - [VME-4] (VMTS-252): Record the real format of each volume file, based on a
+                    patch from Platform9. The upstream extend_volume passes the recorded format
                     (admin_metadata['format']) to qemu-img resize, or lets qemu-img guess the
                     format from file content the guest can write when there is no record.
                     _do_create_volume records qcow2 (vmstore_qcow2_volumes) before
