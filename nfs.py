@@ -100,10 +100,28 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     _ensure_share_mounted, _local_volume_dir, _do_create_volume, extend_volume methods, 
                     reducing code duplication and potential maintenance overhead.
                  Refactor: _update_volume_stats to call super() to stay in the Cinder parent stats chain. 
+        3.0.11 - [VME-4] (VMTS-252): Record the real format of each volume file, based on a
+                    patch from Platform9. The upstream extend_volume passes the recorded format
+                    (admin_metadata['format']) to qemu-img resize, or lets qemu-img guess the
+                    format from file content the guest can write when there is no record.
+                    _do_create_volume records qcow2 (vmstore_qcow2_volumes) before
+                    copy_image_to_volume replaces the file with a raw one, so extending a
+                    detached volume created from an image failed with "Image is not in qcow2
+                    format". Volumes created from an image now record raw, and clones and
+                    volumes from snapshot inherit their source's record when it is raw.
+                    Unlike Platform9's version, a recorded qcow2 is not inherited: every
+                    volume created from an image before this release records qcow2 for a raw
+                    file, so inheriting it would make creating a larger clone or volume from
+                    snapshot of an existing boot volume fail with the same error, where 3.0.10
+                    succeeds. This only shows with volumes created before the patch, and only
+                    when the request runs with an admin context (Cinder hides admin metadata
+                    from other users), which is why tests on newly created volumes pass with
+                    either version. A clone without a record keeps the 3.0.10 behaviour.
+                    Existing image volumes still record qcow2; 3.0.12 handles those.
 
     """
 
-    VERSION = '3.0.10'
+    VERSION = '3.0.11'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -825,6 +843,37 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  volume.id, image_id)
         super().copy_image_to_volume(
             context, volume, image_service, image_id, disable_sparse)
+        # fetch_to_raw replaced the file _do_create_volume made, so the
+        # volume is raw now even with vmstore_qcow2_volumes
+        self._set_volume_format(volume, 'raw')
+
+    @staticmethod
+    def _set_volume_format(volume, file_format):
+        """Record the format of the volume file in admin metadata.
+
+        extend_volume passes it to qemu-img resize, so it must match the
+        file. Callers pass a format they know, never one probed from the
+        file: the guest can write any header into it.
+        """
+        volume.admin_metadata['format'] = file_format
+        with volume.obj_as_admin():
+            volume.save()
+
+    def _inherit_volume_format(self, volume, source):
+        """Give a new volume its source's recorded format if that is raw.
+
+        The array copies the source file as is, so a raw source gives a raw
+        volume. A recorded qcow2 is not inherited: volumes created from an
+        image before 3.0.11 record qcow2 for a raw file, and extend_volume
+        would fail on the copy. Without a record, extend_volume lets
+        qemu-img detect the format, which is safe for a real qcow2 file
+        because its header is not written by the guest.
+
+        :param volume: the new volume
+        :param source: the source volume
+        """
+        if (source.admin_metadata or {}).get('format') == 'raw':
+            self._set_volume_format(volume, 'raw')
 
     def copy_volume_to_image(self,
                              context: context.RequestContext,
@@ -847,6 +896,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """
         lock_key = self._get_snapshot_lock_key(snapshot.id)
         result = self._create_volume_from_snapshot_locked(volume, snapshot, lock_key)
+        self._inherit_volume_format(volume, snapshot.volume)
         self._extend_volume_for_cloned_volume(volume, snapshot['volume_size'])
         return result
 
@@ -935,6 +985,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         
         lock_key = self._get_volume_lock_key(volume.id)
         result = self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
+        self._inherit_volume_format(volume, src_vref)
         self._extend_volume_for_cloned_volume(volume, src_vref['size'])
         return result
 
