@@ -114,7 +114,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     memoises it for the rest of the refresh, halving the stat round trips when
                     nfs_sparsed_volumes is enabled. _get_capacity_info never reads the memo, so
                     capacity checks on the volume-create path still see current allocation.
-        3.0.11 - [VMTS-243]: Extend attached (in-use) volumes; reports
+        3.0.12 - [VMTS-243]: Extend attached (in-use) volumes; reports
                     online_extend_support. raw: the driver grows the file,
                     then Nova resizes the guest disk. qcow2: the driver never
                     modifies the file while a VM may hold it (the share is
@@ -129,7 +129,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
     """
 
-    VERSION = '3.0.11'
+    VERSION = '3.0.12'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
