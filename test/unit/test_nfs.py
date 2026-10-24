@@ -408,3 +408,128 @@ class VmstoreNfsDriverShareTestCase(test.TestCase):
         self.assertRaises(
             exception.InvalidConfigurationValue,
             driver._load_shares)
+
+
+class VmstoreNfsDriverVolumeFormatTestCase(test.TestCase):
+    """The recorded volume format matches the file (VMTS-252)."""
+
+    def setUp(self):
+        set_vmstore_overrides()
+        super(VmstoreNfsDriverVolumeFormatTestCase, self).setUp()
+        self.context = context.get_admin_context()
+        self.configuration = mock.Mock()
+        for key, value in VMSTORE_CONFIG.items():
+            setattr(self.configuration, key, value)
+        self.configuration.reserved_percentage = 0
+        self.configuration.max_over_subscription_ratio = 1.0
+        self.configuration.nfs_sparsed_volumes = True
+        self.configuration.nfs_mount_point_base = '/mnt/vmstore'
+        self.configuration.safe_get = mock.Mock(return_value=None)
+
+    @mock.patch('os_brick.remotefs.remotefs.RemoteFsClient')
+    @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, '_check_snapshot_support')
+    @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup')
+    def _get_driver(self, mock_do_setup, mock_check_snapshot, mock_remotefs):
+        driver = vmstore_nfs.VmstoreNfsDriver(configuration=self.configuration)
+        driver.vmstore = mock.Mock()
+        return driver
+
+    @staticmethod
+    def _volume(recorded=None, size=10):
+        volume = mock.MagicMock(id='vol-1', size=size)
+        volume.admin_metadata = {} if recorded is None else {
+            'format': recorded}
+        volume.__getitem__.side_effect = {'id': 'vol-1', 'size': size,
+                                          'name': 'volume-vol-1'}.get
+        return volume
+
+    def test_set_volume_format_saves_as_admin(self):
+        volume = self._volume()
+
+        vmstore_nfs.VmstoreNfsDriver._set_volume_format(volume, 'raw')
+
+        self.assertEqual('raw', volume.admin_metadata['format'])
+        volume.obj_as_admin.assert_called_once_with()
+        volume.save.assert_called_once_with()
+
+    @mock.patch.object(vmstore_nfs.nfs.NfsDriver, 'copy_image_to_volume')
+    def test_copy_image_records_raw(self, mock_parent_copy):
+        """fetch_to_raw writes a raw file even with vmstore_qcow2_volumes."""
+        driver = self._get_driver()
+        volume = self._volume(recorded='qcow2')
+
+        driver.copy_image_to_volume(self.context, volume, mock.sentinel.svc,
+                                    'image-1')
+
+        mock_parent_copy.assert_called_once_with(
+            self.context, volume, mock.sentinel.svc, 'image-1', False)
+        self.assertEqual('raw', volume.admin_metadata['format'])
+        volume.save.assert_called_once_with()
+
+    def _clone(self, source, size=20):
+        driver = self._get_driver()
+        volume = self._volume(size=size)
+        calls = mock.Mock()
+        with mock.patch.object(driver, '_get_virtual_disk_with_retry'), \
+                mock.patch.object(driver, '_create_cloned_volume_locked'), \
+                mock.patch.object(
+                    driver, '_extend_volume_for_cloned_volume') as extend:
+            calls.attach_mock(extend, 'extend')
+            calls.attach_mock(volume.save, 'save')
+            driver.create_cloned_volume(volume, source)
+        return volume, calls
+
+    def test_clone_inherits_raw_before_extend(self):
+        """A larger clone of a raw volume is resized as raw."""
+        volume, calls = self._clone(self._volume(recorded='raw'))
+
+        self.assertEqual('raw', volume.admin_metadata['format'])
+        self.assertEqual(['save', 'extend'],
+                         [c[0] for c in calls.mock_calls])
+
+    def test_clone_does_not_inherit_qcow2(self):
+        """A recorded qcow2 may be stale (image volumes before 3.0.11)."""
+        volume, calls = self._clone(self._volume(recorded='qcow2'))
+
+        self.assertNotIn('format', volume.admin_metadata)
+        volume.save.assert_not_called()
+        calls.extend.assert_called_once_with(volume, 10)
+
+    def test_clone_without_source_record_unchanged(self):
+        """No record on the source keeps the 3.0.10 behaviour."""
+        volume, _calls = self._clone(self._volume())
+
+        self.assertNotIn('format', volume.admin_metadata)
+        volume.save.assert_not_called()
+
+    def test_volume_from_snapshot_inherits_raw_before_extend(self):
+        driver = self._get_driver()
+        volume = self._volume(size=20)
+        snapshot = mock.MagicMock(id='snap-1')
+        snapshot.volume = self._volume(recorded='raw')
+        snapshot.__getitem__.side_effect = {'volume_size': 10}.get
+        calls = mock.Mock()
+        with mock.patch.object(driver, '_create_volume_from_snapshot_locked'), \
+                mock.patch.object(
+                    driver, '_extend_volume_for_cloned_volume') as extend:
+            calls.attach_mock(extend, 'extend')
+            calls.attach_mock(volume.save, 'save')
+            driver.create_volume_from_snapshot(volume, snapshot)
+
+        self.assertEqual('raw', volume.admin_metadata['format'])
+        self.assertEqual(['save', 'extend'],
+                         [c[0] for c in calls.mock_calls])
+        extend.assert_called_once_with(volume, 10)
+
+    def test_volume_from_snapshot_does_not_inherit_qcow2(self):
+        driver = self._get_driver()
+        volume = self._volume(size=20)
+        snapshot = mock.MagicMock(id='snap-1')
+        snapshot.volume = self._volume(recorded='qcow2')
+        snapshot.__getitem__.side_effect = {'volume_size': 10}.get
+        with mock.patch.object(driver, '_create_volume_from_snapshot_locked'), \
+                mock.patch.object(driver, '_extend_volume_for_cloned_volume'):
+            driver.create_volume_from_snapshot(volume, snapshot)
+
+        self.assertNotIn('format', volume.admin_metadata)
+        volume.save.assert_not_called()
