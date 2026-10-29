@@ -88,10 +88,25 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         3.0.8 - Release version for April 2026
         3.0.9 - Fixes VMS-4184: Pass volume.id while querying virtual disk information. Also, populate
                 volumeId parameter in payload to /host/refresh API in refresh_hypervisor function.
+        3.0.9.1 - [VME-4] (VMTS-252): 3.0.9 with Platform9's patch, the same changes as 3.0.11
+                (marked "PF9 change"). The upstream extend_volume passes the recorded format
+                (admin_metadata['format']) to qemu-img resize, or lets qemu-img guess the format
+                from file content the guest can write when there is no record. _do_create_volume
+                records qcow2 (vmstore_qcow2_volumes) before copy_image_to_volume replaces the file
+                with a raw one, so extending a detached volume created from an image failed with
+                "Image is not in qcow2 format". Volumes created from an image now record raw, and
+                clones and volumes from snapshot inherit their source's record when it is raw and
+                are extended when created larger than the source (as VMS-4243 in 3.0.10). Unlike
+                Platform9's version, a recorded qcow2 is not inherited: every volume created from an
+                image before this release records qcow2 for a raw file, and inheriting it makes
+                creating a larger clone or volume from snapshot of an existing boot volume fail with
+                the same error (reproduced in the lab on the 3.0.10 code, VME-4). A clone without a
+                record lets qemu-img detect the format, as in 3.0.9. Existing image volumes still
+                record qcow2.
 
     """
 
-    VERSION = '3.0.9'
+    VERSION = '3.0.9.1'
     CI_WIKI_NAME = 'Vmstore_CI'
 
     vendor_name = 'DDN'
@@ -517,6 +532,20 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         with volume.obj_as_admin():
             volume.save()
 
+    # PF9 change start
+    @staticmethod
+    def _set_volume_format(volume, file_format):
+        """Record the format of the volume file in admin metadata.
+
+        extend_volume passes it to qemu-img resize, so it must match the
+        file. Callers pass a format they know, never one probed from the
+        file: the guest can write any header into it.
+        """
+        volume.admin_metadata['format'] = file_format
+        with volume.obj_as_admin():
+            volume.save()
+    # PF9 change end
+
     def check_encryption_provider(
         self,
         volume: 'objects.Volume',
@@ -825,6 +854,20 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
+
+        # PF9 change start
+        # The array copies the snapshot's file as is, so the new volume has
+        # the source volume's format; extend_volume below reads it back.
+        # Only raw is inherited: volumes created from an image before this
+        # release record qcow2 for a raw file (see version 3.0.9.1).
+        src_format = (snapshot.volume.admin_metadata or {}).get('format')
+        if src_format == 'raw':
+            self._set_volume_format(volume, src_format)
+        if volume['size'] > snapshot['volume_size']:
+            LOG.debug("Resize the new volume %s to %s.",
+                      volume['id'], volume['size'])
+            self.extend_volume(volume, volume['size'])
+        # PF9 change end
         return {'provider_location': volume.provider_location}
 
     def copy_image_to_volume(self,
@@ -846,6 +889,11 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                                  size=volume.size,
                                  run_as_root=self._execute_as_root,
                                  disable_sparse=disable_sparse)
+        # PF9 change start
+        # fetch_to_raw replaced the file _do_create_volume made, so the
+        # volume is raw now even with vmstore_qcow2_volumes
+        self._set_volume_format(volume, 'raw')
+        # PF9 change end
 
         image_utils.resize_image(volpath, volume.size,
                                  run_as_root=self._execute_as_root)
@@ -996,6 +1044,20 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # Async refresh - don't block waiting for hypervisor
         self.refresh_hypervisor(volume)
         volume.provider_location = self._find_share(volume)
+
+        # PF9 change start
+        # The array copies the source file as is, so the clone has the
+        # source's format; extend_volume below reads it back.
+        # Only raw is inherited: volumes created from an image before this
+        # release record qcow2 for a raw file (see version 3.0.9.1).
+        src_format = (src_vref.admin_metadata or {}).get('format')
+        if src_format == 'raw':
+            self._set_volume_format(volume, src_format)
+        if volume['size'] > src_vref['size']:
+            LOG.debug("Resize the new volume %s to %s.",
+                      volume['id'], volume['size'])
+            self.extend_volume(volume, volume['size'])
+        # PF9 change end
 
         LOG.info(
             'Successfully created cloned volume %(vol)s from %(src)s '
