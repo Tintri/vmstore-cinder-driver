@@ -73,6 +73,8 @@ vmstore_qcow2_volumes = False
 |`vmstore_refresh_openstack_region`|String|``|no|OpenStack region for Vmstore hypervisor refresh call.|
 |`vmstore_openstack_hostname`|String|-|no|OpenStack controller hostname or IP. Used for VMstore hypervisor refresh. If not set, attempts to resolve from Keystone config.|
 |`vmstore_stats_cache_period`|Int|59|no|Period in seconds for caching volume statistics. Stats will be refreshed only if the cache is older than this value. Set to 0 to disable caching.|
+|`vmstore_online_extend_nova_check`|Boolean|`True`|no|When extending an attached qcow2 volume, ask Nova whether every attached instance is shut off and, if so, resize the file in the driver. Requires the `[nova]` section credentials. If disabled, attached qcow2 volumes are always left to Nova to resize.|
+|`vmstore_nova_api_timeout`|Int|`30`|no|Timeout in seconds for the Nova API call used by `vmstore_online_extend_nova_check`.|
 |`vmstore_get_vd_timeout`|Int|`8`|no|Maximum time in seconds to wait for a single virtual disk lookup attempt.|
 |`vmstore_virtual_disk_retries`|Int|`3`|no|Number of retries for virtual disk lookup before failing. Each retry triggers a hypervisor refresh and uses exponential backoff.|
 |`vmstore_snapshot_poll_timeout`|Int|`30`|no|Maximum total time in seconds to poll for a snapshot to appear in the VMstore index after creation.|
@@ -120,6 +122,19 @@ When a volume is created from a snapshot that lives on a *different* VMstore bac
 | Standard LAN deployment | Defaults are appropriate |
 | High-latency or WAN-linked controller (e.g. PF9 multi-region) | `vmstore_snapshot_poll_timeout = 120`, `vmstore_virtual_disk_retries = 5`, `vmstore_rest_retry_count = 10` |
 | Large deployment with many concurrent volumes | Keep `vmstore_use_volume_locks = True`; raise `vmstore_stats_cache_period` to 120–300 |
+
+### Extending attached volumes
+
+Since 3.0.12 the driver reports `online_extend_support`, so `cinder extend` (API microversion 3.42 or later) works on `in-use` volumes. The guest sees the new size without a restart; growing the partition and filesystem inside the guest is still up to the user.
+
+- **raw volumes:** the driver grows the file, then Nova resizes the guest disk.
+- **qcow2 volumes:** the driver never modifies the file while an instance may be using it (VMstore shares are mounted `nolock`, so the Cinder host cannot see qemu's lock). Nova/qemu resizes it. If the instance is shut off, Nova skips the resize; the driver then resizes the file itself after Nova confirms the instance is shut off (`vmstore_online_extend_nova_check`). Otherwise the file is grown before the volume's next attach (attach, unshelve or cold migration); starting or rebooting the instance does not apply it, and the driver logs a warning.
+- For a running instance, Cinder reports success once it has notified Nova; if Nova's resize then fails, the error is only in Nova's instance actions and logs.
+- The driver never shrinks a file: an extend to a size smaller than the current file fails.
+- A failed extend leaves the volume at its original size and data; Cinder marks it `error_extending`, and an administrator can recover it with `cinder reset-state --state in-use <volume>`. The exception is an instance started while its qcow2 file was being resized offline: the extend fails after the resize, and the image should be checked with `qemu-img check` first.
+- Known issue: extending a *detached* volume created from an image fails with `Image is not in qcow2 format` (parent driver behaviour, see ADR-0004).
+
+Design and lab evidence: [docs/adr/0004-online-extend-of-attached-volumes.md](docs/adr/0004-online-extend-of-attached-volumes.md).
 
 ### Restart Openstack Cinder service
 
