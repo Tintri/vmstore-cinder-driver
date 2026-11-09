@@ -126,6 +126,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  - [VMTS-252]: Detached extend no longer trusts the recorded
                     format, which is qcow2 for volumes created from an
                     image; copy_image_to_volume now records raw.
+                 - [VME-4]: As in 3.0.11, clones and volumes from snapshot
+                    inherit their source's recorded format when it is raw.
+                    The source's record is read with an admin context, so
+                    this also applies to requests from non-admin users.
 
     """
 
@@ -976,9 +980,38 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             context, volume, image_service, image_id, disable_sparse)
         # fetch_to_raw replaced the file _do_create_volume made, which
         # recorded qcow2, with a raw one (VMTS-252).
-        volume.admin_metadata['format'] = 'raw'
+        self._set_volume_format(volume, 'raw')
+
+    @staticmethod
+    def _set_volume_format(volume, file_format):
+        """Record the format of the volume file in admin metadata.
+
+        Callers pass a format they know, never one probed from the file:
+        the guest can write any header into it.
+
+        :param volume: volume reference
+        :param file_format: 'raw' or 'qcow2'
+        """
+        volume.admin_metadata['format'] = file_format
         with volume.obj_as_admin():
             volume.save()
+
+    def _inherit_volume_format(self, volume, source):
+        """Give a new volume its source's recorded format if that is raw.
+
+        As in 3.0.11: the array copies the source file as is, so a raw
+        source gives a raw volume, and the record keeps a guest-written
+        qcow2 header in the copy from being treated as qcow2. A recorded
+        qcow2 is not inherited: volumes created from an image before 3.0.11
+        record qcow2 for a raw file. The source's record is read with an
+        admin context (_recorded_format), so this also works for requests
+        from non-admin users, where 3.0.11 saw no record.
+
+        :param volume: the new volume
+        :param source: the source volume
+        """
+        if self._recorded_format(source) == 'raw':
+            self._set_volume_format(volume, 'raw')
 
     def copy_volume_to_image(self,
                              context: context.RequestContext,
@@ -1001,6 +1034,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         """
         lock_key = self._get_snapshot_lock_key(snapshot.id)
         result = self._create_volume_from_snapshot_locked(volume, snapshot, lock_key)
+        self._inherit_volume_format(volume, snapshot.volume)
         self._extend_volume_for_cloned_volume(volume, snapshot['volume_size'])
         return result
 
@@ -1378,6 +1412,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         lock_key = self._get_volume_lock_key(volume.id)
         result = self._create_cloned_volume_locked(volume, src_vref, vd, lock_key)
+        self._inherit_volume_format(volume, src_vref)
         self._extend_volume_for_cloned_volume(volume, src_vref['size'])
         return result
 
