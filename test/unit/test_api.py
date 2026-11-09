@@ -352,3 +352,57 @@ class VmstoreProxyExecuteTestCase(test.TestCase):
         with mock.patch.object(self.proxy, '_send_raw', return_value=good_response):
             result = self.proxy._execute_strict('post', 'cinder/host/refresh')
         self.assertEqual({'status': 'ok'}, result)
+
+
+class VmstoreClonesNoRetryTestCase(test.TestCase):
+    """Clone requests are not retried on ERR-API-3206 (VMTS-225)."""
+
+    def setUp(self):
+        set_vmstore_overrides()
+        super(VmstoreClonesNoRetryTestCase, self).setUp()
+        mock_conf = mock.Mock()
+        mock_conf.vmstore_rest_protocol = 'https'
+        mock_conf.vmstore_rest_address = '192.168.1.1'
+        mock_conf.vmstore_rest_port = 443
+        mock_conf.vmstore_user = 'admin'
+        mock_conf.vmstore_password = 'secret'
+        mock_conf.vmstore_rest_retry_count = 2
+        mock_conf.vmstore_refresh_retry_count = 1
+        mock_conf.vmstore_rest_backoff_factor = 0
+        mock_conf.vmstore_rest_connect_timeout = 30
+        mock_conf.vmstore_rest_read_timeout = 300
+        mock_conf.driver_ssl_cert_verify = False
+        mock_conf.driver_ssl_cert_path = None
+        with mock.patch('requests.Session'):
+            self.proxy = api.VmstoreProxy('nfs', 'b', mock_conf)
+        self.proxy.delay = mock.Mock(return_value=0)
+        self.proxy.update_host = mock.Mock()
+        self.clones = api.VmstoreClones(self.proxy)
+
+    def test_clone_3206_raised_after_one_attempt(self):
+        error = api.VmstoreException(code='ERR-API-3206')
+        with mock.patch.object(self.proxy, '_attempt',
+                               side_effect=error) as attempt:
+            self.assertRaises(api.VmstoreException, self.clones.create,
+                              {'destinationPaths': 'x'})
+        attempt.assert_called_once()
+
+    def test_clone_other_errors_still_retried(self):
+        error = api.VmstoreException(code='RESOURCE_BUSY')
+        with mock.patch.object(self.proxy, '_attempt',
+                               side_effect=[error, error, {'ok': 1}]) as attempt:
+            self.assertEqual({'ok': 1}, self.clones.create({}))
+        self.assertEqual(3, attempt.call_count)
+
+    def test_clone_resource_exist_is_success(self):
+        error = api.VmstoreException(code='RESOURCE_EXIST')
+        with mock.patch.object(self.proxy, '_attempt', side_effect=error):
+            self.assertIsNone(self.clones.create({}))
+
+    def test_other_posts_still_retry_3206(self):
+        """Only the clone collection opts out of retries."""
+        error = api.VmstoreException(code='ERR-API-3206')
+        with mock.patch.object(self.proxy, '_attempt',
+                               side_effect=[error, {'ok': 1}]) as attempt:
+            self.assertEqual({'ok': 1}, self.proxy.post('snapshot', {}))
+        self.assertEqual(2, attempt.call_count)
