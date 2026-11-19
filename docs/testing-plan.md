@@ -402,6 +402,13 @@ Reserved for release gate. Use when:
 - Signing off a driver release candidate
 - Validating NFS mount options against a real appliance
 
+Scenario tests that need a real cloud (Nova, two compute hosts, a VMstore) live under
+`test/lab/`, each with a runbook in `docs/runbooks/`:
+
+| Test | Runbook |
+|---|---|
+| Volume migration: format record, qcow2 data, live migration, extend (VME-29) | [volume-migration-lab-test.md](runbooks/volume-migration-lab-test.md) |
+
 ### Minimum host requirements
 
 | Resource | Minimum |
