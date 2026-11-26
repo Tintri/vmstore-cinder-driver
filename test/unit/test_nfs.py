@@ -269,9 +269,15 @@ class VmstoreNfsDriverSnapshotTestCase(test.TestCase):
     @mock.patch('os_brick.remotefs.remotefs.RemoteFsClient')
     @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, '_check_snapshot_support')
     @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup')
-    def test_delete_snapshot_vm_present_logs_warning(
+    def test_delete_snapshot_vm_present_raises_snapshot_is_busy(
             self, mock_do_setup, mock_check_snapshot, mock_remotefs):
-        """Test delete_snapshot logs warning when VM is still present."""
+        """Clones still use the snapshot: refuse, do not report deleted.
+
+        Reporting success left the VMstore snapshot on the array for good
+        (lab, driver 3.0.9: still there after the clone and the parent
+        volume were deleted). SnapshotIsBusy makes Cinder keep the snapshot
+        available and tell the user to delete the dependent volumes first.
+        """
         driver = vmstore_nfs.VmstoreNfsDriver(configuration=self.configuration)
         driver.vmstore = mock.Mock()
         driver.vmstore.snapshots.list.return_value = [
@@ -281,12 +287,146 @@ class VmstoreNfsDriverSnapshotTestCase(test.TestCase):
         driver.vmstore.snapshots.delete.side_effect = error
 
         snapshot = mock.Mock()
+        snapshot.provider_id = None
         snapshot.__getitem__ = lambda s, key: {
             'name': 'test_snapshot',
             'volume_id': 'test-volume-id'
         }[key]
 
-        driver.delete_snapshot(snapshot)
+        self.assertRaises(exception.SnapshotIsBusy,
+                          driver.delete_snapshot, snapshot)
+
+    # VME-34: snapshot delete NotFound handling and provider_id
+
+    def _driver(self):
+        with mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup'), \
+                mock.patch.object(vmstore_nfs.VmstoreNfsDriver,
+                                  '_check_snapshot_support'), \
+                mock.patch('os_brick.remotefs.remotefs.RemoteFsClient'):
+            driver = vmstore_nfs.VmstoreNfsDriver(
+                configuration=self.configuration)
+        driver.vmstore = mock.Mock()
+        return driver
+
+    @staticmethod
+    def _snapshot(name='snapshot-1', provider_id=None):
+        snapshot = mock.Mock()
+        snapshot.id = 'snap-id-1'
+        snapshot.provider_id = provider_id
+        snapshot.__getitem__ = lambda s, key: {'name': name}[key]
+        return snapshot
+
+    @staticmethod
+    def _listed(name='snapshot-1', uuid='array-uuid-1'):
+        return [{'description': name, 'uuid': {'uuid': uuid}}]
+
+    def test_delete_snapshot_found_by_name(self):
+        driver = self._driver()
+        driver.vmstore.snapshots.list.return_value = self._listed()
+
+        driver.delete_snapshot(self._snapshot())
+
+        driver.vmstore.snapshots.list.assert_called_once_with(
+            {'contain': 'snapshot-1'})
+        driver.vmstore.snapshots.delete.assert_called_once_with(
+            'array-uuid-1', missing_ok=False)
+
+    def test_delete_snapshot_uses_provider_id(self):
+        driver = self._driver()
+
+        driver.delete_snapshot(self._snapshot(provider_id='array-uuid-9'))
+
+        driver.vmstore.snapshots.list.assert_not_called()
+        driver.vmstore.snapshots.delete.assert_called_once_with(
+            'array-uuid-9', missing_ok=False)
+
+    def test_delete_snapshot_not_found_on_delete_and_gone_succeeds(self):
+        driver = self._driver()
+        driver.vmstore.snapshots.list.side_effect = [self._listed(), []]
+        driver.vmstore.snapshots.delete.side_effect = api.VmstoreException(
+            code='RESOURCE_NOT_FOUND', message='Snapshot not found')
+
+        driver.delete_snapshot(self._snapshot())
+
+        self.assertEqual(2, driver.vmstore.snapshots.list.call_count)
+
+    def test_delete_snapshot_provider_id_not_found_and_gone_succeeds(self):
+        driver = self._driver()
+        driver.vmstore.snapshots.list.return_value = []
+        driver.vmstore.snapshots.delete.side_effect = api.VmstoreException(
+            code='RESOURCE_NOT_FOUND', message='Snapshot not found')
+
+        driver.delete_snapshot(self._snapshot(provider_id='array-uuid-9'))
+
+        driver.vmstore.snapshots.list.assert_called_once_with(
+            {'contain': 'snapshot-1'})
+
+    def test_delete_snapshot_not_found_but_still_listed_raises(self):
+        """Never report success while the array snapshot still exists."""
+        driver = self._driver()
+        driver.vmstore.snapshots.list.return_value = self._listed()
+        driver.vmstore.snapshots.delete.side_effect = api.VmstoreException(
+            code='RESOURCE_NOT_FOUND', message='VM does not exist')
+
+        exc = self.assertRaises(api.VmstoreException,
+                                driver.delete_snapshot, self._snapshot())
+
+        self.assertIn('snapshot-1', str(exc))
+        self.assertIn('array-uuid-1', str(exc))
+        self.assertIn('VM does not exist', str(exc))
+
+    def test_delete_snapshot_other_error_raises_with_context(self):
+        driver = self._driver()
+        driver.vmstore.snapshots.list.return_value = self._listed()
+        driver.vmstore.snapshots.delete.side_effect = api.VmstoreException(
+            code='ERR-API-9999', message='Internal error')
+
+        exc = self.assertRaises(api.VmstoreException,
+                                driver.delete_snapshot, self._snapshot())
+
+        self.assertEqual('ERR-API-9999', exc.code)
+        self.assertIn('snapshot-1', str(exc))
+        self.assertIn('array-uuid-1', str(exc))
+        self.assertIn('Internal error', str(exc))
+
+    def test_delete_snapshot_shared_snapshot_raises_snapshot_is_busy(self):
+        """ERR-API-3107: clones or a clone directory still use it."""
+        driver = self._driver()
+        driver.vmstore.snapshots.list.return_value = self._listed()
+        driver.vmstore.snapshots.delete.side_effect = api.VmstoreException(
+            code='ERR-API-3107',
+            message='Cannot delete the shared snapshot because it has '
+                    'younger or older siblings')
+
+        exc = self.assertRaises(exception.SnapshotIsBusy,
+                                driver.delete_snapshot, self._snapshot())
+
+        self.assertIn('snapshot-1', str(exc))
+        driver.vmstore.snapshots.delete.assert_called_once()
+
+    def test_delete_snapshot_lookup_not_found_raises_with_context(self):
+        """A NotFound on the lookup cannot tell us the snapshot is gone."""
+        driver = self._driver()
+        driver.vmstore.snapshots.list.side_effect = api.VmstoreException(
+            code='RESOURCE_NOT_FOUND', message='VM does not exist')
+
+        exc = self.assertRaises(api.VmstoreException,
+                                driver.delete_snapshot, self._snapshot())
+
+        self.assertIn('snapshot-1', str(exc))
+        self.assertIn('VM does not exist', str(exc))
+        driver.vmstore.snapshots.delete.assert_not_called()
+
+    def test_delete_snapshot_ignores_partial_name_matches(self):
+        driver = self._driver()
+        driver.vmstore.snapshots.list.return_value = [
+            {'description': 'clone-snapshot-1-x', 'uuid': {'uuid': 'other'}},
+            {'description': None, 'uuid': {'uuid': 'none'}},
+        ]
+
+        driver.delete_snapshot(self._snapshot())
+
+        driver.vmstore.snapshots.delete.assert_not_called()
 
 
 class VmstoreNfsDriverCreateSnapshotTestCase(test.TestCase):
@@ -365,6 +505,45 @@ class VmstoreNfsDriverCreateSnapshotTestCase(test.TestCase):
 
         # Since 3.0.9: volume.id is used, not name_id
         driver.vmstore.virtual_disk.get.assert_called_with('volume-uuid-456')
+
+    def _create_snapshot_with_response(self, response):
+        with mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup'), \
+                mock.patch.object(vmstore_nfs.VmstoreNfsDriver,
+                                  '_check_snapshot_support'), \
+                mock.patch('os_brick.remotefs.remotefs.RemoteFsClient'):
+            driver = vmstore_nfs.VmstoreNfsDriver(
+                configuration=self.configuration)
+        driver.vmstore = mock.Mock()
+        driver.nas_path = '/tintri/test_share'
+        driver.vmstore.virtual_disk.get.return_value = [{
+            'vmName': 'test-vm',
+            'vmUuid': {'uuid': 'vm-uuid-123'},
+            'instanceUuid': 'instance-uuid-123'
+        }]
+        driver.vmstore.snapshots.create.return_value = response
+        volume = mock.Mock()
+        volume.id = 'volume-uuid-456'
+        volume.__getitem__ = lambda s, key: {'name': 'volume-456'}[key]
+        snapshot = mock.Mock()
+        snapshot.id = 'snap-id-1'
+        snapshot.volume = volume
+        snapshot.__getitem__ = lambda s, key: {'name': 'snapshot-1'}[key]
+        return driver.create_snapshot(snapshot)
+
+    def test_create_snapshot_records_array_uuid_as_provider_id(self):
+        """VME-34: Cinder can map the record to the array snapshot."""
+        self.assertEqual(
+            {'provider_id': 'array-uuid-1'},
+            self._create_snapshot_with_response(['array-uuid-1']))
+        self.assertEqual(
+            {'provider_id': 'array-uuid-2'},
+            self._create_snapshot_with_response(
+                [{'uuid': {'uuid': 'array-uuid-2'}}]))
+
+    def test_create_snapshot_without_uuid_returns_no_update(self):
+        """Delete falls back to the name lookup for these snapshots."""
+        self.assertIsNone(self._create_snapshot_with_response(None))
+        self.assertIsNone(self._create_snapshot_with_response([]))
 
 
 class VmstoreNfsDriverShareTestCase(test.TestCase):

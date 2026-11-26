@@ -139,6 +139,20 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     inherit their source's recorded format when it is raw.
                     The source's record is read with an admin context, so
                     this also applies to requests from non-admin users.
+                 - [VME-34]: Snapshot delete reports success only when the
+                    VMstore snapshot is gone. VMstore can answer NotFound
+                    for a snapshot that still exists, so a NotFound is
+                    checked against a fresh listing; every other failure is
+                    raised with the Cinder snapshot name, the VMstore
+                    snapshot UUID and VMstore's reason. Every DELETE 404 is
+                    typed NotFound and is no longer retried.
+                    create_snapshot records the VMstore snapshot UUID in
+                    provider_id; delete uses it and falls back to the name
+                    for snapshots created by older drivers. A snapshot that
+                    volumes created from it still use (ERR-API-3107) is
+                    refused with SnapshotIsBusy and stays available, instead
+                    of being reported deleted while the VMstore snapshot
+                    stayed on the array; 3107 is no longer retried.
 
     """
 
@@ -904,7 +918,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             raise api.VmstoreException(code='NotFound', message=msg)
 
         lock_key = self._get_snapshot_lock_key(snapshot.id)
-        self._create_snapshot_locked(snapshot, vd, lock_key)
+        return self._create_snapshot_locked(snapshot, vd, lock_key)
 
     @coordination.synchronized('{lock_key}')
     def _create_snapshot_locked(self, snapshot, vd, lock_key):
@@ -915,6 +929,9 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         :param snapshot: snapshot reference
         :param vd: virtual disk info for the snapshot's volume
         :param lock_key: coordination lock key
+        :returns: {'provider_id': <VMstore snapshot UUID>} when VMstore
+                  returns the UUID, otherwise None (delete then finds the
+                  snapshot by name)
         """
         LOG.debug('Creating snapshot (with locking) after aquiring vd %s', snapshot['name'])
         volume = snapshot.volume
@@ -931,8 +948,75 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'snapshotCreator': 'Vmstore cinder driver',
             'deletionPolicy': 'DELETE_ON_EXPIRATION'
         }
-        self.vmstore.snapshots.create(payload)
-        LOG.info('Snapshot %s created successfully', snapshot['name'])
+        resp = self.vmstore.snapshots.create(payload)
+        snap_uuid = self._snapshot_uuid_from_response(resp)
+        LOG.info('Snapshot %(name)s created successfully, VMstore '
+                 'snapshot %(uuid)s',
+                 {'name': snapshot['name'], 'uuid': snap_uuid or 'unknown'})
+        if snap_uuid:
+            return {'provider_id': snap_uuid}
+        return None
+
+    @staticmethod
+    def _snapshot_uuid_from_response(resp):
+        """Return the VMstore snapshot UUID from a cinder/snapshot response.
+
+        VMstore answers with a list holding the UUID, as a string or as a
+        Uuid object. Anything else gives None.
+        """
+        if not isinstance(resp, list) or not resp:
+            return None
+        first = resp[0]
+        if isinstance(first, str):
+            return first or None
+        if isinstance(first, dict) and isinstance(first.get('uuid'), dict):
+            return first['uuid'].get('uuid') or None
+        return None
+
+    @staticmethod
+    def _snapshot_in_use(error):
+        """True if VMstore refused a snapshot delete because of clones.
+
+        ERR-API-3107 covers clones and leftover clone directories ("its live
+        VM is still present", "has younger or older siblings"); the text
+        check covers responses without the code.
+        """
+        return (error.code == 'ERR-API-3107'
+                or 'VM is still present' in str(error))
+
+    @staticmethod
+    def _snapshot_provider_id(snapshot):
+        """Return the VMstore snapshot UUID recorded at create, or None."""
+        provider_id = getattr(snapshot, 'provider_id', None)
+        if isinstance(provider_id, str) and provider_id:
+            return provider_id
+        return None
+
+    def _find_vmstore_snapshot(self, name):
+        """Return the UUID of the VMstore snapshot described as name, or None.
+
+        Raises when VMstore cannot answer the query: a NotFound on the
+        listing does not show that the snapshot is gone.
+        """
+        try:
+            snapshots = self.vmstore.snapshots.list({'contain': name})
+        except api.VmstoreException as e:
+            msg = f'Cannot look up VMstore snapshot {name}: {e}'
+            LOG.error(msg)
+            raise api.VmstoreException(code=e.code, message=msg)
+        for item in snapshots or []:
+            if isinstance(item, dict) and item.get('description') == name:
+                return item['uuid']['uuid']
+        return None
+
+    @staticmethod
+    def _snapshot_delete_error(name, snap_uuid, error, reason=None):
+        """Log and return one error naming both snapshots and VMstore's answer."""
+        detail = f'{reason}: {error}' if reason else str(error)
+        msg = (f'Failed to delete VMstore snapshot {snap_uuid} for Cinder '
+               f'snapshot {name}: {detail}')
+        LOG.error(msg)
+        return api.VmstoreException(code=error.code, message=msg)
 
     def delete_snapshot(self, snapshot):
         """Deletes a snapshot.
@@ -948,33 +1032,50 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     def _delete_snapshot_locked(self, snapshot, lock_key):
         """Deletes a snapshot with coordination lock.
 
+        The VMstore snapshot is the one recorded in provider_id at create,
+        or else the one whose description is the Cinder snapshot name. The
+        delete reports success only when that snapshot is gone (VME-34):
+        VMstore can answer NotFound for a snapshot that still exists, for
+        example while its VM association is broken (VMTS-279), so a
+        NotFound is checked against a fresh listing. A snapshot that clones
+        still use is refused with SnapshotIsBusy: Cinder keeps it available
+        and the VMstore snapshot is deleted once its clones are gone.
+        Reporting success there left the VMstore snapshot on the array for
+        good.
+
         :param snapshot: snapshot reference
         :param lock_key: coordination lock key
         """
-        LOG.info('Deleting snapshot %s', snapshot['name'])
-        snapshots = self.vmstore.snapshots.list({'contain': snapshot['name']})
-        snap_uuid = ''
-        for vmstore_snapshot in snapshots:
-            if snapshot['name'] == vmstore_snapshot['description']:
-                snap_uuid = vmstore_snapshot['uuid']['uuid']
-                break  # Found it, no need to continue
-
+        name = snapshot['name']
+        LOG.info('Deleting snapshot %s', name)
+        snap_uuid = (self._snapshot_provider_id(snapshot)
+                     or self._find_vmstore_snapshot(name))
         if not snap_uuid:
             LOG.info('Did not find snapshot %(name)s, '
-                     'this is ok for deletion.',
-                     {'name': snapshot['name']})
+                     'this is ok for deletion.', {'name': name})
             return
 
         try:
-            self.vmstore.snapshots.delete(snap_uuid)
-            LOG.info('Snapshot %s deleted successfully', snapshot['name'])
+            self.vmstore.snapshots.delete(snap_uuid, missing_ok=False)
         except api.VmstoreException as e:
-            if 'VM is still present' in str(e):
+            if self._snapshot_in_use(e):
                 LOG.warning(
-                    'Snapshot %s has active clones, will be cleaned up '
-                    'when parent volume is deleted: %s', snapshot['name'], e)
-            else:
-                raise
+                    'Snapshot %(name)s (VMstore %(uuid)s) is still used by '
+                    'volumes created from it; delete those volumes first: '
+                    '%(err)s', {'name': name, 'uuid': snap_uuid, 'err': e})
+                raise exception.SnapshotIsBusy(snapshot_name=name)
+            if e.code != 'RESOURCE_NOT_FOUND':
+                raise self._snapshot_delete_error(name, snap_uuid, e)
+            remaining = self._find_vmstore_snapshot(name)
+            if remaining:
+                raise self._snapshot_delete_error(
+                    name, remaining, e,
+                    'VMstore answered NotFound but still lists the snapshot')
+            LOG.info('Snapshot %(name)s (VMstore %(uuid)s) is no longer '
+                     'on VMstore', {'name': name, 'uuid': snap_uuid})
+            return
+        LOG.info('Snapshot %(name)s (VMstore %(uuid)s) deleted successfully',
+                 {'name': name, 'uuid': snap_uuid})
 
     def copy_image_to_volume(self,
                              context: context.RequestContext,
@@ -1509,16 +1610,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         LOG.debug('Creating temporary snapshot for clone: %s', clone_name)
         resp = self.vmstore.snapshots.create(payload)
-
-        # Try to extract UUID from response
-        snap_uuid = None
-        if resp:
-            if isinstance(resp, list) and len(resp) > 0:
-                # Response might be a list with UUID
-                if isinstance(resp[0], dict) and 'uuid' in resp[0]:
-                    snap_uuid = resp[0]['uuid']['uuid']
-                elif isinstance(resp[0], str):
-                    snap_uuid = resp[0]
+        snap_uuid = self._snapshot_uuid_from_response(resp)
 
         # If UUID not in response, poll for it with optimized backoff
         if not snap_uuid:

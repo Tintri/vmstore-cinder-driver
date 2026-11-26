@@ -21,6 +21,10 @@
         3.0.6    - cache volume stats, filter list snapshots
         3.0.8    - Fix BUG: lock uuid Encode
         3.0.10   - Refactor -> Transport layer: proxy dispatch + request engine
+        3.0.12   - [VME-34] Every DELETE 404 is typed RESOURCE_NOT_FOUND and
+                   is not retried; delete(missing_ok=False) lets a caller
+                   check that the object is really gone. Snapshot delete
+                   does not retry ERR-API-3107 (snapshot still shared).
 """
 
 import hashlib
@@ -79,6 +83,9 @@ class VmstoreException(exception.VolumeDriverException):
 
 
 class VmstoreCollections(object):
+    # Delete errors that are final: retrying cannot change the answer.
+    DELETE_NO_RETRY_CODES = ('RESOURCE_NOT_FOUND',)
+
     def __init__(self, proxy):
         self.proxy = proxy
         self.namespace = 'vmstore'
@@ -118,14 +125,23 @@ class VmstoreCollections(object):
             if error.code != 'RESOURCE_EXIST':
                 raise
 
-    def delete(self, payload):
+    def delete(self, payload, missing_ok=True):
+        """Delete one object.
+
+        A NotFound answer is final and is not retried. With missing_ok (the
+        default) it counts as deleted. Callers that must know the object is
+        really gone pass missing_ok=False and get the RESOURCE_NOT_FOUND
+        error, because VMstore can answer NotFound for an object that still
+        exists (VME-34).
+        """
         LOG.debug('Delete %(subj)s %(payload)s',
                   {'subj': self.subj, 'payload': payload})
         path = self.path(payload)
         try:
-            return self.proxy.delete(path, payload)
+            return self.proxy.delete(
+                path, payload, no_retry_codes=self.DELETE_NO_RETRY_CODES)
         except VmstoreException as error:
-            if error.code == 'RESOURCE_NOT_FOUND':
+            if error.code == 'RESOURCE_NOT_FOUND' and missing_ok:
                 LOG.debug('Resource not found during delete, treating as '
                           'success: %(payload)s', {'payload': payload})
                 return
@@ -167,6 +183,11 @@ class VmstoreVirtualDisks(VmstoreCollections):
 
 
 class VmstoreSnapshots(VmstoreCollections):
+    # ERR-API-3107: the snapshot is shared (clones, or a leftover clone
+    # directory, still use it). It cannot be deleted until they are gone,
+    # so retrying only delays the answer by about 30 s (VME-34).
+    DELETE_NO_RETRY_CODES = ('RESOURCE_NOT_FOUND', 'ERR-API-3107')
+
     def __init__(self, proxy):
         super(VmstoreSnapshots, self).__init__(proxy)
         self.root = 'snapshot'
@@ -319,8 +340,9 @@ class VmstoreProxy(object):
         return self._execute('post', path, payload,
                              no_retry_codes=no_retry_codes)
 
-    def delete(self, path, payload=None):
-        return self._execute('delete', path, payload)
+    def delete(self, path, payload=None, no_retry_codes=()):
+        return self._execute('delete', path, payload,
+                             no_retry_codes=no_retry_codes)
 
     def put(self, path, payload=None):
         return self._execute('put', path, payload)
@@ -394,11 +416,8 @@ class VmstoreProxy(object):
         making each page fetch visible and independently testable.
         """
         content = self._parse_content(response)
+        # Raises for every error response, so only successes go past here.
         self._check_error(response, content)
-
-        # Normalised to success by _check_error (e.g. idempotent DELETE 404)
-        if not response.ok:
-            return None
 
         # Some endpoints return None or 0 for success with no body
         if content is None or content == 0:
@@ -467,26 +486,28 @@ class VmstoreProxy(object):
                 message=_('JSON parse error on response: %s') % exc)
 
     def _check_error(self, response, content):
-        """Raise VmstoreException for error responses, with documented exceptions.
+        """Raise VmstoreException for every error response.
 
-        Special cases (do NOT raise):
-          - DELETE 404 with 'Failed to lookup' — idempotent, treat as success.
+        Typed codes:
+          - Any DELETE 404, whatever its wording ("Failed to lookup" and the
+            ResourceNotFoundException text alike): RESOURCE_NOT_FOUND.
+            VmstoreCollections.delete() decides whether a missing object
+            counts as deleted (VME-34).
+          - Any response whose message says 'does not exist':
+            RESOURCE_NOT_FOUND. A GET 404 with other text is left untyped,
+            because it can also mean a wrong endpoint or API version.
+          - 500 RESOURCE_BUSY: propagated so the caller can retry.
 
-        Special cases (raise with typed code):
-          - 404 with 'does not exist' in message — RESOURCE_NOT_FOUND.
-          - 500 RESOURCE_BUSY — propagate immediately so caller can retry.
-
-        Snapshot-delete with active clones is logged before raising so the
-        collection-level handler in VmstoreCollections.delete() can catch it.
+        Snapshot-delete with active clones is logged before raising.
         """
         if response.ok:
             return
-        # Idempotent DELETE: 404 "Failed to lookup" is success
         if (response.status_code == requests.codes.not_found
-                and response.request.method == 'DELETE'
-                and 'Failed to lookup' in (
-                    (content or {}).get('causeDetails') or '')):
-            return
+                and response.request.method == 'DELETE'):
+            if isinstance(content, dict):
+                raise VmstoreException(content, code='RESOURCE_NOT_FOUND')
+            raise VmstoreException(code='RESOURCE_NOT_FOUND',
+                                   message=_('Not found (HTTP 404)'))
         # Typed not-found
         if (isinstance(content, dict)
                 and content.get('message')
@@ -501,8 +522,8 @@ class VmstoreProxy(object):
         if (isinstance(content, dict)
                 and 'live VM is still present' in (
                     content.get('causeDetails') or '')):
-            LOG.info('Could not delete snapshot with existing clones; '
-                     'will be cleaned up when the parent volume is deleted')
+            LOG.info('VMstore refused to delete a snapshot that clones '
+                     'still use (ERR-API-3107)')
         raise VmstoreException(content)
 
     def _next_link(self, content):

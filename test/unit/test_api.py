@@ -112,6 +112,30 @@ class VmstoreCollectionsTestCase(test.TestCase):
             'test_resource'
         )
 
+    def test_delete_not_found_raises_when_not_missing_ok(self):
+        """VME-34: callers that must know the object is gone see NotFound."""
+        error = api.VmstoreException(code='RESOURCE_NOT_FOUND')
+        self.mock_proxy.delete.side_effect = error
+        exc = self.assertRaises(
+            api.VmstoreException,
+            self.collections.delete, 'test_resource', missing_ok=False)
+        self.assertEqual('RESOURCE_NOT_FOUND', exc.code)
+
+    def test_delete_does_not_retry_not_found(self):
+        """VME-34: a 404 is final; retrying it only delays the caller."""
+        self.collections.delete('test_resource')
+        self.mock_proxy.delete.assert_called_once_with(
+            self.collections.path('test_resource'), 'test_resource',
+            no_retry_codes=('RESOURCE_NOT_FOUND',))
+
+    def test_snapshot_delete_does_not_retry_shared_snapshot(self):
+        """ERR-API-3107 (clones still use the snapshot) cannot succeed on retry."""
+        snapshots = api.VmstoreSnapshots(self.mock_proxy)
+        snapshots.delete('snap-uuid')
+        self.mock_proxy.delete.assert_called_once_with(
+            snapshots.path('snap-uuid'), 'snap-uuid',
+            no_retry_codes=('RESOURCE_NOT_FOUND', 'ERR-API-3107'))
+
 
 class VmstoreProxyTestCase(test.TestCase):
 
@@ -191,10 +215,39 @@ class VmstoreProxyCheckErrorTestCase(test.TestCase):
         response = _make_response(200, {'key': 'val'})
         self.proxy._check_error(response, {'key': 'val'})  # must not raise
 
-    def test_delete_404_failed_to_lookup_is_success(self):
-        content = {'causeDetails': 'Failed to lookup resource abc'}
-        response = _make_response(404, content, method='DELETE')
-        self.proxy._check_error(response, content)  # must not raise
+    def test_delete_404_raises_resource_not_found_for_any_wording(self):
+        """VME-34: every DELETE 404 is typed NotFound, whatever its text.
+
+        VmstoreCollections.delete turns it into success for callers that
+        accept a missing object; snapshot delete checks the object is gone.
+        """
+        for content in ({'causeDetails': 'Failed to lookup resource abc'},
+                        {'message': 'Snapshot abc not found'},
+                        {'code': 'ERR-API-1404'},
+                        None):
+            response = _make_response(404, content, method='DELETE')
+            exc = self.assertRaises(
+                api.VmstoreException,
+                self.proxy._check_error, response, content)
+            self.assertEqual('RESOURCE_NOT_FOUND', exc.code)
+
+    def test_get_404_without_does_not_exist_is_not_typed_not_found(self):
+        """A GET 404 can mean a wrong endpoint, so only the known text counts."""
+        content = {'message': 'No such endpoint'}
+        response = _make_response(404, content, method='GET')
+        exc = self.assertRaises(
+            api.VmstoreException,
+            self.proxy._check_error, response, content)
+        self.assertNotEqual('RESOURCE_NOT_FOUND', exc.code)
+
+    def test_error_without_cause_details_does_not_crash(self):
+        """3.0.9 raised TypeError on a missing causeDetails (VME-34)."""
+        content = {'message': 'Cannot delete snapshot', 'code': 'ERR_API'}
+        response = _make_response(500, content, method='DELETE')
+        exc = self.assertRaises(
+            api.VmstoreException,
+            self.proxy._check_error, response, content)
+        self.assertIn('Cannot delete snapshot', str(exc))
 
     def test_404_does_not_exist_raises_resource_not_found(self):
         content = {'message': 'Resource does not exist'}
@@ -278,12 +331,14 @@ class VmstoreProxyCollectTestCase(test.TestCase):
         result = self.proxy._collect('delete', response)
         self.assertIsNone(result)
 
-    def test_normalised_delete_404_returns_none(self):
-        """_collect returns None when _check_error normalises a DELETE 404."""
+    def test_delete_404_raises_from_collect(self):
+        """VME-34: a DELETE 404 reaches the caller as RESOURCE_NOT_FOUND."""
         content = {'causeDetails': 'Failed to lookup resource abc'}
         response = _make_response(404, content, method='DELETE')
-        result = self.proxy._collect('delete', response)
-        self.assertIsNone(result)
+        exc = self.assertRaises(
+            api.VmstoreException,
+            self.proxy._collect, 'delete', response)
+        self.assertEqual('RESOURCE_NOT_FOUND', exc.code)
 
 
 class VmstoreProxyExecuteTestCase(test.TestCase):
@@ -339,6 +394,16 @@ class VmstoreProxyExecuteTestCase(test.TestCase):
                                side_effect=[error, success]):
             self.proxy._execute('get', 'path')
         self.proxy.update_host.assert_called_once()
+
+    def test_delete_passes_no_retry_codes(self):
+        error = api.VmstoreException(code='RESOURCE_NOT_FOUND')
+        with mock.patch.object(self.proxy, '_attempt',
+                               side_effect=error) as attempt:
+            self.assertRaises(
+                api.VmstoreException,
+                self.proxy.delete, 'snapshot/abc',
+                no_retry_codes=('RESOURCE_NOT_FOUND',))
+        attempt.assert_called_once()
 
     def test_execute_strict_raises_immediately_on_error(self):
         bad_response = _make_response(503, {'message': 'unavailable'})
