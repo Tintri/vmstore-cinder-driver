@@ -68,8 +68,14 @@ new_vol() { # name, create arguments -> volume ID
   [[ "$id" =~ $UUID_RE ]] || id=$(cli "openstack volume list --name $1 -f value -c ID" | head -1)
   echo "$id"; }
 extend() { # volume, new size in GB -> final status (in-use extend needs API 3.42)
+  local s
   cli "openstack --os-volume-api-version $VOL_API volume set --size $2 $1" | show >&2
-  wait_vol "$1"; }
+  s=$(wait_vol "$1")
+  # A refused extend (for example no backend with online extend support) is only visible
+  # as a Cinder user message on the volume: show the newest one as evidence.
+  cli "openstack --os-volume-api-version 3.3 volume message list -f value -c 'Resource UUID' -c 'Event ID' -c 'User Message'" |
+    grep -F "$1" | tail -1 | sed 's/^/  user message: /' >&2
+  echo "$s"; }
 # CLI output goes to stderr (still logged) so callers capture only the final status.
 attach() { cli "openstack server add volume $VM $1" | show >&2; wait_vol "$1"; }
 detach() { cli "openstack server remove volume $VM $1" | show >&2; wait_vol "$1"; }
@@ -85,7 +91,7 @@ finfo() { # volume -> "<raw|qcow2|missing|unchecked> <file bytes> <virtual bytes
   [ -n "$CINDER_SSH" ] || { echo "unchecked 0 0"; return 0; }
   local p; p=$(fpath "$1"); [ -n "$p" ] || { echo "missing 0 0"; return 0; }
   on "$CINDER_SSH" "p='$p'; [ -e \$p ] || { echo missing 0 0; exit; }; x=\$(head -c4 \$p | od -An -tx1 | tr -d ' '); s=\$(stat -c %s \$p)
-    if [ \$x = 514649fb ]; then v=\$(qemu-img info -U -f qcow2 --output=json \$p | sed -nE 's/.*\"virtual-size\": *([0-9]+).*/\1/p' | head -1); echo qcow2 \$s \${v:-0}; else echo raw \$s \$s; fi" | tail -1; }
+    if [ \$x = 514649fb ]; then v=\$(qemu-img info -U -f qcow2 --output=json \$p | python3 -c 'import json, sys; print(json.load(sys.stdin)[\"virtual-size\"])' 2>/dev/null); echo qcow2 \$s \${v:-0}; else echo raw \$s \$s; fi" | tail -1; }
 pwrite() { # path, format -> ok | error (test volume only, before attach)
   on "$CINDER_SSH" "qemu-io -f $2 -c 'write -P 0x5a 0 $PAT' '$1' 2>&1 | grep -q '^wrote $PAT_BYTES/$PAT_BYTES' && echo ok || echo error" | tail -1; }
 pcheck() { # path, format -> ok | bad | error (read-only, shares the image lock)
