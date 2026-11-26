@@ -85,7 +85,7 @@ finfo() { # volume -> "<raw|qcow2|missing|unchecked> <file bytes> <virtual bytes
   [ -n "$CINDER_SSH" ] || { echo "unchecked 0 0"; return 0; }
   local p; p=$(fpath "$1"); [ -n "$p" ] || { echo "missing 0 0"; return 0; }
   on "$CINDER_SSH" "p='$p'; [ -e \$p ] || { echo missing 0 0; exit; }; x=\$(head -c4 \$p | od -An -tx1 | tr -d ' '); s=\$(stat -c %s \$p)
-    if [ \$x = 514649fb ]; then v=\$(qemu-img info -U -f qcow2 --output=json \$p | sed -nE 's/.*\"virtual-size\": *([0-9]+).*/\1/p' | head -1); echo qcow2 \$s \${v:-0}; else echo raw \$s \$s; fi" | tail -1; }
+    if [ \$x = 514649fb ]; then v=\$(qemu-img info -U -f qcow2 --output=json \$p | python3 -c 'import json, sys; print(json.load(sys.stdin)[\"virtual-size\"])' 2>/dev/null); echo qcow2 \$s \${v:-0}; else echo raw \$s \$s; fi" | tail -1; }
 pwrite() { # path, format -> ok | error (test volume only, before attach)
   on "$CINDER_SSH" "qemu-io -f $2 -c 'write -P 0x5a 0 $PAT' '$1' 2>&1 | grep -q '^wrote $PAT_BYTES/$PAT_BYTES' && echo ok || echo error" | tail -1; }
 pcheck() { # path, format -> ok | bad | error (read-only, shares the image lock)
