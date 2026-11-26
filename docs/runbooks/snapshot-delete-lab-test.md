@@ -23,9 +23,10 @@ listing confirms the snapshot is gone.
 
 | Driver | S1 | S2 | S3 | S4 |
 | --- | --- | --- | --- | --- |
-| 3.0.11 (from the code, not measured) | FAIL: `provider_id` not set | PASS: the name lookup finds nothing, delete is a no-op | to be measured (depends on whether deleting the parent removes the array snapshot) | PASS: every 3.0.11 delete works by name |
-| 3.0.12-beta before VME-34 | as 3.0.11 (same create and delete code) | as 3.0.11 | to be measured | as 3.0.11 |
-| 3.0.12 with VME-34 | PASS | PASS | PASS | PASS |
+| 3.0.9 (measured 2026-11-26) | FAIL: `provider_id` not set | PASS: the name lookup finds nothing, delete is a no-op | FAIL: leak. VMstore refuses the delete because of the clone, the driver logs a warning and Cinder marks the snapshot deleted; the VMstore snapshot is still there after the clone and the parent are deleted | PASS: found by name |
+| 3.0.11 (from the code, not measured) | as 3.0.9 | as 3.0.9 | as 3.0.9 (same clone-refusal and parent cleanup code) | as 3.0.9 |
+| 3.0.12-beta before VME-34 | as 3.0.11 (same create and delete code) | as 3.0.11 | as 3.0.11 | as 3.0.11 |
+| 3.0.12 with VME-34 | PASS | PASS | FAIL until the clone-refusal path changes: VME-34 leaves it as it is (see VME-34 for the follow-up) | PASS |
 
 ## Prerequisites and access levels
 
@@ -144,3 +145,4 @@ created by 3.0.11, by hand, on the CLI host:
 
 | Date | Lab | Driver | S1 | S2 | S3 | S4 | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-11-26 | lab A, PCD 2026.8 (Aug P2), `vmstore_qcow2_volumes = true` | 3.0.9 | FAIL | PASS | FAIL | PASS | Baseline. S3: VMstore snapshot left on the array after the clone and parent were deleted (removed by the script's cleanup). Cleanup complete, other objects unchanged. |
