@@ -66,6 +66,10 @@ the restart, so cinder-volume came back with the old value. `host-option.sh` now
 `OPTION_SETTLE_SECONDS` (default 45) after its edit and stops without restarting if the file
 changed. Change `vmstore_qcow2_volumes` in the PCD cluster blueprint (it rewrites `cinder.conf`
 and restarts cinder-volume on the storage hosts, as customers do), and use `status` to confirm.
+Each blueprint apply also rewrites `pf9_identifier_timestamp` in every backend section, so
+after a blueprint round trip (option off, then back on) the file differs from the as-found
+copy only in those lines. `status` and `rollback` ignore them: such a file counts as
+PRE-TEST, and the backup line says "apart from PCD's pf9_identifier_timestamp".
 
 **Which file, elsewhere.** A blueprint change rewrites `cinder.conf` and restarts
 cinder-volume, so a hand edit can be overwritten. cinder-volume
@@ -100,7 +104,7 @@ nothing when the host is already there.
 | `STATE: PRE-TEST FILES, but the last start line is not ...` | files restored, service not restarted on them |
 | `STATE: TEST BUILD <version> installed; pre-test is ...` | a test build is installed: roll back |
 | `STATE: UNKNOWN to this tool ...` | no backup in this `PREFIX`'s directory: nothing deployed from here (check other `/root/*-driver-swap` directories) |
-| `STATE: PRE-TEST, every changed file matches its first backup` / `STATE: CHANGED ...` | config files as found / still changed |
+| `STATE: PRE-TEST, every changed file matches its first backup` / `STATE: CHANGED ...` | config files as found (PCD's `pf9_identifier_timestamp` lines ignored) / still changed |
 | `STATE: no option changed by this tool` | no option backups |
 
 ### If the scripts cannot finish

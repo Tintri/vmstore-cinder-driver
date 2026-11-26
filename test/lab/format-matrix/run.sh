@@ -136,13 +136,32 @@ try:
     print(" ".join(v.get("id", "") for v in (json.load(sys.stdin).get("volumes_attached") or [])))
 except ValueError:
     pass'; }
-cold_migrate() { # VM, host -> op result (migration, then confirm)
+# PCD confirms cold migrations and resizes by itself within seconds (Nova's
+# resize_confirm_window), so VERIFY_RESIZE may be over before it is seen. Wait for either,
+# confirm only if still needed (a 400 or 409 means it was confirmed meanwhile), then judge by
+# the result: the host or the flavor, not the states on the way. A migration Nova could not
+# schedule also ends ACTIVE, on the old host.
+finish_resize() { # VM -> op result once the VM is ACTIVE again
+  local s t i
+  for ((i = 0; i < 600; i += 10)); do s=$(sfield "$1" status); t=$(sfield "$1" OS-EXT-STS:task_state)
+    [ "$t" = None ] && [[ "$s" =~ ^(VERIFY_RESIZE|ACTIVE|ERROR)$ ]] && break; sleep 10
+  done
+  [ "$s" = VERIFY_RESIZE ] && cli "openstack server resize confirm $1" | show >&2
+  op_vm "$1" ACTIVE; }
+on_host() { local h; h=$(sfield "$1" OS-EXT-SRV-ATTR:host)
+  [ "$h" = "$2" ] && echo ok || echo "failed:VM on ${h:-unknown}, not $2"; }
+cold_migrate() { # VM, host -> op result (the VM must end ACTIVE on that host)
   cli "openstack --os-compute-api-version 2.56 server migrate --host $2 --wait $1" | show >&2
-  local r; r=$(op_vm "$1" VERIFY_RESIZE); [ "$r" = ok ] || { echo "$r"; return; }
-  cli "openstack server resize confirm $1" | show >&2; op_vm "$1" ACTIVE; }
+  local r; r=$(finish_resize "$1"); [ "$r" = ok ] || { echo "$r"; return; }
+  on_host "$1" "$2"; }
+resize_vm() { # VM, flavor ID, flavor name -> op result (the VM must end ACTIVE on that flavor)
+  cli "openstack server resize --flavor $2 --wait $1" | show >&2
+  local r f; r=$(finish_resize "$1"); [ "$r" = ok ] || { echo "$r"; return; }
+  f=$(sfield "$1" flavor)   # "<name> (<id>)", or original_name='<name>' from compute API 2.47
+  [[ "$f" == *"$2"* || "$f" == *"'$3'"* || "$f" == "$3 "* ]] && echo ok || echo "failed:flavor still $(clean <<<"$f")"; }
 live_migrate() { cli "openstack --os-compute-api-version 2.79 server migrate --live-migration --host $2 --wait $1" | show >&2
   local r; r=$(op_vm "$1" ACTIVE); [ "$r" = ok ] || { echo "$r"; return; }
-  [ "$(sfield "$1" OS-EXT-SRV-ATTR:host)" = "$2" ] && echo ok || echo "failed:VM still on $(sfield "$1" OS-EXT-SRV-ATTR:host)"; }
+  on_host "$1" "$2"; }
 
 # Cinder record and file, read on CINDER_SSH (read-only).
 volrec() { on "$CINDER_SSH" "cd $RDIR && (set +u; set -a; . $CINDER_VENV/cinder.env; set +a; $CINDER_VENV/bin/python volume_record.py --conf-dir $CINDER_CONF_DIR $*)" | grep '^VOL'; }
@@ -436,11 +455,10 @@ two_host() {
   r=$(detach "$VM" "$D"); [ "$r" = ok ] && r=$(extend_detached "$D" 2)
   row T7 "Detach, extend the migrated volume (1 to 2 GB)" "$r" "$D" "" 2
   r=$(cold_migrate "$VM" "$SRC_COMPUTE_ID")
-  if [ "$r" = ok ]; then
-    cli "openstack server resize --flavor $FLV2 --wait $VM" | show; r=$(op_vm "$VM" VERIFY_RESIZE)
-    [ "$r" = ok ] && { cli "openstack server resize confirm $VM" | show; r=$(op_vm "$VM" ACTIVE); }
-  fi
-  row T8 "Cold migrate back to SRC, resize" "$r" "$N" "$VM"
+  row T8 "Cold migrate back to SRC" "$r" "$N" "$VM"
+  if [[ "$FLV2" =~ ^[0-9a-zA-Z-]+$ ]]; then r=$(resize_vm "$VM" "$FLV2" "$PREFIX-flavor2")
+  else r="failed:flavor $PREFIX-flavor2 not created"; fi
+  row T9 "Resize the VM (2 vCPUs)" "$r" "$N" "$VM"
 }
 
 # ---------------------------------------------------------------- flip test

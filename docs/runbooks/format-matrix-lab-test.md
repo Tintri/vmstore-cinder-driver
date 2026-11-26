@@ -27,7 +27,7 @@ report failures. This script runs the same steps and writes the same table.
 | Command | Steps |
 | --- | --- |
 | `./run.sh <lab.env>` | One host: Platform9 steps 1 to 19 |
-| `./run.sh --two-host <lab.env>` | Two hosts: volume migrate to the other cinder-volume host, then move the VM (T1 to T8). `LIVE=1` live migrates instead of the cold migration in T5 |
+| `./run.sh --two-host <lab.env>` | Two hosts: volume migrate to the other cinder-volume host, then move the VM (T1 to T9). `LIVE=1` live migrates instead of the cold migration in T5 |
 | `./run.sh --flip-phase create <lab.env>` | Flip test, part 1 (option on): VM, boot volume and an empty qcow2 volume, kept |
 | `./run.sh --flip-phase after <lab.env>` | Flip test, part 2, after the backend was switched to off and restarted: F1 to F9 on the old volumes, then cleanup |
 
@@ -58,7 +58,10 @@ One host (same numbers as Platform9's single-host tables):
 Two hosts (Platform9's "volume migrate, then move the VM" table): T1 boot from image on SRC,
 T2 data volume from image, T3 migrate it to the other cinder-volume host, T4 attach, T5 cold
 migrate the VM to DST (live with `LIVE=1`), T6 stop / start and hard reboot on DST, T7 detach
-and extend the migrated volume, T8 cold migrate back and resize. `b` rows show the data volume.
+and extend the migrated volume, T8 cold migrate back to SRC, T9 resize the VM to a 2-vCPU
+flavor. `b` rows show the data volume. PCD confirms cold migrations and resizes by itself
+within seconds, so T5, T8 and T9 pass on the result (the VM is ACTIVE on the target host, or
+on the new flavor) whether or not the run saw `VERIFY_RESIZE`.
 
 Flip test (Platform9's "created with qcow2 on, then switched off" table): C1 to C3 in phase
 create (empty volume, VM booted from an image volume, empty volume attached); F1 cinder-volume
@@ -168,6 +171,8 @@ on the workstation.
 | --- | --- |
 | 18 or T1 not run, `--block-device` or `volume_type` rejected | The CLI or Nova does not accept compute API 2.67. Update python-openstackclient on the CLI host. |
 | T5 or T8 `VM ERROR`, `No valid host` | DST (or SRC) has no placement memory for the flavor. Free capacity or lower `FLAVOR_RAM_MB`. |
+| T5 or T8 `VM on <host>, not <target>` | Nova did not move the VM (scheduling failed, the VM stays ACTIVE where it was). Check placement capacity on the target and the nova-conductor log. |
+| T9 `flavor still ...` | The resize did not apply. Check that SRC has capacity for 2 vCPUs. |
 | T3 `migration error` | `VOLUME_HOSTS` must be cinder-volume host names serving the same backend, both up. |
 | libvirt column `unchecked` | No `SRC_COMPUTE_SSH` / `DST_COMPUTE_SSH`, or the VM runs on a host not in the env file. |
 | precheck: hosts disagree on `vmstore_qcow2_volumes` | Finish or roll back the option change on every host serving the backend first. |

@@ -34,7 +34,9 @@ resize. For a test with I/O running in the guest, see "Manual add-on: guest I/O"
 
 E1 and E4 use volumes created from the image, which are always raw files. E2 and E3 use
 empty volumes, which are qcow2 only with `vmstore_qcow2_volumes = True`; with False they
-are raw and E2 and E3 report SKIP. Run the suite once with each setting.
+are raw and E2 and E3 report SKIP. Run the suite once with each setting. The precheck reads
+both options from the backend's own section (then `[backend_defaults]`), in the order
+cinder-volume reads the config directory.
 
 ## Expected results
 
@@ -170,7 +172,8 @@ and remove `/root/vme10-lab` on the cinder-volume host. Replace `vme10` with you
 | E3 `not resized offline` | `vmstore_online_extend_nova_check` is False, the `[nova]` credentials in the Cinder config do not work, or Nova still reported a task or power state other than shut down. The cinder-volume log names the reason. |
 | E4 `no grow warning in the cinder-volume log` | The attach ran on a host missing from `LOG_SSH`, or the log is not in UTC. The file size result above it still shows whether the grow happened. |
 | VM not `ACTIVE` or on another host | Capacity on `SRC_COMPUTE_ID` (placement memory), or the image cannot boot from a volume of this type. |
-| E2 and E3 SKIP | Empty volumes are raw (`vmstore_qcow2_volumes = False`). Expected in the raw-only run. |
+| E2 and E3 SKIP | Empty volumes are raw (`vmstore_qcow2_volumes = False`). Expected in the raw-only run. The SKIP line shows the value read from the backend's own section. |
+| precheck `WARNING: ... but a new empty volume is a <format> file` | The option on `CINDER_SSH` does not match the file the backend created: another host serving the backend has a different value (check every host with `swap.sh status`), or the option is set in a file read later (`cinder_override.conf`). |
 
 ## Run history
 
