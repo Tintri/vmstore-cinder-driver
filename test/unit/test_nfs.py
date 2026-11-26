@@ -1214,3 +1214,192 @@ class VmstoreNfsDriverOnlineExtendStatsTestCase(_ExtendTestBase):
 
         self.assertTrue(
             self.driver._stats['pools'][0]['online_extend_support'])
+
+
+class VmstoreNfsDriverTempCloneCleanupTestCase(_ExtendTestBase):
+    """A failed create never leaves its temporary clone directory (VMTS-225).
+
+    The directory is a clone reference on the array: while it exists, the
+    snapshot it was cloned from cannot be deleted (ERR-API-3107).
+    """
+
+    def setUp(self):
+        super(VmstoreNfsDriverTempCloneCleanupTestCase, self).setUp()
+        self.mnt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.mnt, ignore_errors=True)
+        self.driver.nas_path = '/tintri/test_share'
+        self._patch_driver('_get_mount_point_for_share', return_value=self.mnt)
+        self._patch_driver('_get_share_path',
+                           return_value='192.168.1.1:/tintri/test_share')
+        self._patch_driver('_wait_for_snapshot', return_value='snap-uuid')
+        self.volume = _FakeVolume(id='vol-new', name='volume-vol-new',
+                                  name_id='vol-new', size=10)
+        self.snapshot = mock.MagicMock()
+        self.snapshot.__getitem__.side_effect = {
+            'name': 'snapshot-1', 'volume_name': 'volume-src'}.__getitem__
+        self.temp_dir = os.path.join(self.mnt, 'snapshot-1-vol-vol-new')
+
+    def _clone_creates_dir(self, *args, **kwargs):
+        """What the array does: a directory holding the cloned file."""
+        os.mkdir(self.temp_dir)
+        with open(os.path.join(self.temp_dir, 'volume-src'), 'w') as f:
+            f.write('data')
+
+    def _from_snapshot(self):
+        self.driver._create_volume_from_snapshot_same_backend(
+            self.volume, self.snapshot, 'lock')
+
+    def test_success_moves_file_and_removes_dir(self):
+        self.driver.vmstore.clones.create.side_effect = self._clone_creates_dir
+
+        self._from_snapshot()
+
+        self.assertTrue(os.path.exists(
+            os.path.join(self.mnt, 'volume-vol-new')))
+        self.assertFalse(os.path.exists(self.temp_dir))
+
+    def test_db_error_reading_volume_name_happens_before_clone(self):
+        """The reported failure: snapshot['volume_name'] needs the DB."""
+        self.snapshot.__getitem__.side_effect = {
+            'name': 'snapshot-1'}.__getitem__   # KeyError for volume_name
+
+        self.assertRaises(KeyError, self._from_snapshot)
+        self.driver.vmstore.clones.create.assert_not_called()
+        self.assertEqual([], os.listdir(self.mnt))
+
+    def test_clone_request_failure_after_dir_created_removes_dir(self):
+        def clone_then_fail(*args, **kwargs):
+            self._clone_creates_dir()
+            raise api.VmstoreException(code='ERR-API-3206')
+        self.driver.vmstore.clones.create.side_effect = clone_then_fail
+
+        self.assertRaises(api.VmstoreException, self._from_snapshot)
+        self.assertEqual([], os.listdir(self.mnt))
+
+    def test_rename_failure_removes_dir(self):
+        self.driver.vmstore.clones.create.side_effect = self._clone_creates_dir
+
+        with mock.patch.object(vmstore_nfs.os, 'rename',
+                               side_effect=OSError('EIO')):
+            self.assertRaises(OSError, self._from_snapshot)
+        self.assertEqual([], os.listdir(self.mnt))
+
+    def test_any_exception_after_clone_removes_dir(self):
+        """Not only OSError: a DB or API error is cleaned up too."""
+        self.driver.vmstore.clones.create.side_effect = self._clone_creates_dir
+
+        with mock.patch.object(vmstore_nfs.os, 'rename',
+                               side_effect=RuntimeError('db gone')):
+            self.assertRaises(RuntimeError, self._from_snapshot)
+        self.assertEqual([], os.listdir(self.mnt))
+
+    def test_failed_cleanup_is_logged_and_original_error_raised(self):
+        self.driver.vmstore.clones.create.side_effect = self._clone_creates_dir
+
+        with mock.patch.object(vmstore_nfs.os, 'rename',
+                               side_effect=OSError('EIO')), \
+                mock.patch.object(vmstore_nfs.shutil, 'rmtree',
+                                  side_effect=OSError('EBUSY')), \
+                mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            error = self.assertRaises(OSError, self._from_snapshot)
+
+        self.assertEqual('EIO', str(error))
+        logged = [c[0][1] for c in mock_log.error.call_args_list
+                  if len(c[0]) > 1 and isinstance(c[0][1], dict)]
+        self.assertTrue(any(d.get('dir') == self.temp_dir
+                            and 'rm_err' in d for d in logged))
+
+    def test_rmdir_failure_after_move_does_not_fail_create(self):
+        """The file is in place; an empty directory is not a clone."""
+        self.driver.vmstore.clones.create.side_effect = self._clone_creates_dir
+
+        with mock.patch.object(vmstore_nfs.os, 'rmdir',
+                               side_effect=OSError('EBUSY')), \
+                mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self._from_snapshot()
+
+        self.assertTrue(os.path.exists(
+            os.path.join(self.mnt, 'volume-vol-new')))
+        mock_log.warning.assert_called_once()
+
+    def test_clone_of_volume_failure_removes_dir(self):
+        src = _FakeVolume(id='vol-src', name='volume-src', size=10)
+        temp_dir = os.path.join(self.mnt, 'clone-volume-src-vol-new')
+
+        def clone_then_fail(*args, **kwargs):
+            os.mkdir(temp_dir)
+            open(os.path.join(temp_dir, 'volume-src'), 'w').close()
+            raise api.VmstoreException(code='ERR-API-3206')
+        self.driver.vmstore.snapshots.create.return_value = [
+            {'uuid': {'uuid': 'snap-uuid'}}]
+        self.driver.vmstore.clones.create.side_effect = clone_then_fail
+        vd = [{'vmUuid': {'uuid': 'vm-1'}, 'vmName': 'vm',
+               'instanceUuid': 'inst'}]
+
+        self.assertRaises(api.VmstoreException,
+                          self.driver._create_cloned_volume_locked,
+                          self.volume, src, vd, 'lock')
+        self.assertEqual([], os.listdir(self.mnt))
+
+    def test_cross_backend_move_failure_removes_source_dir(self):
+        src_mnt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, src_mnt, ignore_errors=True)
+        temp_dir = os.path.join(src_mnt, 'snapshot-1-vol-vol-new')
+        self.driver._get_mount_point_for_share.side_effect = (
+            lambda share: src_mnt if share == 'src-share' else self.mnt)
+        self._patch_driver('_ensure_share_mounted')
+        source_proxy = mock.Mock()
+        source_proxy.clones.create.side_effect = (
+            lambda payload: (os.mkdir(temp_dir), open(
+                os.path.join(temp_dir, 'volume-src'), 'w').close()))
+        source_config = mock.Mock(nas_host='10.0.0.2',
+                                  nas_share_path='/tintri/src')
+
+        with mock.patch.object(vmstore_nfs.shutil, 'move',
+                               side_effect=OSError('EXDEV copy failed')):
+            self.assertRaises(OSError, self.driver._clone_on_source_move_file,
+                              self.volume, self.snapshot, source_config,
+                              'src-share', source_proxy, 'lock')
+        self.assertEqual([], os.listdir(src_mnt))
+
+    def _replicate(self, wait_side_effect=None, create_file=True):
+        clone_dir = os.path.join(self.mnt, 'clone-dst-vol-new')
+
+        def task(payload):
+            os.mkdir(clone_dir)
+            if create_file:
+                open(os.path.join(clone_dir, 'volume-src'), 'w').close()
+            return {'uuid': {'uuid': 'task-1'}}
+        source_proxy = mock.Mock()
+        source_proxy.virtual_machines.create.side_effect = task
+        self.configuration.vmstore_task_timeout = 10
+        self.configuration.vmstore_task_poll_interval = 1
+        with mock.patch.object(vmstore_nfs.utils, 'wait_for_task_completion',
+                               side_effect=wait_side_effect):
+            self.driver._replicate_and_clone_volume(
+                self.volume, self.snapshot, mock.Mock(nas_host='10.0.0.2'),
+                source_proxy, [{'id': 'repl-1'}], 'lock')
+        return clone_dir
+
+    def test_replication_success_moves_file(self):
+        clone_dir = self._replicate()
+        self.assertFalse(os.path.exists(clone_dir))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.mnt, 'volume-vol-new')))
+
+    def test_replication_missing_file_after_task_removes_dir(self):
+        self.assertRaises(api.VmstoreException, self._replicate,
+                          create_file=False)
+        self.assertEqual([], os.listdir(self.mnt))
+
+    def test_replication_task_not_finished_keeps_dir_and_logs_it(self):
+        """The array may still be writing: do not remove, ask for cleanup."""
+        with mock.patch.object(vmstore_nfs, 'LOG') as mock_log:
+            self.assertRaises(Exception, self._replicate,
+                              wait_side_effect=Exception('timeout'))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.mnt, 'clone-dst-vol-new')))
+        self.assertTrue(any(
+            c[0][1].get('dir', '').endswith('clone-dst-vol-new')
+            for c in mock_log.error.call_args_list
+            if len(c[0]) > 1 and isinstance(c[0][1], dict)))

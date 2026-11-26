@@ -133,10 +133,26 @@ class VmstoreCollections(object):
 
 
 class VmstoreClones(VmstoreCollections):
+    # ERR-API-3206 (CLONE_REQUEST_FAILED) is not retried: the array already
+    # retries a clone while its filesystem service is busy, and after a
+    # failed attempt the destination path may exist, so another request
+    # fails the same way (VMTS-225).
+    NO_RETRY_CODES = ('ERR-API-3206',)
+
     def __init__(self, proxy):
         super(VmstoreClones, self).__init__(proxy)
         self.root = 'cinder/clone'
         self.subj = 'Clones'
+
+    def create(self, payload=None):
+        LOG.debug('Create %(subj)s: %(payload)s',
+                  {'subj': self.subj, 'payload': payload})
+        try:
+            return self.proxy.post(self.root, payload,
+                                   no_retry_codes=self.NO_RETRY_CODES)
+        except VmstoreException as error:
+            if error.code != 'RESOURCE_EXIST':
+                raise
 
 
 class VmstoreVirtualDisks(VmstoreCollections):
@@ -299,8 +315,9 @@ class VmstoreProxy(object):
     def get(self, path, payload=None):
         return self._execute('get', path, payload)
 
-    def post(self, path, payload=None):
-        return self._execute('post', path, payload)
+    def post(self, path, payload=None, no_retry_codes=()):
+        return self._execute('post', path, payload,
+                             no_retry_codes=no_retry_codes)
 
     def delete(self, path, payload=None):
         return self._execute('delete', path, payload)
@@ -312,12 +329,12 @@ class VmstoreProxy(object):
     # Execution engine
     # ------------------------------------------------------------------
 
-    def _execute(self, method, path, payload=None):
+    def _execute(self, method, path, payload=None, no_retry_codes=()):
         """Retry loop: up to retries+1 attempts with backoff and session refresh.
 
         On each failure the error is logged and the session is refreshed before
         the next attempt. After exhausting all attempts the last exception is
-        re-raised.
+        re-raised. An error whose code is in no_retry_codes is raised at once.
         """
         last_error = None
         info = '%s %s' % (method.upper(), self.url(path))
@@ -332,6 +349,8 @@ class VmstoreProxy(object):
             except VmstoreException as exc:
                 last_error = exc
                 LOG.error('Failed %s: %s', info, exc)
+                if exc.code in no_retry_codes:
+                    raise
         LOG.error('Reached maximum %s retries for %s: %s',
                   self.retries, info, last_error)
         raise last_error or VmstoreException(

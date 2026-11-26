@@ -14,6 +14,7 @@
 
 """VMstore NFS Volume Driver for Cinder."""
 
+import functools
 import hashlib
 import os
 import re
@@ -126,6 +127,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                  - [VMTS-252]: Detached extend no longer trusts the recorded
                     format, which is qcow2 for volumes created from an
                     image; copy_image_to_volume now records raw.
+                 - [VMTS-225]: A failed volume-from-snapshot or clone no
+                    longer leaves its temporary clone directory on the
+                    array, where it counted as a clone reference and blocked
+                    deleting the snapshot (ERR-API-3107). DB reads such as
+                    snapshot['volume_name'] happen before the clone request,
+                    and any failure from the request to the rename removes
+                    the directory. Clone requests are not retried on
+                    ERR-API-3206: the array has already retried them.
 
     """
 
@@ -1104,40 +1113,26 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             {'snap': snapshot['name'], 'path': clone_path,
             'src': source_config.nas_host, 'lock': lock_key})
 
-        # Use SOURCE proxy to create the clone (must be on same VMstore as snapshot)
-        source_proxy.clones.create(payload)
-
-        # Now move the clone from source share to destination share
+        # Resolve the paths before the clone exists on the array (VMTS-225):
+        # snapshot['volume_name'] is lazy-loaded from the database.
         source_mount_dir = self._get_mount_point_for_share(source_share)
         dest_mount_dir = self._get_mount_point_for_share(dest_share)
-
-        # Source clone paths
         source_temp_clone_dir = os.path.join(source_mount_dir, clone_name)
         source_temp_clone_path = os.path.join(source_temp_clone_dir,
-                                            snapshot['volume_name'])
-
-        # Destination path
+                                              snapshot['volume_name'])
         dest_volume_path = os.path.join(dest_mount_dir, volume['name'])
 
         LOG.info(
-            'Moving clone from source %(src)s to destination %(dst)s',
+            'Cloning on source and moving %(src)s to destination %(dst)s',
             {'src': source_temp_clone_path, 'dst': dest_volume_path})
 
-        # Move/copy the clone from source to destination. The source and
-        # destination shares are separate NFS mounts (different filesystems),
-        # so os.rename would raise EXDEV (Errno 18: Invalid cross-device link).
-        # shutil.move falls back to copy+delete across filesystems.
-        try:
-            shutil.move(source_temp_clone_path, dest_volume_path)
-            os.rmdir(source_temp_clone_dir)
-        except OSError as exc:
-            LOG.error(
-                'Failed to rename clone from %(src)s to %(dst)s: %(err)s — '
-                'attempting cleanup of temp directory %(dir)s',
-                {'src': source_temp_clone_path, 'dst': dest_volume_path,
-                'err': exc, 'dir': source_temp_clone_dir})
-            shutil.rmtree(source_temp_clone_dir, ignore_errors=True)
-            raise
+        # Clone on the SOURCE proxy (same VMstore as the snapshot), then move
+        # the file. The two shares are separate NFS mounts, so os.rename would
+        # raise EXDEV; shutil.move falls back to copy and delete.
+        self._clone_and_move(
+            functools.partial(source_proxy.clones.create, payload),
+            source_temp_clone_dir, source_temp_clone_path, dest_volume_path,
+            move=shutil.move)
 
         LOG.info(
             'Successfully moved clone from %(src)s to %(dst)s with lock %(lock)s',
@@ -1190,6 +1185,16 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             }
         }
 
+        # Resolve the paths before the array starts writing the clone
+        # (VMTS-225): snapshot['volume_name'] is lazy-loaded from the database.
+        # The local NFS mount already points at the share, so the clone is
+        # visible directly under it as clone_dir_name.
+        dest_mount_dir = self._get_mount_point_for_share(self._get_share_path())
+        dest_clone_dir = os.path.join(dest_mount_dir, clone_dir_name)
+        dest_cloned_file_path = os.path.join(dest_clone_dir,
+                                             snapshot['volume_name'])
+        dest_volume_path = os.path.join(dest_mount_dir, volume['name'])
+
         LOG.debug(
             'Creating remote clone from snapshot %(snap)s to %(path)s '
             'using replication path %(repl_path_id)s with lock %(lock)s)',
@@ -1202,43 +1207,98 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         LOG.debug('Remote clone task created: %s', task_id)
 
-        # Wait for the task to complete
+        # Wait for the task to complete. If it does not, the array may still
+        # be writing the directory, so it is not removed here.
         timeout = self.configuration.vmstore_task_timeout
         poll_interval = self.configuration.vmstore_task_poll_interval
-        utils.wait_for_task_completion(
-            source_proxy, task_id, timeout, poll_interval)
+        try:
+            utils.wait_for_task_completion(
+                source_proxy, task_id, timeout, poll_interval)
+        except Exception as exc:
+            LOG.error('Remote clone task %(task)s for volume %(vol)s did not '
+                      'complete: %(err)s. Once the task has ended, remove '
+                      '%(dir)s from the share if it is still there.',
+                      {'task': task_id, 'vol': volume.id, 'err': exc,
+                       'dir': dest_clone_dir})
+            raise
 
         LOG.debug('Remote clone task %s completed successfully', task_id)
 
-        # Make sure that the destination directory exists on the destination backend
-        # and contains exactly one file. The local NFS mount already points at the
-        # share (e.g. /tintri/cinder), so the clone is visible directly under it
-        # using clone_dir_name, without the datastore-root subdir prefix.
-        dest_mount_dir = self._get_mount_point_for_share(self._get_share_path())
-        dest_clone_dir = os.path.join(dest_mount_dir, clone_dir_name)
-        dest_cloned_file_path = os.path.join(dest_clone_dir, snapshot['volume_name'])
-        if not os.path.exists(dest_cloned_file_path):
-            msg = f'Destination clone directory {dest_clone_dir} does not exist or'
-            f' does not contain the cloned file {snapshot["volume_name"]}'
-            LOG.error(msg)
-            raise api.VmstoreException(code='CloneFailed', message=msg)
+        # The task has ended: move the cloned file into place, and remove the
+        # directory if anything fails from here on.
+        def check_cloned_file():
+            if not os.path.exists(dest_cloned_file_path):
+                raise api.VmstoreException(
+                    code='CloneFailed',
+                    message=(f'Destination clone directory {dest_clone_dir} '
+                             f'does not exist or does not contain the cloned '
+                             f'file {os.path.basename(dest_cloned_file_path)}'))
 
-        # Rename the file in the destination clone directory to the volume name
-        dest_volume_path = os.path.join(dest_mount_dir, volume['name'])
-        try:
-            os.rename(dest_cloned_file_path, dest_volume_path)
-            os.rmdir(dest_clone_dir)
-        except OSError as exc:
-            LOG.error(
-                'Failed to rename clone from %(src)s to %(dst)s: %(err)s',
-                {'src': dest_cloned_file_path, 'dst': dest_volume_path,
-                 'err': exc})
-            raise
+        self._clone_and_move(check_cloned_file, dest_clone_dir,
+                             dest_cloned_file_path, dest_volume_path)
 
         LOG.debug(
             'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
             {'src': dest_cloned_file_path, 'dst': dest_volume_path,
             'lock': lock_key})
+
+    def _clone_and_move(self, create_clone, temp_clone_dir: str,
+                        temp_clone_path: str, destination: str,
+                        move=None) -> None:
+        """Create a clone in a temporary directory and move its file into place.
+
+        If anything fails, from the clone request to the move, the temporary
+        directory is removed before the error is raised: while it exists the
+        array counts it as a clone of the snapshot and refuses to delete the
+        snapshot (ERR-API-3107, VMTS-225). Once the file is in place, failing
+        to remove the then empty directory does not fail the create.
+
+        :param create_clone: callable that makes the array create the clone
+        :param temp_clone_dir: local path of the temporary clone directory
+        :param temp_clone_path: local path of the cloned file in that directory
+        :param destination: local path the file is moved to
+        :param move: function that moves temp_clone_path to destination
+                     (default os.rename)
+        """
+        try:
+            create_clone()
+            (move or os.rename)(temp_clone_path, destination)
+        except Exception as exc:
+            LOG.error('Creating %(dst)s from a clone in %(dir)s failed: '
+                      '%(err)s', {'dst': destination, 'dir': temp_clone_dir,
+                                  'err': exc})
+            self._discard_temp_clone_dir(temp_clone_dir, exc)
+            raise
+        try:
+            os.rmdir(temp_clone_dir)
+        except OSError as exc:
+            LOG.warning('Could not remove the temporary clone directory '
+                        '%(dir)s after moving its file to %(dst)s: %(err)s',
+                        {'dir': temp_clone_dir, 'dst': destination,
+                         'err': exc})
+
+    @staticmethod
+    def _discard_temp_clone_dir(temp_clone_dir: str, error) -> None:
+        """Remove the temporary clone directory of a failed create.
+
+        :param temp_clone_dir: local path of the temporary clone directory
+        :param error: the exception that made the create fail
+        """
+        if not os.path.lexists(temp_clone_dir):
+            return
+        try:
+            shutil.rmtree(temp_clone_dir)
+        except OSError as exc:
+            LOG.error('Could not remove the temporary clone directory '
+                      '%(dir)s after a failed create (%(err)s): %(rm_err)s. '
+                      'Remove it from the share: until then the array counts '
+                      'it as a clone of the snapshot and refuses to delete '
+                      'the snapshot.',
+                      {'dir': temp_clone_dir, 'err': error, 'rm_err': exc})
+            return
+        LOG.warning('Removed the temporary clone directory %(dir)s after a '
+                    'failed create: %(err)s',
+                    {'dir': temp_clone_dir, 'err': error})
 
     def _create_volume_from_snapshot_cross_backend(self, volume, snapshot,
                                                      source_config, source_share, lock_key):
@@ -1326,31 +1386,23 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'destinationPaths': clone_path,
         }
 
+        # Resolve everything that needs the database or the share before the
+        # clone exists on the array (VMTS-225): snapshot['volume_name'] is
+        # lazy-loaded from the database.
+        mount_dir = self._get_mount_point_for_share(self._get_share_path())
+        temp_clone_dir = os.path.join(mount_dir, clone_name)
+        temp_clone_path = os.path.join(temp_clone_dir, snapshot['volume_name'])
+        clone_destination = os.path.join(mount_dir, volume['name'])
+
         LOG.debug(
             'Creating clone from snapshot %(snap)s to %(path)s '
             'with lock %(lock)s',
             {'snap': snapshot['name'], 'path': clone_path, 'lock': lock_key})
 
         # Use current backend's proxy to create the clone
-        self.vmstore.clones.create(payload)
-
-        # File system operations (no lock needed for these)
-        mount_dir = self._get_mount_point_for_share(self._get_share_path())
-        temp_clone_dir = os.path.join(mount_dir, clone_name)
-        temp_clone_path = os.path.join(temp_clone_dir, snapshot['volume_name'])
-        clone_destination = os.path.join(mount_dir, volume['name'])
-
-        try:
-            os.rename(temp_clone_path, clone_destination)
-            os.rmdir(temp_clone_dir)
-        except OSError as exc:
-            LOG.error(
-                'Failed to rename clone from %(src)s to %(dst)s: %(err)s — '
-                'attempting cleanup of temp directory %(dir)s',
-                {'src': temp_clone_path, 'dst': clone_destination,
-                 'err': exc, 'dir': temp_clone_dir})
-            shutil.rmtree(temp_clone_dir, ignore_errors=True)
-            raise
+        self._clone_and_move(
+            functools.partial(self.vmstore.clones.create, payload),
+            temp_clone_dir, temp_clone_path, clone_destination)
 
         LOG.debug(
             'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
@@ -1458,29 +1510,19 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'destinationPaths': clone_path,
         }
 
-        LOG.debug(
-            'Creating clone from snapshot %(snap)s to %(path)s '
-            'with lock %(lock)s',
-            {'snap': clone_name, 'path': clone_path, 'lock': lock_key})
-        self.vmstore.clones.create(clone_payload)
-
-        # File system operations (no lock contention)
+        # Resolve the paths before the clone exists on the array (VMTS-225).
         mount_dir = self._get_mount_point_for_share(self._get_share_path())
         temp_clone_dir = os.path.join(mount_dir, clone_name)
         temp_clone_path = os.path.join(temp_clone_dir, src_name)
         clone_destination = os.path.join(mount_dir, volume['name'])
 
-        try:
-            os.rename(temp_clone_path, clone_destination)
-            os.rmdir(temp_clone_dir)
-        except OSError as exc:
-            LOG.error(
-                'Failed to rename clone from %(src)s to %(dst)s: %(err)s — '
-                'attempting cleanup of temp directory %(dir)s',
-                {'src': temp_clone_path, 'dst': clone_destination,
-                 'err': exc, 'dir': temp_clone_dir})
-            shutil.rmtree(temp_clone_dir, ignore_errors=True)
-            raise
+        LOG.debug(
+            'Creating clone from snapshot %(snap)s to %(path)s '
+            'with lock %(lock)s',
+            {'snap': clone_name, 'path': clone_path, 'lock': lock_key})
+        self._clone_and_move(
+            functools.partial(self.vmstore.clones.create, clone_payload),
+            temp_clone_dir, temp_clone_path, clone_destination)
         LOG.debug(
             'Clone renamed from %(src)s to %(dst)s with lock %(lock)s',
             {'src': temp_clone_path, 'dst': clone_destination,
