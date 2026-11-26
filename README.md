@@ -91,7 +91,7 @@ volume_backend_name = vmstore
 New volumes should be raw files. `vmstore_qcow2_volumes` is deprecated since 3.0.12 and will be removed; a backend with it set to `True` logs a warning at startup. VMstore takes snapshots and clones on the array and raw volumes are sparse files, so qcow2 adds nothing, while with qcow2 the format Cinder records can drift from the file and break VMs on their next migrate, resize or hard reboot.
 
 - **Switching an existing backend to `False`** only affects new volumes. Existing qcow2 volumes keep working side by side with raw ones.
-- **Avoid host-assisted volume migration of qcow2 volumes** until they are converted: Cinder's generic migration records and copies them wrongly.
+- **Volume migration (3.0.12):** moving a volume to a host that serves the same VMstore share copies nothing; the file stays and only the volume's host changes, so qcow2 volumes keep their format and record. To another share or array, a qcow2 file is refused (Cinder's generic copy would cut it), and a raw file is copied by Cinder only if the destination reports creating raw volumes. Do not use `--force-host-copy` for qcow2 volumes: it bypasses the driver.
 - **Converting existing qcow2 volumes to raw** is a separate, VMstore-side procedure, not part of the driver.
 
 Design and plan (deprecate, then raw enforced for new volumes, then removal): [ADR-0005](docs/adr/0005-raw-volumes-qcow2-deprecated.md).

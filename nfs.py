@@ -164,6 +164,14 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     removal; a backend with it set to True logs a warning
                     at startup. New volumes should be raw. Existing qcow2
                     volumes keep working with the option off (docs/adr/0005).
+                 - [VME-29]: migrate_volume. A move to a host serving the
+                    same VMstore share copies nothing: the file stays and
+                    Cinder only changes the volume's host, so a qcow2
+                    volume keeps its format and record. Elsewhere a qcow2
+                    file is refused instead of being cut by Cinder's
+                    generic byte copy, and a raw file is left to that copy
+                    only if the destination reports creating raw volumes
+                    (new pool capability vmstore_qcow2_volumes).
 
     """
 
@@ -808,6 +816,88 @@ class VmstoreNfsDriver(nfs.NfsDriver):
 
         return self._stats
 
+    def migrate_volume(self, context, volume, host):
+        """Move a volume to another backend host (VME-29).
+
+        Cinder calls this only for a volume without attachments; Nova copies
+        an attached one and keeps the guest's format. Without it, Cinder's
+        generic migration byte-copies the file into a volume the destination
+        creates, which cut qcow2 files at the volume size and left the
+        destination's qcow2 record on raw data (lab, 2026-11-19).
+
+        - Same VMstore share: the file stays where it is and nothing is
+          copied; Cinder only moves the volume to the other host. This is a
+          move between cinder-volume hosts serving one backend.
+        - Another share or array: a qcow2 file is refused, because the
+          generic copy would cut it. A raw file is left to the generic copy
+          only if the destination reports creating raw volumes
+          (vmstore_qcow2_volumes false); otherwise it is refused, because
+          the destination would record qcow2 for raw data.
+
+        Refusing ends the migration in error without any copy: Cinder does
+        not fall back to the generic copy when this raises. An administrator
+        can still force it with --force-host-copy, which bypasses drivers.
+
+        :param context: request context
+        :param volume: volume to move
+        :param host: destination; host['host'] is host@backend#pool and
+                     host['capabilities'] its reported capabilities
+        :returns: (moved, model_update)
+        """
+        caps = host.get('capabilities') or {}
+        dest_pool = volume_utils.extract_host(host['host'], level='pool')
+        here = (volume.provider_location or '').rstrip('/')
+        if (dest_pool and dest_pool.rstrip('/') == here
+                and caps.get('vendor_name') == self.vendor_name):
+            LOG.info('Volume %(vol)s stays on VMstore share %(share)s; '
+                     'moving it to %(host)s without copying.',
+                     {'vol': volume.id, 'share': here, 'host': host['host']})
+            return True, None
+
+        file_format = self._format_for_copy(volume)
+        if file_format != 'raw':
+            reason = _("volume %(vol)s is a %(fmt)s file, which Cinder's "
+                       "generic migration would cut at the volume size. "
+                       "Move it to a host serving the same VMstore share, "
+                       "or convert it to raw first.") % {
+                'vol': volume.id, 'fmt': file_format}
+        elif caps.get('vmstore_qcow2_volumes') is not False:
+            reason = _('destination %(host)s does not report creating raw '
+                       'volumes (vmstore_qcow2_volumes false, driver 3.0.12 '
+                       'or later), so it would record qcow2 for the raw '
+                       'data of volume %(vol)s.') % {
+                'host': host['host'], 'vol': volume.id}
+        else:
+            LOG.info('Volume %(vol)s is raw and %(host)s creates raw '
+                     "volumes; using Cinder's generic migration.",
+                     {'vol': volume.id, 'host': host['host']})
+            return False, None
+        LOG.error('Refusing to migrate volume %(vol)s to %(host)s: '
+                  '%(reason)s', {'vol': volume.id, 'host': host['host'],
+                                 'reason': reason})
+        raise exception.VolumeMigrationFailed(reason=reason)
+
+    def _format_for_copy(self, volume) -> str:
+        """Format of a volume's file, for deciding whether to byte-copy it.
+
+        Uses the same rule as extend: raw wins if the probe, the record or
+        an attachment says raw (a guest can write a qcow2 header into a raw
+        volume, never the reverse). Any doubt refuses the move.
+
+        :param volume: volume reference
+        :returns: 'raw' or the probed format
+        """
+        path = os.path.join(self._local_volume_dir(volume),
+                            self.get_active_image_from_info(volume))
+        try:
+            info = self._qemu_img_info(path, volume.name)
+        except Exception as error:
+            reason = _('cannot read the format of volume %(vol)s '
+                       '(%(err)s)') % {'vol': volume.id, 'err': error}
+            LOG.error('Refusing to migrate: %s', reason)
+            raise exception.VolumeMigrationFailed(reason=reason)
+        return self._volume_file_format(volume, info.file_format)
+
     def _update_volume_stats(self) -> None:
         LOG.info('VmstoreNfsDriver _update_volume_stats')
 
@@ -854,6 +944,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             'multiattach': False,
             'QoS_support': False,
             'online_extend_support': True,
+            # Format new volumes get here; migrate_volume on another backend
+            # reads it to decide whether a raw file may be byte-copied.
+            'vmstore_qcow2_volumes':
+                self.configuration.vmstore_qcow2_volumes is True,
             'consistencygroup_support': False,
             'consistent_group_snapshot_enabled': False,
         }
