@@ -28,6 +28,7 @@ from cinder.tests.unit import test
 from cinder.tests.unit.volume.drivers.vmstore import set_vmstore_overrides
 from cinder.volume.drivers.vmstore import api
 from cinder.volume.drivers.vmstore import nfs as vmstore_nfs
+from cinder.volume.drivers.vmstore import options as vmstore_options
 
 
 VMSTORE_CONFIG = {
@@ -171,6 +172,67 @@ class VmstoreNfsDriverTestCase(test.TestCase):
         driver._remotefsclient.mount.assert_called_once_with(
             '192.168.1.1:/tintri/test_share', [])
 
+
+class VmstoreNfsDriverQcow2DeprecationTestCase(test.TestCase):
+    """vmstore_qcow2_volumes is deprecated (VME-33): new volumes are raw.
+
+    Existing qcow2 volumes keep working (hybrid deployments), so 3.0.12
+    still honours the option, but says plainly that it is deprecated.
+    """
+
+    def setUp(self):
+        set_vmstore_overrides()
+        super().setUp()
+        self.configuration = mock.Mock()
+        for key, value in VMSTORE_CONFIG.items():
+            setattr(self.configuration, key, value)
+        self.configuration.nfs_mount_point_base = '/mnt/vmstore'
+        self.configuration.nfs_mount_options = None
+        self.configuration.reserved_percentage = 0
+        self.configuration.max_over_subscription_ratio = 1.0
+        self.configuration.nfs_sparsed_volumes = True
+        self.configuration.nfs_qcow2_volumes = False
+        self.configuration.vmstore_rest_retry_count = 1
+        self.configuration.safe_get = mock.Mock(return_value=None)
+
+    def _driver(self):
+        with mock.patch('os_brick.remotefs.remotefs.RemoteFsClient'), \
+                mock.patch.object(vmstore_nfs.VmstoreNfsDriver,
+                                  '_check_snapshot_support'):
+            return vmstore_nfs.VmstoreNfsDriver(
+                configuration=self.configuration)
+
+    def test_option_is_deprecated_for_removal(self):
+        opt = [o for o in vmstore_options.VMSTORE_NFS_OPTS
+               if o.name == 'vmstore_qcow2_volumes'][0]
+        self.assertTrue(opt.deprecated_for_removal)
+        self.assertIn('raw', opt.deprecated_reason)
+        self.assertFalse(opt.default)
+
+    @mock.patch.object(vmstore_nfs, 'LOG')
+    def test_setup_warns_when_qcow2_volumes_enabled(self, mock_log):
+        self.configuration.vmstore_qcow2_volumes = True
+        driver = self._driver()
+        with mock.patch.object(driver, '_validate_required_options'), \
+                mock.patch.object(driver, '_do_setup', return_value=True), \
+                mock.patch.object(driver, '_ensure_shares_mounted'):
+            driver.do_setup(mock.sentinel.ctxt)
+
+        warnings = [c[0][0] for c in mock_log.warning.call_args_list]
+        self.assertEqual(1, len(warnings))
+        self.assertIn('vmstore_qcow2_volumes', warnings[0])
+        self.assertIn('deprecated', warnings[0])
+
+    @mock.patch.object(vmstore_nfs, 'LOG')
+    def test_setup_does_not_warn_when_qcow2_volumes_disabled(self, mock_log):
+        self.configuration.vmstore_qcow2_volumes = False
+        driver = self._driver()
+        with mock.patch.object(driver, '_validate_required_options'), \
+                mock.patch.object(driver, '_do_setup', return_value=True), \
+                mock.patch.object(driver, '_ensure_shares_mounted'):
+            driver.do_setup(mock.sentinel.ctxt)
+
+        mock_log.warning.assert_not_called()
 
 class VmstoreNfsDriverDeleteVolumeTestCase(test.TestCase):
     """Test cases for delete_volume functionality."""
