@@ -135,18 +135,41 @@ judge() { # check, what passed
   if [ -n "$FAILS" ]; then result "$1" FAIL "$FAILS"
   else result "$1" PASS "$2${NOTES:+; not checked: $NOTES}"; fi; }
 
+backend_opt() { # ssh host, option -> "<value> <file>" for [BACKEND], else [backend_defaults]; empty if not set
+  on "$1" "bash -s -- '$CINDER_CONF_DIR' '$BACKEND' '$2'" <<'EOF' | tail -1
+d=$1; b=$2; opt=$3; sec=; def=
+for f in "$d"/*.conf; do   # oslo.config reads a config dir in sorted order; the last value wins
+  [ -f "$f" ] || continue
+  s=
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      \[*) s=${line#[}; s=${s%%]*}; s=$(printf '%s' "$s" | tr -d '[:space:]') ;;
+      *=*) k=$(printf '%s' "${line%%=*}" | tr -d '[:space:]')
+           [ "$k" = "$opt" ] || continue
+           v=$(printf '%s' "${line#*=}" | tr -d '[:space:]')
+           [ "$s" = "$b" ] && sec="$v $(basename "$f")"
+           [ "$s" = backend_defaults ] && def="$v $(basename "$f")[backend_defaults]" ;;
+    esac
+  done < "$f"
+done
+echo "${sec:-$def}"
+EOF
+}
+
+# Options of BACKEND on CINDER_SSH, read from its own section: other backends on the same
+# host often set them differently.
 QCOW2_OPT=?; NOVA_CHECK=?
 precheck() {
-  local bad=0 backend svc h o
+  local bad=0 svc h o
   echo "### precheck $(ts)"
   [ "$(cli "openstack token issue -f value -c id >/dev/null && echo ok")" = ok ] || { echo "  CLI or credentials not working on $CLI_SSH"; exit 2; }
   [[ "$(cli "openstack --os-volume-api-version $VOL_API volume type show $VOLUME_TYPE -f value -c id" | tail -1)" =~ $UUID_RE ]] ||
     { echo "  volume type $VOLUME_TYPE not found, or the CLI or Cinder does not accept API $VOL_API"; bad=1; }
-  backend=$(cli "openstack volume type show $VOLUME_TYPE -f json -c properties" | python3 -c 'import json, sys; print((json.load(sys.stdin).get("properties") or {}).get("volume_backend_name", ""))' 2>/dev/null)
-  backend=${backend:-$VOLUME_TYPE}
-  svc=$(cli "openstack volume service list --service cinder-volume -f value -c Host -c Status -c State" | grep "@$backend enabled up$")
-  if [ -n "$svc" ]; then echo "  cinder-volume enabled and up for $backend: $(awk '{print $1}' <<<"$svc" | paste -sd' ' -)"
-  else echo "  no cinder-volume service *@$backend enabled and up"; bad=1; fi
+  BACKEND=$(cli "openstack volume type show $VOLUME_TYPE -f json -c properties" | python3 -c 'import json, sys; print((json.load(sys.stdin).get("properties") or {}).get("volume_backend_name", ""))' 2>/dev/null)
+  BACKEND=${BACKEND:-$VOLUME_TYPE}
+  svc=$(cli "openstack volume service list --service cinder-volume -f value -c Host -c Status -c State" | grep "@$BACKEND enabled up$")
+  if [ -n "$svc" ]; then echo "  cinder-volume enabled and up for $BACKEND: $(awk '{print $1}' <<<"$svc" | paste -sd' ' -)"
+  else echo "  no cinder-volume service *@$BACKEND enabled and up"; bad=1; fi
   grep -q "^$SRC_COMPUTE_ID enabled up$" <<<"$(cli "openstack compute service list --service nova-compute -f value -c Host -c Status -c State")" ||
     { echo "  nova-compute $SRC_COMPUTE_ID is not enabled and up"; bad=1; }
   [ "$(cli "openstack image show $IMAGE_ID -f value -c status" | tail -1)" = active ] || { echo "  image $IMAGE_ID not active"; bad=1; }
@@ -155,11 +178,13 @@ precheck() {
   if [ -n "$CINDER_SSH" ]; then
     [ -n "$(on "$CINDER_SSH" "command -v qemu-io && command -v qemu-img && test -x $CINDER_VENV/bin/python && test -f $CINDER_VENV/cinder.env && echo ok" | grep -x ok)" ] ||
       { echo "  $CINDER_SSH lacks qemu-io, qemu-img, $CINDER_VENV/bin/python or $CINDER_VENV/cinder.env"; bad=1; }
-    # Only these two option lines are printed; nothing else is read from the config.
-    o=$(on "$CINDER_SSH" "grep -rhE '^[[:space:]]*(vmstore_qcow2_volumes|vmstore_online_extend_nova_check)[[:space:]]*=' $CINDER_CONF_DIR 2>/dev/null" | tr -d ' ')
-    QCOW2_OPT=$(sed -n 's/^vmstore_qcow2_volumes=//p' <<<"$o" | tail -1); QCOW2_OPT=${QCOW2_OPT:-default}
-    NOVA_CHECK=$(sed -n 's/^vmstore_online_extend_nova_check=//p' <<<"$o" | tail -1); NOVA_CHECK=${NOVA_CHECK:-default (True)}
-    echo "  $CINDER_SSH config: vmstore_qcow2_volumes=$QCOW2_OPT vmstore_online_extend_nova_check=$NOVA_CHECK"
+    # Only these two options are read from the config, and only for [BACKEND].
+    o=$(backend_opt "$CINDER_SSH" vmstore_qcow2_volumes); QCOW2_OPT=${o%% *}
+    echo "  [$BACKEND] vmstore_qcow2_volumes = ${o:-not set (driver default False)}"
+    QCOW2_OPT=${QCOW2_OPT:-False}
+    o=$(backend_opt "$CINDER_SSH" vmstore_online_extend_nova_check); NOVA_CHECK=${o%% *}
+    echo "  [$BACKEND] vmstore_online_extend_nova_check = ${o:-not set (driver default True)}"
+    NOVA_CHECK=${NOVA_CHECK:-True}
   else echo "  CINDER_SSH not set: E2, E3 and E4 will SKIP, E1 checks Cinder and the guest size only"; fi
   if [ -n "$SRC_COMPUTE_SSH" ]; then
     [ -n "$(on "$SRC_COMPUTE_SSH" "command -v virsh && echo ok" | grep -x ok)" ] || { echo "  $SRC_COMPUTE_SSH has no virsh"; bad=1; }
@@ -221,6 +246,12 @@ done
 host=$(vhost "$E1V"); BACKEND=${host#*@}; BACKEND=${BACKEND%%#*}
 v=$(running_version); echo "  backend $BACKEND, driver_version reported by cinder-volume: ${v:-unknown (cinder get-pools not available)}"
 E2F=$(finfo "$E2V" | cut -d' ' -f1); E3F=$(finfo "$E3V" | cut -d' ' -f1)
+case "$QCOW2_OPT" in True | true | TRUE | 1 | yes) WANT=qcow2 ;; "?") WANT=unknown ;; *) WANT=raw ;; esac
+if [ -n "$CINDER_SSH" ] && [ "$WANT" != unknown ] && [ "$E2F" != "$WANT" ]; then
+  echo "  WARNING: [$BACKEND] vmstore_qcow2_volumes = $QCOW2_OPT on $CINDER_SSH, but a new empty volume is a $E2F file (other hosts serving $BACKEND set differently?)"
+fi
+# Why E2 and E3 cannot run on this backend (they need a qcow2 volume), for their SKIP line.
+qcow2_skip() { echo "needs a qcow2 volume, and new empty volumes on $BACKEND are $1 files (vmstore_qcow2_volumes = $QCOW2_OPT); run again with the option on to cover it"; }
 
 if [ -n "$CINDER_SSH" ]; then
   echo "### $(ts) write pattern 0x5a ($PAT at offset 0) into $PREFIX-e1-raw and $PREFIX-e2-empty (test volumes, before attach)"
@@ -239,7 +270,7 @@ s=$(wait_server "$VM" ACTIVE); h=$(sfield "$VM" OS-EXT-SRV-ATTR:host); echo "  v
 
 echo "### E1 $(ts) in-use extend of a raw volume, 1 -> 2 GB"
 reset_check; f=$(finfo "$E1V"); n1=$(nameid "$E1V")
-if [ -z "$CINDER_SSH" ] && [ -z "$SRC_COMPUTE_SSH" ]; then result E1 SKIP "needs CINDER_SSH or SRC_COMPUTE_SSH"
+if [ -z "$CINDER_SSH" ] && [ -z "$SRC_COMPUTE_SSH" ]; then result E1 SKIP "nothing to check: needs CINDER_SSH (file and data) or SRC_COMPUTE_SSH (guest size) in the env file"
 elif [ "${f%% *}" != raw ] && [ "${f%% *}" != unchecked ]; then result E1 FAIL "not tested: file is ${f%% *}, expected raw"
 elif [ "$(attach "$E1V")" != in-use ]; then result E1 FAIL "not tested: attach did not end in-use"
 else
@@ -260,8 +291,8 @@ fi
 
 echo "### E2 $(ts) in-use extend of a qcow2 volume, 1 -> 2 GB (Nova resizes it)"
 reset_check; n2=$(nameid "$E2V")
-if [ -z "$CINDER_SSH" ]; then result E2 SKIP "needs CINDER_SSH to tell the file format"
-elif [ "$E2F" != qcow2 ]; then result E2 SKIP "empty volumes are $E2F files here (vmstore_qcow2_volumes=$QCOW2_OPT)"
+if [ -z "$CINDER_SSH" ]; then result E2 SKIP "needs CINDER_SSH in the env file to tell the file format"
+elif [ "$E2F" != qcow2 ]; then result E2 SKIP "$(qcow2_skip "$E2F")"
 elif [ "$(attach "$E2V")" != in-use ]; then result E2 FAIL "not tested: attach did not end in-use"
 else
   echo "  before: guest size $(gsize "$VM" "$n2")"
@@ -282,7 +313,7 @@ fi
 
 echo "### E4 $(ts) attach-time grow of a raw file smaller than its volume"
 reset_check
-if [ -z "$CINDER_SSH" ]; then result E4 SKIP "needs CINDER_SSH"
+if [ -z "$CINDER_SSH" ]; then result E4 SKIP "needs CINDER_SSH in the env file to shrink the test file and read its size"
 else
   P4=$(fpath "$E4V"); f=$(finfo "$E4V"); n4=$(nameid "$E4V")
   if [ "${f%% *}" != raw ] || [[ "$P4" != */volume-"$n4" ]]; then result E4 FAIL "not tested: file ${f%% *} at ${P4:-?}"
@@ -308,9 +339,9 @@ fi
 
 echo "### E3 $(ts) extend of a qcow2 volume whose instance is shut off, 1 -> 2 GB"
 reset_check; n3=$(nameid "$E3V")
-if [ -z "$CINDER_SSH" ]; then result E3 SKIP "needs CINDER_SSH to tell the file format"
-elif [ "$E3F" != qcow2 ]; then result E3 SKIP "empty volumes are $E3F files here (vmstore_qcow2_volumes=$QCOW2_OPT)"
-elif [[ "$NOVA_CHECK" =~ ^(False|false|0|no)$ ]]; then result E3 SKIP "vmstore_online_extend_nova_check=$NOVA_CHECK: the driver leaves the file to Nova"
+if [ -z "$CINDER_SSH" ]; then result E3 SKIP "needs CINDER_SSH in the env file to tell the file format"
+elif [ "$E3F" != qcow2 ]; then result E3 SKIP "$(qcow2_skip "$E3F")"
+elif [[ "$NOVA_CHECK" =~ ^(False|false|0|no)$ ]]; then result E3 SKIP "[$BACKEND] vmstore_online_extend_nova_check = $NOVA_CHECK: the driver leaves an offline qcow2 resize to Nova, so there is nothing of the driver to check"
 elif [ "$(attach "$E3V")" != in-use ]; then result E3 FAIL "not tested: attach did not end in-use"
 else
   P3=$(fpath "$E3V")

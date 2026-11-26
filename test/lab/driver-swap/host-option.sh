@@ -40,6 +40,18 @@ mkdir -p "$BK_ROOT" || die "cannot create $BK_ROOT"
 exec 9>"$SWAP_DIR/.lock"
 command -v flock >/dev/null && { flock -n 9 || die "another driver or option change is running on this host"; }
 
+# PCD's host agent stamps pf9_identifier_timestamp into every backend section each time it
+# applies the cluster blueprint, so a blueprint round trip (option off, then on again) leaves
+# only those lines different from the file as found. They are ignored when a file is
+# compared with its backup.
+STAMP='^[[:space:]]*pf9_identifier_timestamp[[:space:]]*='
+same_conf() { # backup, file -> 0 if equal apart from PCD's stamps
+  cmp -s "$1" "$2" && return 0
+  diff -q <(grep -vE "$STAMP" "$1") <(grep -vE "$STAMP" "$2") >/dev/null; }
+conf_state() { # backup, file -> how the file compares with the backup
+  if cmp -s "$1" "$2"; then echo "file now as before this change"
+  elif same_conf "$1" "$2"; then echo "file now as before this change, apart from PCD's pf9_identifier_timestamp"
+  else echo "file CHANGED since"; fi; }
 effective() { # section -> value and the file it comes from (sorted order, last wins), per file listing
   local f
   for f in "$CONF_DIR"/*.conf; do [ -f "$f" ] && "$PY" - "$f" "$1" "$OPT" <<'EOF'
@@ -146,7 +158,7 @@ rollback_options() {
     f=$(awk '$1 == "file" {print $2}' "$r"); bk=$(dirname "$r")
     case " $done_files " in *" $f "*) continue ;; esac
     done_files="$done_files $f"
-    if cmp -s "$bk/$(basename "$f")" "$f"; then say "$f already as found ($bk)"; continue; fi
+    if same_conf "$bk/$(basename "$f")" "$f"; then say "$f already as found ($bk): $(conf_state "$bk/$(basename "$f")" "$f")"; continue; fi
     cp -a "$f" "$BK_ROOT/before-rollback-$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$f")"
     cp -a "$bk/$(basename "$f")" "$f" && cmp -s "$bk/$(basename "$f")" "$f" || die "restore of $f failed: copy $bk by hand"
     say "restored $f from $bk"
@@ -161,14 +173,13 @@ status_options() {
   echo "option backups in $BK_ROOT:"
   for r in $(ls -1 "$BK_ROOT"/[0-9]*/RECORD 2>/dev/null | sort); do
     f=$(awk '$1 == "file" {print $2}' "$r"); bk=$(dirname "$r")
-    if cmp -s "$bk/$(basename "$f")" "$f"; then s="file now as before this change"; else s="file CHANGED since"; fi
-    echo "  $bk: $(awk '$1 == "section" {print "[" $2 "]"} $1 == "set" {print $2 "=" $3}' "$r" | paste -sd' ' -) in $f ($s)"
+    echo "  $bk: $(awk '$1 == "section" {print "[" $2 "]"} $1 == "set" {print $2 "=" $3}' "$r" | paste -sd' ' -) in $f ($(conf_state "$bk/$(basename "$f")" "$f"))"
   done
   local seen='' changed=''
   for r in $(ls -1 "$BK_ROOT"/[0-9]*/RECORD 2>/dev/null | sort); do   # first backup of each file = as found
     f=$(awk '$1 == "file" {print $2}' "$r")
     case " $seen " in *" $f "*) continue ;; esac
-    seen="$seen $f"; cmp -s "$(dirname "$r")/$(basename "$f")" "$f" || changed="$changed $f"
+    seen="$seen $f"; same_conf "$(dirname "$r")/$(basename "$f")" "$f" || changed="$changed $f"
   done
   if [ -z "$seen" ]; then echo "STATE: no option changed by this tool"
   elif [ -z "$changed" ]; then echo "STATE: PRE-TEST, every changed file matches its first backup:$seen"

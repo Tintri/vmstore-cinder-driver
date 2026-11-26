@@ -58,8 +58,10 @@ state() { echo "### $1 $(ts)"; shift; local id l
   for id in "$@"; do l=$(volrec "$id")
     echo "  $id record=$(field record "$l") file=$(finfo "$id") status=$(field status "$l") migration=$(field migration "$l") host=$(field host "$l")"
   done; }
-check_fill() { # qcow2 file path -> "check_rc=<n> pattern_failures=<n>"
-  on "$CINDER_SSH" "qemu-img check -U -f qcow2 '$1' >/dev/null 2>&1; echo check_rc=\$?; qemu-io -r -U -f qcow2 -c 'read -P 0x5a 0 512M' -c 'read -P 0x5a 512M 512M' '$1' 2>&1 | grep -c 'Pattern verification failed' | sed 's/^/pattern_failures=/'" | paste -sd' ' -; }
+check_fill() { # file path, raw|qcow2 -> "check_rc=<n> reads=<n>/2 pattern_failures=<n>" (raw has no metadata: check_rc=-)
+  on "$CINDER_SSH" "if [ '$2' = qcow2 ]; then qemu-img check -U -f qcow2 '$1' >/dev/null 2>&1; echo check_rc=\$?; else echo check_rc=-; fi
+    o=\$(qemu-io -r -U -f '$2' -c 'read -P 0x5a 0 512M' -c 'read -P 0x5a 512M 512M' '$1' 2>&1)
+    echo reads=\$(echo \"\$o\" | grep -c '^read 536870912/536870912 bytes')/2 pattern_failures=\$(echo \"\$o\" | grep -c 'Pattern verification failed')" | paste -sd' ' -; }
 disk_type() { # host ssh, vm, file name id -> libvirt driver type of that disk
   on "$1" "virsh dumpxml $2" | awk -v n="volume-$3" '/<driver name=.qemu. type=/ {match($0, /type=.[a-z0-9]+./); t = substr($0, RSTART + 6, RLENGTH - 7)} index($0, n) && /source file/ {print t; exit}'; }
 others() { # every server and volume not created by this run
@@ -147,10 +149,16 @@ DATA=$(cli "openstack volume create --image $IMAGE_ID --size 1 --type $VOLUME_TY
 FILL=$(cli "openstack volume create --size 1 --type $VOLUME_TYPE $PREFIX-filled -f value -c id" | tail -1)
 for v in $BOOT $DATA $FILL; do s=$(wait_vol "$v"); echo "  $v: $s"; [ "$s" = available ] || { echo "volume $v not available"; exit 2; }; done
 
-P=$(fpath "$FILL"); echo "### $(ts) fill $FILL with pattern 0x5a"
-on "$CINDER_SSH" "qemu-io -f qcow2 -c 'write -P 0x5a 0 512M' -c 'write -P 0x5a 512M 512M' '$P'" | sed 's/^/  /'
-echo "  before migration: $(check_fill "$P")"
-state "A. created (expected: image volume record raw / file raw; filled volume qcow2 / qcow2 larger than 1 GiB)" $BOOT $DATA $FILL
+# An empty volume is created in the backend's format (vmstore_qcow2_volumes): R2 fills and
+# checks it in that format, so it covers qcow2 backends and raw ones.
+FMT=$(finfo "$FILL" | cut -d' ' -f1)
+case "$FMT" in raw | qcow2) ;; *) echo "  $FILL file is $FMT, expected raw or qcow2"; exit 2 ;; esac
+P=$(fpath "$FILL"); echo "### $(ts) fill $FILL ($FMT file) with pattern 0x5a"
+on "$CINDER_SSH" "qemu-io -f $FMT -c 'write -P 0x5a 0 512M' -c 'write -P 0x5a 512M 512M' '$P'" | sed 's/^/  /'
+c=$(check_fill "$P" "$FMT"); echo "  before migration: $c"
+[[ "$c" == "check_rc="[0-]" reads=2/2 pattern_failures=0" ]] || { echo "  fill did not verify before the migration"; exit 2; }
+if [ "$FMT" = qcow2 ]; then w="qcow2 / qcow2 larger than 1 GiB"; else w="raw / raw 1 GiB"; fi
+state "A. created (expected: image volume record raw / file raw; filled volume $w)" $BOOT $DATA $FILL
 
 if [ $CINDER_ONLY = 0 ]; then
   echo "### $(ts) boot a VM from $PREFIX-boot on SRC"
@@ -172,10 +180,14 @@ state "B. after volume migration" $DATA $FILL
 l=$(volrec "$DATA"); f=$(finfo "$DATA"); r=$(field record "$l"); [ "$r" = None ] && r=raw  # no record means raw
 if [ "$r" = "${f%% *}" ]; then result R1 PASS "image volume record $r matches file ${f%% *} after migration"
 else result R1 FAIL "image volume record $r but file ${f%% *} after migration"; fi
-P=$(fpath "$FILL"); f=$(finfo "$FILL"); c=$(check_fill "$P")
-if [ "${f%% *}" = qcow2 ] && [ "${f##* }" -gt 1073741824 ] && [[ "$c" == "check_rc=0 pattern_failures=0" ]]; then
-  result R2 PASS "filled qcow2 intact after migration: ${f##* } bytes, $c"
-else result R2 FAIL "filled qcow2 after migration: ${f%% *} ${f##* } bytes, $c"; fi
+P=$(fpath "$FILL"); f=$(finfo "$FILL"); c=$(check_fill "$P" "$FMT"); ok=0
+if [ "$FMT" = qcow2 ]; then
+  [ "${f%% *}" = qcow2 ] && [ "${f##* }" -gt 1073741824 ] && [ "$c" = "check_rc=0 reads=2/2 pattern_failures=0" ] && ok=1
+else
+  [ "${f%% *}" = raw ] && [ "${f##* }" = 1073741824 ] && [ "$c" = "check_rc=- reads=2/2 pattern_failures=0" ] && ok=1
+fi
+if [ $ok = 1 ]; then result R2 PASS "filled $FMT volume intact after migration: ${f%% *} ${f##* } bytes, $c"
+else result R2 FAIL "filled $FMT volume after migration: ${f%% *} ${f##* } bytes, $c"; fi
 
 if [ $CINDER_ONLY = 0 ]; then
   echo "### $(ts) attach $PREFIX-data to the VM"

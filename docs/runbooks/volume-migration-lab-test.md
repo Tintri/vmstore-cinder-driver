@@ -12,7 +12,7 @@ plus the checks that came out of the investigation:
 | Check | What is verified |
 | --- | --- |
 | **R1** | A volume created from an image (raw file, recorded raw) still records `raw` after it is migrated to the other cinder-volume host. The generic migration creates the target as qcow2 (`vmstore_qcow2_volumes`) and the record swap carries that `qcow2` record onto the original volume ID. |
-| **R2** | A qcow2 volume filled with a known pattern is intact after migration: file larger than the virtual size, `qemu-img check` clean, every byte reads back. The copy uses the volume size as the `dd` count, which cuts off qcow2 data stored past the virtual size. |
+| **R2** | An empty volume filled with a known pattern is intact after migration. It is filled in the format the backend creates (`vmstore_qcow2_volumes`). qcow2: file larger than the virtual size, `qemu-img check` clean, every byte reads back; the generic copy uses the volume size as the `dd` count, which cuts off qcow2 data stored past the virtual size. raw: file exactly 1 GiB and every byte reads back. |
 | **R3** | Platform9's steps: boot-from-volume VM, attach the migrated image volume, live migrate the VM. Passes when the VM is ACTIVE on the destination and the volume is opened with its real file format. |
 | **R4** | Detached extend of the migrated image volume (1 to 2 GB). Fails when extend trusts a stale `qcow2` record on a raw file (`Image is not in qcow2 format`). |
 
@@ -64,8 +64,9 @@ setup problem (nothing tested).
 
 - `### precheck`: DST free placement memory and the machine type check.
 - `### A. created`: record and file of each volume before migration. Expected:
-  image volumes `record=raw file=raw`, the filled volume `record=qcow2 file=qcow2`
-  with more than 1073741824 bytes.
+  image volumes `record=raw file=raw`; the filled volume `record=qcow2 file=qcow2`
+  with more than 1073741824 bytes when the backend creates qcow2 volumes, `record=raw
+  file=raw` with exactly 1073741824 bytes when it creates raw ones.
 - `### B. after volume migration`: same fields after the generic migration, then
   `RESULT R1` and `RESULT R2`.
 - `### C. after live migration`: VM host, migration record, libvirt disk type against
