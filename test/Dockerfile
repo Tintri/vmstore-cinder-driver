@@ -11,16 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone OpenStack Cinder. Defaults to the release Platform9 PCD ships (2025.1;
-# upstream renamed stable/2025.1 to unmaintained/2025.1).
-# Override at build time with: docker compose build --build-arg CINDER_REF=master
-ARG CINDER_REF=unmaintained/2025.1
+# Clone OpenStack Cinder at a release tag, so a test run means the same thing
+# every time: branches move and get renamed (stable/2025.1 became
+# unmaintained/2025.1). Default 26.4.0 is the last 2025.1 release (same commit
+# as 2025.1-eom), the series Platform9 PCD is built on; bump it on purpose when
+# that base moves. CINDER_SERIES picks the upper-constraints file.
+# Override at build time, e.g. CINDER_REF=master CINDER_SERIES=master.
+ARG CINDER_REF=26.4.0
+ARG CINDER_SERIES=2025.1
 RUN git clone --depth 1 --branch ${CINDER_REF} \
     https://github.com/openstack/cinder /cinder
 
 # Install cinder test dependencies, pinned with the OpenStack upper-constraints
-# that match CINDER_REF, prefix dropped (unmaintained/2025.1 or stable/2025.1 ->
-# .../upper/2025.1, master -> .../upper/master).
+# of CINDER_SERIES (2025.1 -> .../upper/2025.1, master -> .../upper/master).
 # Without them pip resolves the newest libraries, which break older Cinder
 # branches (for example oslo.utils dropping secretutils.md5).
 # Set UPPER_CONSTRAINTS_URL to use a different constraints file.
@@ -31,7 +34,7 @@ RUN git clone --depth 1 --branch ${CINDER_REF} \
 # compatibility issue (AttributeError: get_requires_for_build_editable).
 WORKDIR /cinder
 ARG UPPER_CONSTRAINTS_URL=
-RUN UC="${UPPER_CONSTRAINTS_URL:-https://releases.openstack.org/constraints/upper/${CINDER_REF##*/}}" \
+RUN UC="${UPPER_CONSTRAINTS_URL:-https://releases.openstack.org/constraints/upper/${CINDER_SERIES}}" \
     && case "${CINDER_REF}" in master) ST="setuptools" ;; *) ST="setuptools<80" ;; esac \
     && echo "Using upper-constraints: ${UC}, ${ST}" \
     && pip install --no-cache-dir --upgrade pip \

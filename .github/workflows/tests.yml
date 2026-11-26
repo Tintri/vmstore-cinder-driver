@@ -33,9 +33,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cinder_ref: [unmaintained/2025.1, master]
+        include:
+          # Last 2025.1 release (the series PCD is built on); bump on purpose.
+          - cinder_ref: 26.4.0
+            cinder_series: '2025.1'
+          # Upstream drift early warning; do not make this a required check.
+          - cinder_ref: master
+            cinder_series: master
     env:
       CINDER_REF: ${{ matrix.cinder_ref }}
+      CINDER_SERIES: ${{ matrix.cinder_series }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
