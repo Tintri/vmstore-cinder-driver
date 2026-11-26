@@ -123,6 +123,15 @@ VMSTORE_PERF_OPTS = [
     cfg.IntOpt('vmstore_virtual_disk_retries',
                default=3,
                help='Number of retries for virtual disk lookup before failing.'),
+    cfg.IntOpt('vmstore_refresh_cooldown',
+               default=600,
+               min=0,
+               help='After a failed virtual disk lookup, refresh the '
+                    'hypervisor for that volume at most once per this many '
+                    'seconds; lookups still retry. Limits the refreshes '
+                    'sent for a volume that VMstore no longer associates '
+                    'with its file. 0 refreshes before every retry, as '
+                    'before 3.0.12.'),
     cfg.BoolOpt('vmstore_use_volume_locks',
                 default=True,
                 help='Use volume-level locks instead of backend-wide locks '

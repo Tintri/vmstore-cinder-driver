@@ -19,6 +19,7 @@ import shutil
 import tempfile
 from unittest import mock
 
+from oslo_utils import fixture as utils_fixture
 from oslo_utils import units
 
 from cinder import context
@@ -544,6 +545,152 @@ class VmstoreNfsDriverCreateSnapshotTestCase(test.TestCase):
         """Delete falls back to the name lookup for these snapshots."""
         self.assertIsNone(self._create_snapshot_with_response(None))
         self.assertIsNone(self._create_snapshot_with_response([]))
+
+
+class VmstoreNfsDriverVirtualDiskLookupTestCase(test.TestCase):
+    """Hypervisor refresh after a failed virtual-disk lookup (VME-34).
+
+    VMTS-279: a volume whose association is broken on VMstore was refreshed
+    twice per create_snapshot or clone attempt, 440 times an hour on one
+    deployment. A volume is now refreshed at most once per
+    vmstore_refresh_cooldown seconds; lookups still retry.
+    """
+
+    def setUp(self):
+        set_vmstore_overrides()
+        super().setUp()
+        self.configuration = mock.Mock()
+        for key, value in VMSTORE_CONFIG.items():
+            setattr(self.configuration, key, value)
+        self.configuration.vmstore_virtual_disk_retries = 3
+        self.configuration.vmstore_snapshot_poll_initial_delay = 0.5
+        self.configuration.vmstore_get_vd_timeout = 8
+        self.configuration.vmstore_refresh_cooldown = 600
+        self.configuration.nfs_mount_point_base = '/mnt/vmstore'
+        self.configuration.nfs_mount_options = None
+        self.configuration.reserved_percentage = 0
+        self.configuration.max_over_subscription_ratio = 1.0
+        self.configuration.nfs_sparsed_volumes = True
+        self.configuration.nfs_qcow2_volumes = False
+        self.configuration.safe_get = mock.Mock(return_value=None)
+        self.clock = self.useFixture(utils_fixture.TimeFixture())
+        self.mock_sleep = self._patch(vmstore_nfs.time, 'sleep')
+
+    def _patch(self, target, attribute):
+        patcher = mock.patch.object(target, attribute)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def _driver(self):
+        with mock.patch('os_brick.remotefs.remotefs.RemoteFsClient'), \
+                mock.patch.object(vmstore_nfs.VmstoreNfsDriver,
+                                  '_check_snapshot_support'), \
+                mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup'):
+            driver = vmstore_nfs.VmstoreNfsDriver(
+                configuration=self.configuration)
+        driver.vmstore = mock.Mock()
+        driver.vmstore.virtual_disk.get.return_value = None
+        self.mock_refresh = self._patch(driver, 'refresh_hypervisor')
+        return driver
+
+    @staticmethod
+    def _volume(volume_id='vol-1'):
+        volume = mock.MagicMock()
+        volume.id = volume_id
+        volume.__getitem__.side_effect = {
+            'name': 'volume-%s' % volume_id, 'id': volume_id}.__getitem__
+        return volume
+
+    def test_found_on_first_lookup_does_not_refresh(self):
+        driver = self._driver()
+        driver.vmstore.virtual_disk.get.return_value = [{'vmName': 'v'}]
+
+        self.assertEqual([{'vmName': 'v'}],
+                         driver._get_virtual_disk_with_retry(self._volume()))
+        self.mock_refresh.assert_not_called()
+
+    def test_failed_lookup_refreshes_once_and_still_retries(self):
+        driver = self._driver()
+        volume = self._volume()
+
+        self.assertIsNone(driver._get_virtual_disk_with_retry(volume))
+
+        self.assertEqual(3, driver.vmstore.virtual_disk.get.call_count)
+        self.mock_refresh.assert_called_once_with(volume)
+
+    def test_next_operation_inside_window_does_not_refresh(self):
+        driver = self._driver()
+        volume = self._volume()
+
+        driver._get_virtual_disk_with_retry(volume)
+        self.clock.advance_time_seconds(599)
+        driver._get_virtual_disk_with_retry(volume)
+
+        self.assertEqual(6, driver.vmstore.virtual_disk.get.call_count)
+        self.assertEqual(1, self.mock_refresh.call_count)
+
+    def test_refreshes_again_after_window(self):
+        driver = self._driver()
+        volume = self._volume()
+
+        driver._get_virtual_disk_with_retry(volume)
+        self.clock.advance_time_seconds(601)
+        driver._get_virtual_disk_with_retry(volume)
+
+        self.assertEqual(2, self.mock_refresh.call_count)
+
+    def test_found_disk_clears_window(self):
+        driver = self._driver()
+        volume = self._volume()
+        driver._get_virtual_disk_with_retry(volume)
+        driver.vmstore.virtual_disk.get.return_value = [{'vmName': 'v'}]
+        driver._get_virtual_disk_with_retry(volume)
+
+        driver.vmstore.virtual_disk.get.return_value = None
+        driver._get_virtual_disk_with_retry(volume)
+
+        self.assertEqual(2, self.mock_refresh.call_count)
+
+    def test_window_is_per_volume(self):
+        driver = self._driver()
+        first, second = self._volume('vol-1'), self._volume('vol-2')
+
+        driver._get_virtual_disk_with_retry(first)
+        driver._get_virtual_disk_with_retry(second)
+
+        self.assertEqual([mock.call(first), mock.call(second)],
+                         self.mock_refresh.call_args_list)
+
+    def test_zero_cooldown_refreshes_before_every_retry(self):
+        self.configuration.vmstore_refresh_cooldown = 0
+        driver = self._driver()
+        volume = self._volume()
+
+        driver._get_virtual_disk_with_retry(volume)
+        driver._get_virtual_disk_with_retry(volume)
+
+        self.assertEqual(4, self.mock_refresh.call_count)
+
+    def test_backoff_unchanged_when_refresh_is_skipped(self):
+        driver = self._driver()
+
+        driver._get_virtual_disk_with_retry(self._volume())
+
+        self.assertEqual([mock.call(0.5), mock.call(1.0)],
+                         self.mock_sleep.call_args_list)
+
+    @mock.patch.object(vmstore_nfs, 'LOG')
+    def test_failed_lookup_warns_with_volume_and_cause(self, mock_log):
+        driver = self._driver()
+
+        driver._get_virtual_disk_with_retry(self._volume('vol-9'))
+
+        self.assertEqual(1, mock_log.warning.call_count)
+        message = (mock_log.warning.call_args[0][0]
+                   % mock_log.warning.call_args[0][1])
+        self.assertIn('vol-9', message)
+        self.assertIn('LOG-VCACHE-0067', message)
+        self.assertIn('vmstore_refresh_cooldown', message)
 
 
 class VmstoreNfsDriverShareTestCase(test.TestCase):
