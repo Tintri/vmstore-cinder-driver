@@ -68,8 +68,14 @@ new_vol() { # name, create arguments -> volume ID
   [[ "$id" =~ $UUID_RE ]] || id=$(cli "openstack volume list --name $1 -f value -c ID" | head -1)
   echo "$id"; }
 extend() { # volume, new size in GB -> final status (in-use extend needs API 3.42)
+  local s
   cli "openstack --os-volume-api-version $VOL_API volume set --size $2 $1" | show >&2
-  wait_vol "$1"; }
+  s=$(wait_vol "$1")
+  # A refused extend (for example no backend with online extend support) is only visible
+  # as a Cinder user message on the volume: show the newest one as evidence.
+  cli "openstack --os-volume-api-version 3.3 volume message list -f value -c 'Resource UUID' -c 'Event ID' -c 'User Message'" |
+    grep -F "$1" | tail -1 | sed 's/^/  user message: /' >&2
+  echo "$s"; }
 # CLI output goes to stderr (still logged) so callers capture only the final status.
 attach() { cli "openstack server add volume $VM $1" | show >&2; wait_vol "$1"; }
 detach() { cli "openstack server remove volume $VM $1" | show >&2; wait_vol "$1"; }
