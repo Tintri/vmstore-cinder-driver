@@ -7,8 +7,10 @@
 #   host-option.sh rollback        restore every file changed by `set` from its oldest backup
 #   host-option.sh status <backend_section>
 #
-# Which file: PCD writes cinder.conf from the cluster blueprint, and a blueprint change
-# rewrites it and restarts cinder-volume, so a hand edit there can be overwritten. The
+# Which file: PCD writes cinder.conf from the cluster blueprint, and its host agent rewrites
+# it within seconds of a hand edit (seen 2026-11-26 on PCD 2026.8: 9 to 12 s). The script
+# waits OPTION_SETTLE_SECONDS (default 45) after the edit and stops without restarting if the
+# file changed; on PCD, change the option through the cluster blueprint. The
 # config directory is read in sorted order and the last value wins, so a value in
 # cinder_override.conf takes precedence over cinder.conf; whether the host agent also
 # rewrites cinder_override.conf is not known. The script therefore does not choose: pass
@@ -116,6 +118,17 @@ with open(path, 'w', encoding='utf-8') as f:   # same inode: owner and mode stay
     f.writelines(out)
 EOF
   say "changed lines:"; diff "$bk/$(basename "$file")" "$file" | sed 's/^/  /'
+  # PCD's host agent rewrites cinder.conf from the cluster blueprint within seconds of a
+  # hand edit (seen 2026-11-26: 9 to 12 s). Wait, then make sure the edit is still there.
+  local edited; edited=$(md5sum "$file" | cut -d' ' -f1)
+  sleep "${OPTION_SETTLE_SECONDS:-45}"
+  if [ "$(md5sum "$file" | cut -d' ' -f1)" != "$edited" ]; then
+    say "ABORT: $file was rewritten within ${OPTION_SETTLE_SECONDS:-45} s of the edit (PCD host agent):"
+    show_effective "$section"
+    say "nothing restarted. Change $OPT through the PCD cluster blueprint instead."
+    record "option $section $OPT=$value in $file REVERTED by the host agent, not restarted"
+    exit 1
+  fi
   show_effective "$section"
   if ! restart_and_wait; then
     cp -a "$bk/$(basename "$file")" "$file"; say "RESTORED $file after a failed start"

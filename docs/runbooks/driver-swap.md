@@ -60,8 +60,15 @@ Only this option can be changed. The edit changes the option's line in that sect
 it) and leaves the rest of the file byte for byte; the file is backed up first, and a failed
 restart restores it.
 
-**Which file.** PCD writes `cinder.conf` from the cluster blueprint, and a blueprint change
-rewrites it and restarts cinder-volume, so a hand edit can be overwritten. cinder-volume
+**On PCD, use the cluster blueprint.** Measured 2026-11-26 on PCD 2026.8 (Aug P2): PCD's
+host agent rewrote `cinder.conf` from the blueprint 9 to 12 seconds after a hand edit, before
+the restart, so cinder-volume came back with the old value. `host-option.sh` now waits
+`OPTION_SETTLE_SECONDS` (default 45) after its edit and stops without restarting if the file
+changed. Change `vmstore_qcow2_volumes` in the PCD cluster blueprint (it rewrites `cinder.conf`
+and restarts cinder-volume on the storage hosts, as customers do), and use `status` to confirm.
+
+**Which file, elsewhere.** A blueprint change rewrites `cinder.conf` and restarts
+cinder-volume, so a hand edit can be overwritten. cinder-volume
 reads the config directory in sorted order and the last value wins, so a value in
 `cinder_override.conf` takes precedence over `cinder.conf`. Whether PCD's host agent also
 rewrites `cinder_override.conf` is not known, so the tool does not choose: give `--file` (or
