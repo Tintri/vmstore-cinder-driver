@@ -16,7 +16,7 @@ listing confirms the snapshot is gone.
 | --- | --- |
 | **S1** | A new snapshot's `provider_id` equals the UUID of the one VMstore snapshot described `snapshot-<id>`. A normal delete then removes both. |
 | **S2** | The VMstore snapshot is deleted out of band (by the helper, through the driver's own client), then the Cinder snapshot is deleted. Passes when Cinder ends `deleted` and VMstore has no snapshot left. With VME-34 this is the path where VMstore answers NotFound and the driver lists again before reporting success. |
-| **S3** | Snapshot with a clone: volume from the snapshot, then delete the snapshot. Records Cinder's status, whether VMstore kept the snapshot, and the log line. Then deletes the clone and the parent. Passes when Cinder ended `deleted` and no VMstore snapshot is left once the clone and parent are gone; a leftover is reported as a leak. Behaviour with a live clone follows the decision in issue 05 (today: if VMstore refuses because of the clone, the driver logs a warning and Cinder marks the snapshot deleted). |
+| **S3** | Snapshot with a clone: volume from the snapshot, then delete the snapshot while the clone exists. From 3.0.12 VMstore refuses (ERR-API-3107), the driver raises SnapshotIsBusy and Cinder keeps the snapshot `available` with a user message; the script then deletes the clone, deletes the snapshot again (expected `deleted`), and deletes the parent. Passes when nothing is left on VMstore at the end and the snapshot was either refused and then deleted, or reported deleted without a leak. A VMstore snapshot left after the clone and parent are gone is reported as a leak. |
 | **S4** | A snapshot without `provider_id`, as created by 3.0.11: the helper clears `provider_id` on a new test snapshot, then Cinder deletes it. Passes when Cinder ends `deleted` and the VMstore snapshot is gone (found by name). For a real upgrade, see "S4 with a real upgrade". |
 
 ## Expected results
@@ -26,7 +26,7 @@ listing confirms the snapshot is gone.
 | 3.0.9 (measured 2026-11-26) | FAIL: `provider_id` not set | PASS: the name lookup finds nothing, delete is a no-op | FAIL: leak. VMstore refuses the delete because of the clone, the driver logs a warning and Cinder marks the snapshot deleted; the VMstore snapshot is still there after the clone and the parent are deleted | PASS: found by name |
 | 3.0.11 (from the code, not measured) | as 3.0.9 | as 3.0.9 | as 3.0.9 (same clone-refusal and parent cleanup code) | as 3.0.9 |
 | 3.0.12-beta before VME-34 | as 3.0.11 (same create and delete code) | as 3.0.11 | as 3.0.11 | as 3.0.11 |
-| 3.0.12 with VME-34 | PASS | PASS | FAIL until the clone-refusal path changes: VME-34 leaves it as it is (see VME-34 for the follow-up) | PASS |
+| 3.0.12 with VME-34 | PASS | PASS | PASS: refused as busy while the clone exists (snapshot stays `available`), deleted from Cinder and VMstore once the clone is gone | PASS |
 
 ## Prerequisites and access levels
 

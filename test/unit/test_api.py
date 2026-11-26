@@ -128,6 +128,14 @@ class VmstoreCollectionsTestCase(test.TestCase):
             self.collections.path('test_resource'), 'test_resource',
             no_retry_codes=('RESOURCE_NOT_FOUND',))
 
+    def test_snapshot_delete_does_not_retry_shared_snapshot(self):
+        """ERR-API-3107 (clones still use the snapshot) cannot succeed on retry."""
+        snapshots = api.VmstoreSnapshots(self.mock_proxy)
+        snapshots.delete('snap-uuid')
+        self.mock_proxy.delete.assert_called_once_with(
+            snapshots.path('snap-uuid'), 'snap-uuid',
+            no_retry_codes=('RESOURCE_NOT_FOUND', 'ERR-API-3107'))
+
 
 class VmstoreProxyTestCase(test.TestCase):
 

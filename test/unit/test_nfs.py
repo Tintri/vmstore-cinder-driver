@@ -269,9 +269,15 @@ class VmstoreNfsDriverSnapshotTestCase(test.TestCase):
     @mock.patch('os_brick.remotefs.remotefs.RemoteFsClient')
     @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, '_check_snapshot_support')
     @mock.patch.object(vmstore_nfs.VmstoreNfsDriver, 'do_setup')
-    def test_delete_snapshot_vm_present_logs_warning(
+    def test_delete_snapshot_vm_present_raises_snapshot_is_busy(
             self, mock_do_setup, mock_check_snapshot, mock_remotefs):
-        """Test delete_snapshot logs warning when VM is still present."""
+        """Clones still use the snapshot: refuse, do not report deleted.
+
+        Reporting success left the VMstore snapshot on the array for good
+        (lab, driver 3.0.9: still there after the clone and the parent
+        volume were deleted). SnapshotIsBusy makes Cinder keep the snapshot
+        available and tell the user to delete the dependent volumes first.
+        """
         driver = vmstore_nfs.VmstoreNfsDriver(configuration=self.configuration)
         driver.vmstore = mock.Mock()
         driver.vmstore.snapshots.list.return_value = [
@@ -281,12 +287,14 @@ class VmstoreNfsDriverSnapshotTestCase(test.TestCase):
         driver.vmstore.snapshots.delete.side_effect = error
 
         snapshot = mock.Mock()
+        snapshot.provider_id = None
         snapshot.__getitem__ = lambda s, key: {
             'name': 'test_snapshot',
             'volume_id': 'test-volume-id'
         }[key]
 
-        driver.delete_snapshot(snapshot)
+        self.assertRaises(exception.SnapshotIsBusy,
+                          driver.delete_snapshot, snapshot)
 
     # VME-34: snapshot delete NotFound handling and provider_id
 
@@ -371,15 +379,30 @@ class VmstoreNfsDriverSnapshotTestCase(test.TestCase):
         driver = self._driver()
         driver.vmstore.snapshots.list.return_value = self._listed()
         driver.vmstore.snapshots.delete.side_effect = api.VmstoreException(
-            code='ERR-API-3107', message='Snapshot is in use')
+            code='ERR-API-9999', message='Internal error')
 
         exc = self.assertRaises(api.VmstoreException,
                                 driver.delete_snapshot, self._snapshot())
 
-        self.assertEqual('ERR-API-3107', exc.code)
+        self.assertEqual('ERR-API-9999', exc.code)
         self.assertIn('snapshot-1', str(exc))
         self.assertIn('array-uuid-1', str(exc))
-        self.assertIn('Snapshot is in use', str(exc))
+        self.assertIn('Internal error', str(exc))
+
+    def test_delete_snapshot_shared_snapshot_raises_snapshot_is_busy(self):
+        """ERR-API-3107: clones or a clone directory still use it."""
+        driver = self._driver()
+        driver.vmstore.snapshots.list.return_value = self._listed()
+        driver.vmstore.snapshots.delete.side_effect = api.VmstoreException(
+            code='ERR-API-3107',
+            message='Cannot delete the shared snapshot because it has '
+                    'younger or older siblings')
+
+        exc = self.assertRaises(exception.SnapshotIsBusy,
+                                driver.delete_snapshot, self._snapshot())
+
+        self.assertIn('snapshot-1', str(exc))
+        driver.vmstore.snapshots.delete.assert_called_once()
 
     def test_delete_snapshot_lookup_not_found_raises_with_context(self):
         """A NotFound on the lookup cannot tell us the snapshot is gone."""

@@ -128,14 +128,18 @@ SNAPS=()
 cleanup() {
   echo "=== cleanup $(ts)"
   local ids id s a
-  # Snapshots first, then volumes created from a snapshot, then the source volumes.
-  ids=$(cli "openstack volume snapshot list --all-projects -f value -c ID -c Name" | awk -v p="^$PREFIX-" '$2 ~ p {print $1}')
-  for id in $ids; do s=$(wait_snap "$id")
-    [[ "$s" == error* ]] && { echo "  snapshot $id was $s, resetting to available (test snapshot)"; cli "openstack volume snapshot set --state available $id"; }
-    cli "openstack volume snapshot delete $id" | show
-  done
-  for id in $ids; do echo "  snapshot $id: $(wait_snap "$id")"; done
+  # Snapshots, then volumes created from a snapshot, then snapshots again (one that a
+  # clone kept busy can go now), then the source volumes.
+  del_snaps() { local ids id s
+    ids=$(cli "openstack volume snapshot list --all-projects -f value -c ID -c Name" | awk -v p="^$PREFIX-" '$2 ~ p {print $1}')
+    for id in $ids; do s=$(wait_snap "$id")
+      [[ "$s" == error* ]] && { echo "  snapshot $id was $s, resetting to available (test snapshot)"; cli "openstack volume snapshot set --state available $id"; }
+      cli "openstack volume snapshot delete $id" | show
+    done
+    for id in $ids; do echo "  snapshot $id: $(wait_snap "$id")"; done; }
+  del_snaps
   for pass in clone source; do
+    [ "$pass" = source ] && del_snaps
     ids=$(cli "openstack volume list --all-projects -f value -c ID -c Name" |
       awk -v p="^$PREFIX-" -v c="$pass" '$2 ~ p && (($2 ~ /-clone$/) == (c == "clone")) {print $1}')
     for id in $ids; do s=$(wait_vol "$id")
@@ -236,6 +240,9 @@ else
 fi
 
 echo "### S3 $(ts) snapshot with a clone, then delete"
+# 3.0.12: VMstore refuses (ERR-API-3107) while the clone exists and the driver raises
+# SnapshotIsBusy, so Cinder keeps the snapshot available; it deletes once the clone is
+# gone. Before 3.0.12 the driver reported success and the VMstore snapshot stayed.
 P3=$(new_vol "$PREFIX-s3-src" "--size 1 --type $VOLUME_TYPE"); s=
 [[ "$P3" =~ $UUID_RE ]] && s=$(wait_vol "$P3"); echo "  parent $P3: ${s:-create failed}"
 S3=
@@ -247,17 +254,28 @@ else
   if [ "$s" != available ]; then result S3 FAIL "not tested: volume from snapshot not available"
   else
     cli "openstack volume snapshot delete $S3" | show; s=$(wait_snap "$S3"); a=$(arr "$S3")
-    echo "  after snapshot delete: Cinder $s, VMstore [$a]"; logs_for "$S3"
-    if [ "$s" != deleted ]; then result S3 FAIL "snapshot delete ended $s (VMstore [$a])"
-    else
-      cli "openstack volume delete $C3" | show; c=$(wait_vol "$C3"); echo "  clone: $c"
-      cli "openstack volume delete $P3" | show; p=$(wait_vol "$P3"); echo "  parent: $p"
-      a2=$(arr "$S3"); echo "  after clone and parent deleted: VMstore [$a2]"
-      case "$a" in "") k="removed at delete" ;; error|unchecked) k="not checked at delete" ;; *) k="kept while the clone existed" ;; esac
-      if [ "$c" != deleted ] || [ "$p" != deleted ]; then result S3 FAIL "not tested: clone $c, parent $p"
-      elif [ "$a2" = unchecked ]; then result S3 PASS "Cinder deleted; VMstore not checked (no CINDER_SSH)"
-      elif [ -z "$a2" ]; then result S3 PASS "Cinder deleted; VMstore snapshot $k, gone after the clone and parent were deleted"
-      else result S3 FAIL "leak: VMstore snapshot $a2 remains after the clone and parent were deleted"; fi
+    echo "  delete while the clone exists: Cinder $s, VMstore [$a]"; logs_for "$S3"
+    m=$(cli "openstack --os-volume-api-version 3.3 volume message list -f value -c 'Resource UUID' -c 'User Message'" | awk -v r="$S3" '$1 == r {$1 = ""; print}' | head -1)
+    [ -n "$m" ] && echo "  user message:$m"
+    case "$s" in
+      available) k=refused ;;
+      deleted) k=reported-deleted ;;
+      *) k=other ;;
+    esac
+    cli "openstack volume delete $C3" | show; c=$(wait_vol "$C3"); echo "  clone: $c"
+    s2=$s
+    if [ "$k" = refused ]; then
+      cli "openstack volume snapshot delete $S3" | show; s2=$(wait_snap "$S3")
+      echo "  delete after the clone is gone: Cinder $s2, VMstore [$(arr "$S3")]"
     fi
+    cli "openstack volume delete $P3" | show; p=$(wait_vol "$P3"); echo "  parent: $p"
+    a2=$(arr "$S3"); echo "  after clone and parent deleted: VMstore [$a2]"
+    if [ "$k" = other ]; then result S3 FAIL "delete while the clone exists ended $s (expected available: refused as busy)"
+    elif [ "$c" != deleted ] || [ "$p" != deleted ]; then result S3 FAIL "not tested: clone $c, parent $p"
+    elif [ "$k" = refused ] && [ "$s2" != deleted ]; then result S3 FAIL "refused while the clone existed, but the delete after it ended $s2"
+    elif [ "$a2" = unchecked ]; then result S3 PASS "Cinder: $k while the clone existed, then deleted; VMstore not checked (no CINDER_SSH)"
+    elif [ -n "$a2" ]; then result S3 FAIL "leak: VMstore snapshot $a2 remains after the clone and parent were deleted (Cinder: $k while the clone existed)"
+    elif [ "$k" = refused ]; then result S3 PASS "refused as busy while the clone existed, deleted from Cinder and VMstore after it"
+    else result S3 PASS "reported deleted while the clone existed; VMstore snapshot gone after the clone and parent were deleted"; fi
   fi
 fi
