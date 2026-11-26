@@ -1,0 +1,166 @@
+name: tests
+
+# Unit and functional tests in the Docker harness, flake8 on changed lines, and
+# static checks of the lab scripts. Runs on every pull request and on pushes to
+# the long-lived branches. Needs no secrets. Never switch this to
+# pull_request_target: it would run PR code with a privileged token.
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - 3.0.12-beta
+      - '3.0.*'
+
+permissions:
+  contents: read
+
+# Explicit bash runs steps with -eo pipefail; the implicit default is bash -e
+# only, which would let "docker compose run ... | tee" pass on test failures.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    name: harness (${{ matrix.cinder_ref }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cinder_ref: [stable/2025.1, master]
+    env:
+      CINDER_REF: ${{ matrix.cinder_ref }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No Docker layer cache on purpose: the image is built from a fresh
+      # shallow clone of Cinder and the newest upstream constraints, so a
+      # cache would hide upstream drift, which is what the master leg is for.
+      - name: Build harness image
+        run: docker compose -p harness -f test/docker-compose.yml build tests
+
+      - name: Run unit and functional tests
+        run: |
+          mkdir -p artifacts
+          docker compose -p harness -f test/docker-compose.yml run --rm -T tests all 2>&1 \
+            | tee artifacts/harness.log
+
+      - name: Summarize results
+        if: always()
+        run: |
+          {
+            echo "### Harness, Cinder \`$CINDER_REF\`"
+            echo '```'
+            grep -E '^ - (Passed|Failed|Skipped)|^(Unit|Functional) tests:' artifacts/harness.log || echo 'no result lines found'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: harness-log-${{ strategy.job-index }}
+          path: artifacts/harness.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  lint:
+    name: lint (flake8, changed lines)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PUSH_BEFORE_SHA: ${{ github.event.before }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Check out with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick base commit
+        id: base
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+          fi
+          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+            echo "::notice::New branch, no previous commit to diff against; lint skipped."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "::notice::Base commit $base is not in the history (force push?); lint skipped."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "base=$base" >> "$GITHUB_OUTPUT"
+          fi
+
+      # flake8 runs inside the harness image so that import-order checks see
+      # the driver under cinder/volume/drivers/vmstore, as in production.
+      - name: Build harness image
+        if: steps.base.outputs.skip == 'false'
+        run: docker compose -p lint -f test/docker-compose.yml build tests
+
+      - name: flake8 on changed lines
+        if: steps.base.outputs.skip == 'false'
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+        run: |
+          mapfile -t files < <(python3 tools/ci/flake8_changed_lines.py --base "$BASE" --list-container-paths)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No driver or test Python files changed."
+            echo "No driver or test Python files changed, flake8 not run." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf 'Linting: %s\n' "${files[@]}"
+          rc=0
+          docker compose -p lint -f test/docker-compose.yml run --rm -T \
+            -v "$PWD/tox.ini:/tmp/tox.ini:ro" --entrypoint sh tests -c '
+              python -m flake8 --version >/dev/null 2>&1 \
+                && python -c "import flake8_import_order, hacking" 2>/dev/null \
+                || pip install -q "flake8>=6.0.0" "hacking>=6.0.0" "flake8-import-order>=0.18"
+              python -m flake8 --config /tmp/tox.ini --no-show-source "$@"
+            ' sh "${files[@]}" > flake8.out || rc=$?
+          cat flake8.out
+          # flake8 exits 1 when it finds anything; a failure with no findings is a tool error.
+          if [ "$rc" -ne 0 ] && ! grep -qE '^[^ ]+:[0-9]+:[0-9]+: ' flake8.out; then
+            echo "::error::flake8 failed without reporting findings (exit $rc)"
+            exit 1
+          fi
+          python3 tools/ci/flake8_changed_lines.py --base "$BASE" --flake8-output flake8.out
+
+  lab-scripts:
+    name: lab scripts (static checks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: bash -n
+        run: |
+          find test/lab -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
+
+      # shellcheck is preinstalled on GitHub's ubuntu runners.
+      - name: shellcheck (errors only)
+        run: |
+          shellcheck --version
+          find test/lab -name '*.sh' -print0 | xargs -0 -r shellcheck --severity=error
+
+      - name: py_compile
+        run: |
+          find test/lab -name '*.py' -print0 | xargs -0 -r python3 -m py_compile
