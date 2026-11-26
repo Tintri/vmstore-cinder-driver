@@ -454,8 +454,10 @@ flip_create() {
   [ "$r" = ok ] || { not_run C2 "Boot VM from an image volume" "boot volume $r"; return; }
   VM=$(boot_vol "$PREFIX-flip-vm" "$B" "$SRC_COMPUTE_ID"); r=$(op_vm "${VM:-none}" ACTIVE)
   row C2 "Boot VM from an image volume" "$r" "$B" "$VM"; [ "$r" = ok ] || return
-  row C3 "Attach the empty volume" "$(attach "$VM" "$E")" "$E" "$VM"
-  [ "$RC" = 0 ] || return
+  r=$(attach "$VM" "$E"); row C3 "Attach the empty volume" "$r" "$E" "$VM"
+  # Keep the objects whenever the operations worked: a format verdict (C2 drifts on drivers
+  # before 3.0.12, which record qcow2 for image volumes) is a finding, not a reason to stop.
+  [ "$r" = ok ] || return
   {
     echo "VM=$VM"; echo "B=$B"; echo "E=$E"; echo "FLV=$FLV"; echo "CREATE_OPTS='$OPTS'"; echo "CREATE_DRV='$DRV'"
     printf 'CREATE_ROWS=(); '; for r in ${ROWS[@]+"${ROWS[@]}"}; do printf 'CREATE_ROWS+=(%q); ' "$r"; done; echo
