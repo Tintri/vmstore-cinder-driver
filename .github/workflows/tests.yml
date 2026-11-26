@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cinder_ref: [stable/2025.1, master]
+        cinder_ref: [unmaintained/2025.1, master]
     env:
       CINDER_REF: ${{ matrix.cinder_ref }}
     steps:

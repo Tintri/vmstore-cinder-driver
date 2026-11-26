@@ -166,7 +166,7 @@ functional suites.
 
 The container build does the following:
 
-- Clones the `cinder` repository into the image, at `stable/2025.1` by default (the release Platform9 PCD ships).
+- Clones the `cinder` repository into the image, at `unmaintained/2025.1` by default (2025.1, the release Platform9 PCD ships; upstream renamed `stable/2025.1` to `unmaintained/2025.1`).
 - Installs Cinder test dependencies inside the image, pinned with the matching OpenStack upper-constraints.
 - Copies the driver code from this repository into the cloned Cinder tree.
 - Copies the VMstore unit and functional tests into the cloned Cinder tree.

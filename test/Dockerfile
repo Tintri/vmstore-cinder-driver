@@ -1,4 +1,4 @@
-# Python 3.12 satisfies both stable/2025.1 (3.9 to 3.12) and current Cinder
+# Python 3.12 satisfies both 2025.1 (3.9 to 3.12) and current Cinder
 # master (3.11 or later).
 FROM python:3.12-slim
 
@@ -11,14 +11,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone OpenStack Cinder. Defaults to the release Platform9 PCD ships;
-# override at build time with: docker compose build --build-arg CINDER_REF=master
-ARG CINDER_REF=stable/2025.1
+# Clone OpenStack Cinder. Defaults to the release Platform9 PCD ships (2025.1;
+# upstream renamed stable/2025.1 to unmaintained/2025.1).
+# Override at build time with: docker compose build --build-arg CINDER_REF=master
+ARG CINDER_REF=unmaintained/2025.1
 RUN git clone --depth 1 --branch ${CINDER_REF} \
     https://github.com/openstack/cinder /cinder
 
 # Install cinder test dependencies, pinned with the OpenStack upper-constraints
-# that match CINDER_REF (stable/2025.1 -> .../upper/2025.1, master -> .../upper/master).
+# that match CINDER_REF, prefix dropped (unmaintained/2025.1 or stable/2025.1 ->
+# .../upper/2025.1, master -> .../upper/master).
 # Without them pip resolves the newest libraries, which break older Cinder
 # branches (for example oslo.utils dropping secretutils.md5).
 # Set UPPER_CONSTRAINTS_URL to use a different constraints file.
@@ -29,7 +31,7 @@ RUN git clone --depth 1 --branch ${CINDER_REF} \
 # compatibility issue (AttributeError: get_requires_for_build_editable).
 WORKDIR /cinder
 ARG UPPER_CONSTRAINTS_URL=
-RUN UC="${UPPER_CONSTRAINTS_URL:-https://releases.openstack.org/constraints/upper/${CINDER_REF#stable/}}" \
+RUN UC="${UPPER_CONSTRAINTS_URL:-https://releases.openstack.org/constraints/upper/${CINDER_REF##*/}}" \
     && case "${CINDER_REF}" in master) ST="setuptools" ;; *) ST="setuptools<80" ;; esac \
     && echo "Using upper-constraints: ${UC}, ${ST}" \
     && pip install --no-cache-dir --upgrade pip \
