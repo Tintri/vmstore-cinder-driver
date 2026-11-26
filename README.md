@@ -76,7 +76,8 @@ vmstore_qcow2_volumes = False
 |`vmstore_online_extend_nova_check`|Boolean|`True`|no|When extending an attached qcow2 volume, ask Nova whether every attached instance is shut off and, if so, resize the file in the driver. Requires the `[nova]` section credentials. If disabled, attached qcow2 volumes are always left to Nova to resize.|
 |`vmstore_nova_api_timeout`|Int|`30`|no|Timeout in seconds for the Nova API call used by `vmstore_online_extend_nova_check`.|
 |`vmstore_get_vd_timeout`|Int|`8`|no|Maximum time in seconds to wait for a single virtual disk lookup attempt.|
-|`vmstore_virtual_disk_retries`|Int|`3`|no|Number of retries for virtual disk lookup before failing. Each retry triggers a hypervisor refresh and uses exponential backoff.|
+|`vmstore_virtual_disk_retries`|Int|`3`|no|Number of retries for virtual disk lookup before failing. Retries use exponential backoff; a failed lookup triggers a hypervisor refresh, limited by `vmstore_refresh_cooldown`.|
+|`vmstore_refresh_cooldown`|Int|`600`|no|After a failed virtual disk lookup, refresh the hypervisor for that volume at most once per this many seconds; lookups still retry. `0` refreshes before every retry, as before 3.0.12.|
 |`vmstore_snapshot_poll_timeout`|Int|`30`|no|Maximum total time in seconds to poll for a snapshot to appear in the VMstore index after creation.|
 |`vmstore_snapshot_poll_initial_delay`|Float|`0.5`|no|Initial delay in seconds between snapshot poll attempts. Doubles on each retry up to `vmstore_snapshot_max_delay`.|
 |`vmstore_snapshot_max_delay`|Float|`12.0`|no|Cap in seconds on the exponential backoff delay for snapshot polling.|
@@ -91,10 +92,11 @@ After a volume or snapshot is created, VMstore may take a moment to populate its
 
 #### Virtual disk rediscovery
 
-When a create or clone operation completes, the driver queries VMstore for the resulting virtual disk. If it is not yet visible, the driver fires a hypervisor refresh and retries with exponential backoff:
+When a create or clone operation completes, the driver queries VMstore for the resulting virtual disk. If it is not yet visible, the driver fires a hypervisor refresh (at most once per `vmstore_refresh_cooldown` per volume) and retries with exponential backoff:
 
 - `vmstore_virtual_disk_retries` — how many times to retry before failing (default: 3)
 - `vmstore_get_vd_timeout` — per-attempt lookup timeout in seconds (default: 8)
+- `vmstore_refresh_cooldown`: at most one hypervisor refresh per volume in this many seconds (default: 600). A volume that stays missing is usually one whose association VMstore has lost (alert LOG-VCACHE-0067); refreshing it before every retry only loads the array.
 
 #### Snapshot polling
 

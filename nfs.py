@@ -25,6 +25,7 @@ from typing import List
 from os_brick.remotefs import remotefs
 from oslo_concurrency import processutils
 from oslo_log import log as logging
+from oslo_utils import timeutils
 from oslo_utils import units
 
 from cinder.compute import nova
@@ -153,6 +154,12 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     refused with SnapshotIsBusy and stays available, instead
                     of being reported deleted while the VMstore snapshot
                     stayed on the array; 3107 is no longer retried.
+                 - [VME-34]: A failed virtual disk lookup refreshes the
+                    hypervisor for that volume at most once per
+                    vmstore_refresh_cooldown seconds (default 600; 0 keeps
+                    the old refresh before every retry). Lookups still
+                    retry. The final warning names the volume and the
+                    VMstore alert to check (LOG-VCACHE-0067, VMTS-279).
 
     """
 
@@ -166,9 +173,15 @@ class VmstoreNfsDriver(nfs.NfsDriver):
     driver_volume_type = 'nfs'
     TINTRI_PATH_PREFIX = '/tintri/'
 
+    # Bound on remembered lookup refreshes; expired ones are dropped at it.
+    _LOOKUP_REFRESHES_MAX = 1024
+
     def __init__(self, execute=processutils.execute, *args, **kwargs):
 
         self._remotefsclient = None
+        # Volume id -> time of the last hypervisor refresh after a failed
+        # virtual disk lookup; see _refresh_after_failed_lookup.
+        self._lookup_refreshes = {}
         super().__init__(*args, **kwargs)
         if not self.configuration:
             code = 'ENODATA'
@@ -601,6 +614,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
             if vd:
                 LOG.debug('Found virtual disk for %(id)s on attempt %(attempt)s',
                           {'id': volume.id, 'attempt': attempt + 1})
+                self._lookup_refreshes.pop(volume.id, None)
                 return vd
 
             if attempt < max_retries - 1:
@@ -609,17 +623,52 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     'after %(delay).2f seconds',
                     {'id': volume.id, 'attempt': attempt + 1,
                      'max': max_retries, 'delay': delay})
-                # Try refresh call
                 LOG.info('VirtualDisk for %s not found, sleeping %d', volume.id, delay)
-                self.refresh_hypervisor(volume)
+                self._refresh_after_failed_lookup(volume)
                 sleep_time = min(delay, max_delay)
                 time.sleep(sleep_time)
                 delay *= 2  # Exponential backoff
 
         LOG.warning(
-            'Virtual disk for %(name)s not found after %(retries)s retries',
-            {'name': volume['name'], 'retries': max_retries})
+            'Virtual disk for volume %(id)s (%(name)s) not found after '
+            '%(retries)s lookups. If this persists, VMstore may no longer '
+            'associate the volume file with its virtual disk (check VMstore '
+            'for alert LOG-VCACHE-0067). Hypervisor refreshes for this '
+            'volume are limited to one every %(cooldown)s s '
+            '(vmstore_refresh_cooldown).',
+            {'id': volume.id, 'name': volume['name'], 'retries': max_retries,
+             'cooldown': self.configuration.vmstore_refresh_cooldown})
         return None
+
+    def _refresh_after_failed_lookup(self, volume) -> bool:
+        """Refresh the hypervisor after a failed virtual disk lookup.
+
+        At most once per vmstore_refresh_cooldown seconds per volume
+        (VME-34). A volume whose association is broken on VMstore
+        (VMTS-279) was refreshed before every retry of every attempt, up to
+        440 refreshes an hour on one deployment. The window lives in this
+        process only and is cleared when the disk is found.
+
+        :param volume: volume reference
+        :returns: True if a refresh was sent
+        """
+        cooldown = self.configuration.vmstore_refresh_cooldown
+        now = timeutils.utcnow()
+        last = self._lookup_refreshes.get(volume.id)
+        if cooldown and last and (now - last).total_seconds() < cooldown:
+            LOG.debug('Not refreshing the hypervisor for %(id)s: last '
+                      'refresh %(age)d s ago (vmstore_refresh_cooldown '
+                      '%(cooldown)s s)',
+                      {'id': volume.id, 'cooldown': cooldown,
+                       'age': (now - last).total_seconds()})
+            return False
+        if len(self._lookup_refreshes) >= self._LOOKUP_REFRESHES_MAX:
+            self._lookup_refreshes = {
+                vol_id: when for vol_id, when in self._lookup_refreshes.items()
+                if (now - when).total_seconds() < cooldown}
+        self._lookup_refreshes[volume.id] = now
+        self.refresh_hypervisor(volume)
+        return True
 
     def _scan_share(self, mount_point: str) -> tuple[int, int]:
         """Walk the share root once and collect both volume metrics.
