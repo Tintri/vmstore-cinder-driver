@@ -19,6 +19,7 @@ import shutil
 import tempfile
 from unittest import mock
 
+from oslo_concurrency import processutils
 from oslo_utils import fixture as utils_fixture
 from oslo_utils import units
 
@@ -1603,6 +1604,117 @@ class VmstoreNfsDriverOnlineExtendStatsTestCase(_ExtendTestBase):
         self.assertTrue(
             self.driver._stats['pools'][0]['online_extend_support'])
 
+
+class VmstoreNfsDriverMigrateVolumeTestCase(_ExtendTestBase):
+    """Driver-assisted volume migration (VME-29).
+
+    Cinder's generic migration byte-copies the file into a volume the
+    destination creates: it cut qcow2 files at the volume size and left a
+    qcow2 record on raw data (lab, 2026-11-19). Within one VMstore share
+    nothing needs copying; elsewhere a qcow2 file must not be byte-copied.
+    """
+
+    SHARE = '192.168.1.1:/tintri/test_share'
+    OTHER = '192.168.1.2:/tintri/other_share'
+
+    def _host(self, pool, **capabilities):
+        caps = {'vendor_name': self.driver.vendor_name}
+        caps.update(capabilities)
+        return {'host': 'host-b@vmstore-b#%s' % pool, 'capabilities': caps}
+
+    def _migrate(self, host):
+        return self.driver.migrate_volume(mock.sentinel.ctxt,
+                                          self._volume(attachments=[]), host)
+
+    def test_same_share_moves_without_copy(self):
+        moved, update = self._migrate(self._host(self.SHARE))
+
+        self.assertTrue(moved)
+        self.assertIsNone(update)
+        self.mock_qemu_img_info.assert_not_called()
+        self.driver._execute.assert_not_called()
+
+    def test_same_share_qcow2_volume_moves_without_copy(self):
+        """The file stays where it is, so its format and record stay right."""
+        self.mock_recorded_format.return_value = 'qcow2'
+
+        moved, update = self._migrate(self._host(self.SHARE))
+
+        self.assertTrue(moved)
+        self.mock_qemu_img_info.assert_not_called()
+
+    def test_other_share_qcow2_file_is_refused(self):
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+
+        exc = self.assertRaises(
+            exception.VolumeMigrationFailed, self._migrate,
+            self._host(self.OTHER, vmstore_qcow2_volumes=False))
+
+        self.assertIn('qcow2', str(exc))
+        self.assertIn('vol-1', str(exc))
+
+    def test_other_share_raw_file_to_raw_destination_uses_generic_copy(self):
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+
+        moved, update = self._migrate(
+            self._host(self.OTHER, vmstore_qcow2_volumes=False))
+
+        self.assertFalse(moved)
+        self.assertIsNone(update)
+
+    def test_other_share_raw_file_to_qcow2_destination_is_refused(self):
+        """The destination would create qcow2 and record it over raw data."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+
+        self.assertRaises(
+            exception.VolumeMigrationFailed, self._migrate,
+            self._host(self.OTHER, vmstore_qcow2_volumes=True))
+
+    def test_destination_without_format_capability_is_refused(self):
+        """An older driver does not say which format it creates."""
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+
+        self.assertRaises(exception.VolumeMigrationFailed, self._migrate,
+                          self._host(self.OTHER))
+
+    def test_guest_written_qcow2_header_on_raw_volume_counts_as_raw(self):
+        self.mock_qemu_img_info.return_value = _img_info('qcow2', 10)
+        self.mock_recorded_format.return_value = 'raw'
+
+        moved, _update = self._migrate(
+            self._host(self.OTHER, vmstore_qcow2_volumes=False))
+
+        self.assertFalse(moved)
+
+    def test_same_pool_name_on_another_driver_is_not_a_noop(self):
+        self.mock_qemu_img_info.return_value = _img_info('raw', 10)
+
+        moved, _update = self._migrate(self._host(
+            self.SHARE, vendor_name='Other', vmstore_qcow2_volumes=False))
+
+        self.assertFalse(moved)
+
+    def test_unreadable_file_is_refused(self):
+        self.mock_qemu_img_info.side_effect = (
+            processutils.ProcessExecutionError('boom'))
+
+        self.assertRaises(
+            exception.VolumeMigrationFailed, self._migrate,
+            self._host(self.OTHER, vmstore_qcow2_volumes=False))
+
+    @mock.patch('cinder.objects.VolumeList.get_all_by_host', return_value=[])
+    def test_stats_report_the_format_new_volumes_get(self, mock_get_volumes):
+        self.driver._mounted_shares = [self.SHARE]
+        self.driver._execute.return_value = ('4096 26214400 13107200', '')
+        self._patch_driver('_ensure_shares_mounted')
+        self._patch_driver('_get_mount_point_for_share',
+                           return_value='/mnt/share')
+        self._patch_driver('_scan_share', return_value=(0, 0))
+
+        self.driver._update_volume_stats()
+
+        self.assertIs(
+            False, self.driver._stats['pools'][0]['vmstore_qcow2_volumes'])
 
 class VmstoreNfsDriverTempCloneCleanupTestCase(_ExtendTestBase):
     """A failed create never leaves its temporary clone directory (VMTS-225).

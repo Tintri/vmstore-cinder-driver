@@ -19,5 +19,5 @@ qcow2 brings nothing on VMstore: snapshots and clones are taken on the array, no
 
 - New deployments and backends switched to `False` get raw volumes only: detached and attached extend grow the file with `truncate`, and nothing can drift between the file and the record.
 - Volumes created before the switch keep their qcow2 format and their records. Records written wrongly by earlier releases still need correcting (a Cinder and Nova database script, run by the operator).
-- Until a deployment's qcow2 volumes are converted, avoid host-assisted volume migration of qcow2 volumes: the generic migration path is where qcow2 data and records go wrong (VME-29).
+- Volume migration (3.0.12, VME-29): a move within the same VMstore share copies nothing, so qcow2 volumes keep working across cinder-volume hosts. A qcow2 file is refused across shares instead of being cut by Cinder's generic copy; `--force-host-copy` bypasses the driver and must not be used for qcow2 volumes.
 - Reviews: no change may decide a volume's format by probing guest-writable data alone, and no copy may byte-copy a non-raw file as raw.
