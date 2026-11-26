@@ -37,7 +37,7 @@ Example configuration::
     vmstore_password = <VMstore_Password>
     vmstore_rest_address = <VMstoreAdminIP, or FQDN>
     volume_backend_name = vmstore
-    vmstore_qcow2_volumes = False
+    # vmstore_qcow2_volumes is deprecated: leave it unset (new volumes are raw).
 
 Configuration Parameters
 ========================
@@ -110,7 +110,7 @@ Configuration Parameters
      - Boolean
      - ``False``
      - no
-     - Use qcow2 volumes.
+     - Deprecated since 3.0.12; leave it False. Creates new volumes as qcow2 files instead of raw. Existing qcow2 volumes keep working after a backend is switched to False.
    * - ``vmstore_mount_point_base``
      - String
      - ``$state_path/mnt``

@@ -48,7 +48,7 @@ vmstore_user = <VMstore_UserName>
 vmstore_password = <VMstore_Password>
 vmstore_rest_address = <VMstoreAdminIP, or FQDN>
 volume_backend_name = vmstore
-vmstore_qcow2_volumes = False
+# vmstore_qcow2_volumes is deprecated: leave it unset (new volumes are raw).
 ```
 
 ### List of configuration Parameters
@@ -66,7 +66,7 @@ vmstore_qcow2_volumes = False
 |`vmstore_rest_backoff_factor`|Float|`1`|no|Specifies the backoff factor to apply between connection attempts to Vmstore REST API interface.|
 |`vmstore_rest_retry_count`|Int|`5`|no|Specifies the number of times to repeat Vmstore REST API calls in case of connection errors or retriable errors.|
 |`vmstore_refresh_retry_count`|Int|`1`|no|Specifies the number of times to repeat Vmstore RESTful API call to cinder/host/refresh in case of connection errors or Vmstore appliance retriable errors.|
-|`vmstore_qcow2_volumes`|Boolean|`False`|no|Use qcow2 volumes.|
+|`vmstore_qcow2_volumes`|Boolean|`False`|no|**Deprecated since 3.0.12; leave it `False`.** Creates new volumes as qcow2 files instead of raw. See [Volume format: raw](#volume-format-raw).|
 |`vmstore_mount_point_base`|String|`$state_path/mnt`|no|Base directory containing NFS share mount points.|
 |`vmstore_sparsed_volumes`|Boolean|`True`|no|Defines whether the volumes need to be thin-provisioned.|
 |`vmstore_dataset_description`|String|-|no|Human-readable description for the backend.|
@@ -85,6 +85,16 @@ vmstore_qcow2_volumes = False
 |`cross_backend_clone_use_repl_path`|Boolean|`False`|no|Controls how a volume is created from a snapshot that resides on a different VMstore backend. When False (default), the clone is created on the source backend and the file is moved to the destination. When True, the driver attempts to use a VMstore replication path to remotely clone the data, and falls back to the file-move workflow if no replication path from the source to the destination backend exists.|
 |`vmstore_task_timeout`|Int|`86400`|no|Maximum time in seconds to wait for a VMstore async task (such as a replication-path remote clone) to complete. Defaults to 24 hours.|
 |`vmstore_task_poll_interval`|Int|`5`|no|Interval in seconds between polls while waiting for a VMstore async task to complete.|
+
+### Volume format: raw
+
+New volumes should be raw files. `vmstore_qcow2_volumes` is deprecated since 3.0.12 and will be removed; a backend with it set to `True` logs a warning at startup. VMstore takes snapshots and clones on the array and raw volumes are sparse files, so qcow2 adds nothing, while with qcow2 the format Cinder records can drift from the file and break VMs on their next migrate, resize or hard reboot.
+
+- **Switching an existing backend to `False`** only affects new volumes. Existing qcow2 volumes keep working side by side with raw ones.
+- **Avoid host-assisted volume migration of qcow2 volumes** until they are converted: Cinder's generic migration records and copies them wrongly.
+- **Converting existing qcow2 volumes to raw** is a separate, VMstore-side procedure, not part of the driver.
+
+Design and plan (deprecate, then raw enforced for new volumes, then removal): [ADR-0005](docs/adr/0005-raw-volumes-qcow2-deprecated.md).
 
 ### Performance Tuning
 

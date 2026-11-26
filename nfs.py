@@ -160,6 +160,10 @@ class VmstoreNfsDriver(nfs.NfsDriver):
                     the old refresh before every retry). Lookups still
                     retry. The final warning names the volume and the
                     VMstore alert to check (LOG-VCACHE-0067, VMTS-279).
+                 - [VME-33]: vmstore_qcow2_volumes is deprecated for
+                    removal; a backend with it set to True logs a warning
+                    at startup. New volumes should be raw. Existing qcow2
+                    volumes keep working with the option off (docs/adr/0005).
 
     """
 
@@ -422,6 +426,7 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         LOG.info('VmstoreNfsDriver do_setup for context: %s', ctxt)
         self.ctxt = ctxt
         self._validate_required_options()
+        self._warn_if_qcow2_volumes()
         max_retries = self.configuration.vmstore_rest_retry_count
         retries = 0
         while not self._do_setup():
@@ -439,6 +444,21 @@ class VmstoreNfsDriver(nfs.NfsDriver):
         # the first stats report has zero capacity and the scheduler
         # rejects the backend until a volume create triggers mounting.
         self._ensure_shares_mounted()
+
+    def _warn_if_qcow2_volumes(self) -> None:
+        """Warn that vmstore_qcow2_volumes is deprecated (VME-33).
+
+        3.0.12 still honours it, because deployments switch their backends
+        to raw during an upgrade, not before. See docs/adr/0005.
+        """
+        if self.configuration.vmstore_qcow2_volumes is not True:
+            return
+        LOG.warning('vmstore_qcow2_volumes = True is deprecated and will be '
+                    'removed: backend %(backend)s creates new volumes as '
+                    'qcow2 files. Set it to False to create raw volumes; '
+                    'existing qcow2 volumes keep working.',
+                    {'backend': self.configuration.safe_get(
+                        'volume_backend_name')})
 
     def _validate_required_options(self) -> None:
         """Validate that required configuration options are set."""

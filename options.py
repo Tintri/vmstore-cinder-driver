@@ -78,7 +78,18 @@ VMSTORE_CONNECTION_OPTS = [
 VMSTORE_NFS_OPTS = [
     cfg.BoolOpt('vmstore_qcow2_volumes',
                 default=False,
-                help='Use qcow2 volumes.'),
+                deprecated_for_removal=True,
+                deprecated_since='3.0.12',
+                deprecated_reason='New volumes should be raw. VMstore takes '
+                                  'snapshots and clones on the array, so '
+                                  'qcow2 adds nothing, and the recorded '
+                                  'format of a qcow2 volume can drift from '
+                                  'its file. Existing qcow2 volumes keep '
+                                  'working with the option off.',
+                help='Create new volumes as qcow2 files instead of raw. '
+                     'Deprecated: leave it False. Switching an existing '
+                     'backend from True to False only affects new volumes; '
+                     'existing qcow2 volumes keep working.'),
     cfg.StrOpt('vmstore_mount_point_base',
                default='$state_path/mnt',
                help='Base directory that contains NFS share mount points.'),
