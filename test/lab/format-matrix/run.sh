@@ -574,12 +574,17 @@ flip_after() {
 next_spare() { local id; for id in $1; do grep -qx "$id" "$FLIPDIR/used" 2>/dev/null || { echo "$id"; return 0; }; done; }
 reset_if_error() { local s; s=$(vstat "$1")
   [[ "$s" == error* ]] && { echo "  $1 left $s: reset to available (test volume)"; cli "openstack volume set --state available $1"; }; return 0; }
+recover_vm() { # kept VM not ACTIVE after a row: reset and hard reboot it, so the next check starts from a running VM
+  local s; s=$(cli "openstack server show $1 -f value -c status" | tail -1); [ "$s" = ACTIVE ] && return 0
+  echo "  $1 is $s after K12: reset to active and hard reboot (test VM)"
+  cli "openstack server set --state active $1" | show >&2; cli "openstack server reboot --hard $1" | show >&2
+  [ "$(op_vm "$1" ACTIVE)" = ok ] || echo "  WARNING: $1 did not come back ACTIVE; the next check's K1 to K8 will show it"; }
 vmrows() { # #, operation, op result: one row per volume of the VM
   row "$1" "$2 (boot volume)" "$3" "$B" "$VM"
   [ -n "$D" ] && row "${1}b" "$2 (data volume from an image)" "$3" "$D" "$VM"
   row "${1}c" "$2 (empty volume)" "$3" "$E" "$VM"; }
 flip_check() {
-  local n r m cur other h f t tn v x q p c dst C NEW
+  local n r m cur other h f t tn v x q p c dst C NEW moved
   [ -n "$QOFF" ] && [ -z "$QON" ] || [ "$FORCE" = 1 ] || { echo "  phase check needs vmstore_qcow2_volumes off for $BACKEND (FORCE=1 overrides)"; trap - EXIT; on "$CINDER_SSH" "rm -rf $RDIR"; exit 2; }
   KEEP=1; D=${D:-}; IMGS=${IMGS:-}; QS=${QS:-}
   n=$(( $(cat "$FLIPDIR/checks" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FLIPDIR/checks"
@@ -621,6 +626,18 @@ flip_check() {
     reset_if_error "$v"
   else not_run K9 "Extend an image volume created before the switch, detached" "no spare image volume left (FLIP_SPARES)"; fi
 
+  echo "### $(ts) K13 to K15: clone of the data volume, new volume"
+  if [ -n "$D" ]; then
+    C=$(new_vol "$PREFIX-flip-clone-k$n" "--source $D --size 2"); r=$(op_vol "$C" available)
+    row K13 "Clone the data volume from an image (+1 GB)" "$r" "$C" "" 2
+    if [ "$r" = ok ]; then
+      r=$(attach "$VM" "$C"); [ "$r" = ok ] && r=$(vm_cycle "$VM" hard)
+      row K14 "Attach the clone, hard reboot" "$r" "$C" "$VM"; detach "$VM" "$C" >/dev/null
+    else not_run K14 "Attach the clone, hard reboot" "clone failed"; fi
+  else not_run K13 "Clone the data volume from an image" "no data volume (C4 failed)"; not_run K14 "Attach the clone, hard reboot" "no data volume"; fi
+  NEW=$(new_vol "$PREFIX-flip-new-k$n" "--size 1 --type $VOLUME_TYPE"); row K15 "New empty volume" "$(op_vol "$NEW" available)" "$NEW"
+
+  # K10 to K12 run last: an attach of a damaged volume (K11) must not affect K13 to K15.
   echo "### $(ts) K10 to K12: move an empty volume created before the switch to the other cinder-volume host"
   q=$(next_spare "$QS")
   if [ -z "$q" ]; then
@@ -633,30 +650,24 @@ flip_check() {
     echo "$q" >> "$FLIPDIR/used"; cur=$(vhost "$q"); dst=
     for h in $VOLUME_HOSTS; do [ "$h" != "${cur%%@*}" ] && dst="$h@${cur#*@}" && break; done
     echo "  migrate $q: $cur -> $dst"; cli "openstack volume migrate --host '$dst' $q" | show
-    m=$(wait_mig "$q"); r=ok; c=
-    [ "$m" = success ] && [ "$(vstat "$q")" = available ] || r="failed:migration $m, volume $(vstat "$q")"
-    if [ "$r" = ok ]; then p=$(fpath "$q"); f=$(fileinfo "$q"); f=${f%% *}; c=$(check_fill "$p" "${f%-overlay}")
-      fill_ok "$c" || r="failed:data after the move: $c"; fi
-    row K10 "Move an empty volume created before the switch to the other cinder-volume host" "$r" "$q" "" "" "$c"
-    if [ "$r" = ok ]; then
+    m=$(wait_mig "$q"); r=ok; c=; moved=0
+    if [ "$m" = success ] && [ "$(vstat "$q")" = available ]; then moved=1
+      p=$(fpath "$q"); f=$(fileinfo "$q"); f=${f%% *}; c=$(check_fill "$p" "${f%-overlay}")
+      fill_ok "$c" || r="failed:data damaged by the move"
+    else r="failed:migration $m, volume $(vstat "$q")"; fi
+    row K10 "Move an empty volume created before the switch to the other cinder-volume host" "$r" "$q" "" "" "${c:+data: $c}"
+    # K11 and K12 run whenever the volume moved, even with damaged data: they record what an
+    # attach and a detached extend do with the file as the move left it (Platform9 saw an extend
+    # report the new size without growing a qcow2 file recorded raw).
+    if [ "$moved" = 1 ]; then
       r=$(attach "$VM" "$q"); [ "$r" = ok ] && r=$(vm_cycle "$VM" hard)
       row K11 "Attach it, hard reboot" "$r" "$q" "$VM"
       r=$(detach "$VM" "$q"); x=
       [ "$r" = ok ] && { x=$(( $(vsize "$q") + 1 )); r=$(extend_detached "$q" "$x"); }
       row K12 "Detach it, extend detached (+1 GB)" "$r" "$q" "" "$x"; reset_if_error "$q"
-    else not_run K11 "Attach it, hard reboot" "the move failed"; not_run K12 "Detach it, extend detached" "the move failed"; fi
+      recover_vm "$VM"
+    else not_run K11 "Attach it, hard reboot" "the move did not complete"; not_run K12 "Detach it, extend detached" "the move did not complete"; fi
   fi
-
-  echo "### $(ts) K13 to K15: clone of the data volume, new volume"
-  if [ -n "$D" ]; then
-    C=$(new_vol "$PREFIX-flip-clone-k$n" "--source $D --size 2"); r=$(op_vol "$C" available)
-    row K13 "Clone the data volume from an image (+1 GB)" "$r" "$C" "" 2
-    if [ "$r" = ok ]; then
-      r=$(attach "$VM" "$C"); [ "$r" = ok ] && r=$(vm_cycle "$VM" hard)
-      row K14 "Attach the clone, hard reboot" "$r" "$C" "$VM"; detach "$VM" "$C" >/dev/null
-    else not_run K14 "Attach the clone, hard reboot" "clone failed"; fi
-  else not_run K13 "Clone the data volume from an image" "no data volume (C4 failed)"; not_run K14 "Attach the clone, hard reboot" "no data volume"; fi
-  NEW=$(new_vol "$PREFIX-flip-new-k$n" "--size 1 --type $VOLUME_TYPE"); row K15 "New empty volume" "$(op_vol "$NEW" available)" "$NEW"
 }
 flip_cleanup() { echo "### $(ts) flip cleanup: every $PREFIX-* object kept by phase create and the checks"; KEEP=0; }
 

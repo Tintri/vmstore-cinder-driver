@@ -87,8 +87,11 @@ reboot; with `DST_COMPUTE_ID`: K5 cold migrate the VM to the other host (live wi
 K9 extend a spare image volume detached (+1 GB); with two `VOLUME_HOSTS`: K10 move a spare
 empty volume to the other cinder-volume host and check its data, K11 attach it and hard
 reboot, K12 detach and extend it (+1 GB); K13 clone the data volume (+1 GB), K14 attach the
-clone and hard reboot, K15 new empty volume. Rows the lab cannot run (one compute or
-cinder-volume host) are n/a. The report states the driver, the option and whether Nova
+clone and hard reboot, K15 new empty volume. K10 to K12 run last, after K15. K11 and K12 run
+whenever the move completed, even if K10 found the data damaged: they record what an attach
+and a detached extend do with the file as the move left it. If the VM is not ACTIVE after
+K12, the check resets it and hard reboots it, so the next check starts from a running VM.
+Rows the lab cannot run (one compute or cinder-volume host) are n/a. The report states the driver, the option and whether Nova
 probes the file format (Platform9's PCD-4550 patch, in Aug releases).
 
 ### Result of a row
