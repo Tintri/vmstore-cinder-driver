@@ -41,7 +41,7 @@ them, or Cinder keeps the group snapshot, G8 passes.
 
 | Driver | G1 to G7 | G8 | G9 |
 | --- | --- | --- | --- |
-| 3.0.12 (to be measured) | PASS expected (generic path, no driver change) | FAIL expected if VMstore refuses busy snapshots (see above) | PASS |
+| 3.0.12 (measured 2026-11-26) | PASS (generic path, no driver change) | FAIL: VMstore refuses busy snapshots (see above) | PASS |
 
 ## Prerequisites
 
@@ -133,3 +133,4 @@ with your `PREFIX`.
 
 | Date | Lab | Driver | G1 | G2 | G3 | G4 | G5 | G6 | G7 | G8 | G9 | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-11-26 | lab A, PCD 2026.8 (Aug P2), `vmstore_qcow2_volumes = true`, two cinder-volume hosts | 3.0.12 | PASS | PASS | PASS | PASS | PASS | PASS | PASS | FAIL | PASS | G4, G5: derived volumes have no record and qcow2 files, data as expected. G8: 2 VMstore snapshots left with no Cinder record, removed by the cleanup; seen on two runs. Cleanup complete, other objects unchanged. |

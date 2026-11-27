@@ -154,3 +154,4 @@ with your `PREFIX`.
 
 | Date | Lab | Driver | Cache | C1 | C2 | C3 | C4 | C5 | C6 | C7 | Times (miss / hit) | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-11-26 | lab A, PCD 2026.8 (Aug P2) | 3.0.12 | off | not run | not run | not run | not run | not run | not run | not run | - | Stopped before C1: Glance returned no data for the source image, then refused the upload of the private copy (413). Nothing created. |
