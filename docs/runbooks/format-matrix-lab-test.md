@@ -30,6 +30,8 @@ report failures. This script runs the same steps and writes the same table.
 | `./run.sh --two-host <lab.env>` | Two hosts: volume migrate to the other cinder-volume host, then move the VM (T1 to T9). `LIVE=1` live migrates instead of the cold migration in T5 |
 | `./run.sh --flip-phase create <lab.env>` | Flip test, part 1 (option on): VM, boot volume and an empty qcow2 volume, kept |
 | `./run.sh --flip-phase after <lab.env>` | Flip test, part 2, after the backend was switched to off and restarted: F1 to F9 on the old volumes, then cleanup |
+| `./run.sh --flip-phase check <lab.env>` | After the switch, instead of `after`: K1 to K15 on the kept volumes while their records are still what phase create left; keeps everything, so it can run again after a driver swap or an upgrade |
+| `./run.sh --flip-phase cleanup <lab.env>` | Deletes what phase create and the checks kept |
 
 ### Steps and Platform9's numbers
 
@@ -69,6 +71,25 @@ restarted with the VM running, F2 stop / start and hard reboot, F3 online snapsh
 volume then stop / start, F4 detach it, F5 clone it (+1 GB), F6 volume from that snapshot
 (+1 GB), F7 extend the old volume detached while it has a snapshot, F8 attach the post-flip
 clone and stop / start, F9 new empty volume.
+
+Phase create also keeps, for phase check: C4 a data volume created from an image, attached to
+the VM; C5 `FLIP_SPARES` (default 3) detached image volumes; C6 as many detached empty volumes
+holding a data pattern (written with `qemu-io` on the cinder-volume host, right after
+creation). Each check uses one spare of each kind.
+
+Out-of-sync check (phase check): what works while volumes created before the switch keep the
+records they were created with (with drivers before 3.0.12, image volumes are raw files
+recorded qcow2), for example between a driver swap or a PCD upgrade and Platform9's database
+fix. Rows `K<n>`, `K<n>b` and `K<n>c` show the boot volume, the data volume from an image and
+the empty volume. K1 VM running at the start, K2 stop / start, K3 soft reboot, K4 hard
+reboot; with `DST_COMPUTE_ID`: K5 cold migrate the VM to the other host (live with
+`LIVE=1`), K6 hard reboot there, K7 resize (1 to 2 vCPUs, or back), K8 cold migrate back;
+K9 extend a spare image volume detached (+1 GB); with two `VOLUME_HOSTS`: K10 move a spare
+empty volume to the other cinder-volume host and check its data, K11 attach it and hard
+reboot, K12 detach and extend it (+1 GB); K13 clone the data volume (+1 GB), K14 attach the
+clone and hard reboot, K15 new empty volume. Rows the lab cannot run (one compute or
+cinder-volume host) are n/a. The report states the driver, the option and whether Nova
+probes the file format (Platform9's PCD-4550 patch, in Aug releases).
 
 ### Result of a row
 
@@ -130,6 +151,18 @@ Flip test (the option must be on for phase create, off for phase after; `FORCE=1
 ../driver-swap/swap.sh option-rollback my-lab.env <host>                                     # every host changed
 ```
 
+On PCD the option can only be changed through the cluster blueprint (a hand edit of
+`cinder.conf` is rewritten within seconds); see `driver-swap.md`.
+
+Out-of-sync check instead of phase after (two-host lab.env for K5 to K8 and K10 to K12):
+
+```bash
+./run.sh --flip-phase create my-lab.env                        # option on
+# switch the option off, then as often as needed (after a driver swap, an upgrade):
+LABEL="3.0.9, records as created" ./run.sh --flip-phase check my-lab.env
+./run.sh --flip-phase cleanup my-lab.env
+```
+
 Phase create keeps its objects and writes a state file under `${TMPDIR:-/tmp}/<PREFIX>-flip/`;
 use the same `PREFIX` and `TMPDIR` for phase after. If phase after finds the option still on,
 it stops without deleting anything, so the flip can be done and phase after rerun.
@@ -143,8 +176,12 @@ Exit codes: `0` every row matched (n/a allowed), `1` a row failed, `2` precheck 
 
 - Only `<PREFIX>-*` objects are created; Nova's boot volume is renamed `<PREFIX>-nova-vol` as
   soon as it exists. The precheck refuses to start if `<PREFIX>-*` objects exist (except flip
-  phase after, which uses the kept ones).
-- Nothing is written to volume files; file checks use `qemu-img info -U` and read the header.
+  phases after, check and cleanup, which use the kept ones).
+- Nothing is written to volume files, except the data pattern flip phase create writes into
+  its own spare empty volumes (`qemu-io`, detached, right after creation); other file checks
+  use `qemu-img info -U`, `qemu-img check -U` and `qemu-io -r -U` (read-only).
+- Phase check keeps everything. A volume a check leaves in `error_extending` (an extend that
+  failed) is reset to `available`, so later checks and cleanup can use it.
 - Cleanup runs on any exit: VMs, then volumes newest first, then snapshots, repeated until
   nothing is left (a volume with snapshots is deleted in the next round). Snapshots are
   deleted after the volumes made from them because VMstore refuses to delete a snapshot a

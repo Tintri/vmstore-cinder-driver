@@ -203,7 +203,12 @@ if [ $CINDER_ONLY = 0 ]; then
   [ "$st" = ERROR ] && echo "  fault: $(sfield "$VM" fault | cut -c1-400)"
   hs=$(compute_ssh "$host"); dt=$([ -n "$hs" ] && disk_type "$hs" "$VM" "$nid"); ft=$(finfo "$DATA" | cut -d' ' -f1)
   echo "  disk type on $host: ${dt:-?} (file $ft)"
+  # libvirt refuses a live migration to a host whose CPU lacks features the guest uses: a
+  # property of the lab's hosts, not of the volume (cold migration is in the format matrix).
+  cpu=$(on "$SRC_COMPUTE_SSH" "awk -v s='$START' 'substr(\$0,1,19) >= s' $NOVA_LOG | grep -a '$VM' | grep -aoE \"guest CPU doesn't match specification: [^:]*: [a-z0-9_,]+\" | tail -1")
   if [ "$host" = "$DST_COMPUTE_ID" ] && [ "$st" = ACTIVE ] && [ "$dt" = "$ft" ]; then result R3 PASS "VM live migrated to DST, migrated volume opened as $dt"
+  elif [ -n "$cpu" ] && [ "$st" = ACTIVE ] && [ "$host" = "$SRC_COMPUTE_ID" ] && [ "$dt" = "$ft" ]; then
+    result R3 SKIP "lab hosts cannot live-migrate: libvirt \"$cpu\" (DST CPU lacks features of SRC); VM still ACTIVE on SRC, volume opened as $dt"
   elif [[ "$mig" == *None ]]; then result R3 FAIL "live migration rejected before start (no destination selected; check DST capacity and scheduler)"
   else result R3 FAIL "status=$st host=$host migration=[$mig] disk=${dt:-?} file=$ft"; fi
   state "C. after live migration" $DATA

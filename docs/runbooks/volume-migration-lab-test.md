@@ -113,6 +113,7 @@ and remove `/root/vme29-lab` on the cinder-volume host. Replace `vme29` with you
 | `DST QEMU lacks machine type` | Swap SRC and DST (move guests from the older QEMU to the newer one) or pick another host pair. |
 | Image volume creation fails, `Could not find any available weighted backend` | Seen in one lab region: the backend could not create volumes from images there. Use another backend or region. |
 | R3 `live migration rejected before start` | The scheduler chose no destination (usually capacity). The VM stays ACTIVE on SRC. |
+| R3 SKIP `lab hosts cannot live-migrate: libvirt "guest CPU doesn't match specification ..."` | The destination host's CPU lacks features the guest uses (seen on the PCD lab between hosts with different CPUs: `missing features: xsaveopt`). Not a volume result; the VM stays ACTIVE on SRC. Use two compute hosts with the same CPU model, or a common `cpu_mode`/`cpu_models` in Nova, to test live migration. |
 | Volume migrate refused | `--host` must be `<host>@<backend>#<pool>` of the same backend; a type pinned to another backend refuses the move. |
 
 ## Run history
