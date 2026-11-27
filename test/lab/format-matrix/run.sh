@@ -4,24 +4,30 @@
 # (admin_metadata['format'], or none) and the format libvirt opens, as in Platform9's
 # "NFS Volume Format Matrix". Runbook: docs/runbooks/format-matrix-lab-test.md
 #
-# Usage: run.sh [--two-host | --flip-phase create|after] <lab.env>
-#   (default)            one host: Platform9 steps 1 to 19
-#   --two-host           migrate a volume to the other cinder-volume host, then move the VM
-#   --flip-phase create  create a VM and volumes while vmstore_qcow2_volumes is on, keep them
-#   --flip-phase after   after the backend was switched off and restarted: the flip rows
+# Usage: run.sh [--two-host | --flip-phase create|after|check|cleanup] <lab.env>
+#   (default)             one host: Platform9 steps 1 to 19
+#   --two-host            migrate a volume to the other cinder-volume host, then move the VM
+#   --flip-phase create   create a VM and volumes while vmstore_qcow2_volumes is on, keep them
+#   --flip-phase after    after the backend was switched off and restarted: the flip rows, then
+#                         delete everything
+#   --flip-phase check    after the switch: operations on the kept volumes while their records
+#                         are still what phase create left (out of sync with the files); keeps
+#                         everything, so it can run again after a driver swap or an upgrade
+#   --flip-phase cleanup  delete what phase create and the checks kept
 #
 # Creates only objects named <PREFIX>-* (the volume Nova creates for a boot from image is
 # renamed to <PREFIX>-nova-vol) and deletes them on exit, including on failure or Ctrl-C.
-# Flip phase create keeps them for phase after when it succeeds. Never writes to volume
-# files. Exit: 0 every row matched (n/a allowed), 1 a row failed, 2 precheck or setup problem.
+# Flip phases create and check keep them. Never writes to volume files, except the pattern
+# phase create writes into its own spare volumes (qemu-io) to check data after a move.
+# Exit: 0 every row matched (n/a allowed), 1 a row failed, 2 precheck or setup problem.
 set -u
 MODE=single
 case "${1:-}" in
   --two-host) MODE=two-host; shift ;;
   --flip-phase)
-    case "${2:-}" in create | after) MODE=flip-$2; shift 2 ;; *) set -- ;; esac ;;
+    case "${2:-}" in create | after | check | cleanup) MODE=flip-$2; shift 2 ;; *) set -- ;; esac ;;
 esac
-[ -f "${1:-}" ] || { echo "usage: $0 [--two-host | --flip-phase create|after] <lab.env>"; exit 2; }
+[ -f "${1:-}" ] || { echo "usage: $0 [--two-host | --flip-phase create|after|check|cleanup] <lab.env>"; exit 2; }
 # shellcheck disable=SC1090
 . "$1"
 NEED="CLI_SSH CLI_RC REGION AZ SRC_COMPUTE_ID VOLUME_TYPE IMAGE_ID NETWORK_ID PROJECT FLAVOR_RAM_MB PREFIX CINDER_SSH CINDER_VENV CINDER_CONF_DIR"
@@ -33,6 +39,8 @@ CINDER_LOG=${CINDER_LOG:-/var/log/pf9/cindervolume-base.log}   # cinder-volume l
 PCD_RELEASE=${PCD_RELEASE:-}   # free-text label for the report, for example "Aug P2"
 LIVE=${LIVE:-0}                # --two-host: 1 = live migrate to DST instead of a cold migration
 FORCE=${FORCE:-0}              # flip phases: 1 = run even if the option is not what the phase expects
+FLIP_SPARES=${FLIP_SPARES:-3}  # flip create: detached volumes of each kind kept, one per check
+LABEL=${LABEL:-}               # flip check: free-text label for the report, for example "3.0.12, before the DB script"
 VOL_API=3.42                   # Block Storage API version for in-use extend
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -215,6 +223,24 @@ row() {
 }
 not_run() { # #, operation, why: a row that could not run because an earlier step failed
   ROWS+=("| $1 | $2 | - | - | - | not run | $3 |"); RC=1; NFAIL=$((NFAIL + 1)); echo "  ROW $1 $2: not run ($3) [FAIL]"; }
+na_row() { # #, operation, why: a row the lab cannot run (missing host in lab.env)
+  ROWS+=("| $1 | $2 | - | - | - | n/a | $3 |"); NNA=$((NNA + 1)); echo "  ROW $1 $2: n/a ($3) [N/A]"; }
+
+# Data pattern for the spare volumes of the flip test (qemu-io on CINDER_SSH, only on this
+# run's own detached volumes): 0x5a in both halves of 1 GiB.
+fill() { on "$CINDER_SSH" "qemu-io -f $2 -c 'write -P 0x5a 0 512M' -c 'write -P 0x5a 512M 512M' '$1'" >/dev/null; }
+check_fill() { # file path, raw|qcow2 -> "check_rc=<n> reads=<n>/2 pattern_failures=<n>" (raw has no metadata: check_rc=-)
+  on "$CINDER_SSH" "if [ '$2' = qcow2 ]; then qemu-img check -U -f qcow2 '$1' >/dev/null 2>&1; echo check_rc=\$?; else echo check_rc=-; fi
+    o=\$(qemu-io -r -U -f '$2' -c 'read -P 0x5a 0 512M' -c 'read -P 0x5a 512M 512M' '$1' 2>&1)
+    echo reads=\$(echo \"\$o\" | grep -c '^read 536870912/536870912 bytes')/2 pattern_failures=\$(echo \"\$o\" | grep -c 'Pattern verification failed')" | paste -sd' ' -; }
+fill_ok() { [[ "$1" =~ ^check_rc=(0|-)\ reads=2/2\ pattern_failures=0$ ]]; }
+# Whether Nova's NFS volume code probes the file format on that compute host (Platform9's
+# patch PCD-4550, in Aug releases; not in Dec): yes, no or unknown.
+nova_probe() {
+  [ -n "$1" ] || { echo unknown; return 0; }
+  on "$1" "f=\$(find /opt/pf9 /usr/lib/python3/dist-packages -path '*nova/virt/libvirt/volume/nfs.py' 2>/dev/null | head -1)
+    if [ -z \"\$f\" ]; then echo unknown; elif grep -q qemu_img_info \"\$f\"; then echo yes; else echo no; fi" | tail -1; }
+uses_dst() { [ "$MODE" = two-host ] || { [ "$MODE" = flip-check ] && [ -n "${DST_COMPUTE_ID:-}" ]; }; }
 
 others() { # every server, volume and snapshot not created by this run
   cli "openstack server list --all-projects -f value -c ID -c Name -c Status" | awk -v p="^$PREFIX-" '$2 !~ p {print "server", $1, $NF}' | sort
@@ -260,27 +286,32 @@ precheck() {
   svc=$(cli "openstack volume service list --service cinder-volume -f value -c Host -c Status -c State" | grep "@$BACKEND enabled up$")
   if [ -n "$svc" ]; then echo "  cinder-volume enabled and up for $BACKEND: $(awk '{print $1}' <<<"$svc" | paste -sd' ' -)"
   else echo "  no cinder-volume service *@$BACKEND enabled and up"; bad=1; fi
-  if [ "$MODE" = two-host ]; then
+  if [ "$MODE" = two-host ] || { [ "$MODE" = flip-check ] && [ -n "${VOLUME_HOSTS:-}" ]; }; then
     for h in $VOLUME_HOSTS; do grep -q "^$h@$BACKEND enabled up$" <<<"$svc" || { echo "  cinder-volume $h@$BACKEND is not enabled and up"; bad=1; }; done
   fi
   o=$(cli "openstack compute service list --service nova-compute -f value -c Host -c Status -c State")
-  v=$SRC_COMPUTE_ID; [ "$MODE" = two-host ] && v="$v $DST_COMPUTE_ID"
+  v=$SRC_COMPUTE_ID; uses_dst && v="$v $DST_COMPUTE_ID"
   for h in $v; do
     grep -q "^$h enabled up$" <<<"$o" || { echo "  nova-compute $h is not enabled and up"; bad=1; }
   done
   [ "$(cli "openstack image show $IMAGE_ID -f value -c status" | tail -1)" = active ] || { echo "  image $IMAGE_ID not active"; bad=1; }
   [ "$(cli "openstack network show $NETWORK_ID -f value -c status" | tail -1)" = ACTIVE ] || { echo "  network $NETWORK_ID not ACTIVE"; bad=1; }
-  if [ "$MODE" != flip-after ]; then
-    o=$(ours); [ "$o" = 0 ] || { echo "  $o objects named $PREFIX-* already exist: clean them up or change PREFIX"; bad=1; }
-  fi
+  case "$MODE" in
+    flip-after | flip-check | flip-cleanup) ;;
+    *) o=$(ours); [ "$o" = 0 ] || { echo "  $o objects named $PREFIX-* already exist: clean them up or change PREFIX"; bad=1; } ;;
+  esac
   [ -n "$(on "$CINDER_SSH" "command -v qemu-img && test -x $CINDER_VENV/bin/python && test -f $CINDER_VENV/cinder.env && echo ok" | grep -x ok)" ] ||
     { echo "  $CINDER_SSH lacks qemu-img, $CINDER_VENV/bin/python or $CINDER_VENV/cinder.env"; bad=1; }
-  for h in "$SRC_COMPUTE_SSH" "$([ "$MODE" = two-host ] && echo "$DST_COMPUTE_SSH")"; do
+  case "$MODE" in flip-create | flip-check)
+    [ -n "$(on "$CINDER_SSH" "command -v qemu-io && echo ok" | grep -x ok)" ] || { echo "  $CINDER_SSH lacks qemu-io (data pattern of the spare volumes)"; bad=1; } ;;
+  esac
+  for h in "$SRC_COMPUTE_SSH" "$(uses_dst && echo "$DST_COMPUTE_SSH")"; do
     [ -n "$h" ] || continue
     [ -n "$(on "$h" "command -v virsh && echo ok" | grep -x ok)" ] || { echo "  $h has no virsh"; bad=1; }
+    o=$(nova_probe "$h"); echo "  nova on $h: file format probe (PCD-4550) $o"; PROBE="${PROBE:+$PROBE; }$o"
   done
   [ -n "$SRC_COMPUTE_SSH" ] || echo "  SRC_COMPUTE_SSH not set: the libvirt column reads 'unchecked'"
-  if [ "$MODE" = two-host ] && [ "$LIVE" = 1 ] && [ -n "$SRC_COMPUTE_SSH" ] && [ -n "$DST_COMPUTE_SSH" ]; then
+  if uses_dst && [ "$LIVE" = 1 ] && [ -n "$SRC_COMPUTE_SSH" ] && [ -n "$DST_COMPUTE_SSH" ]; then
     v=$(on "$SRC_COMPUTE_SSH" "qemu-system-x86_64 -machine help" | awk '/\(default\)/ {print $1; exit}')
     on "$DST_COMPUTE_SSH" "qemu-system-x86_64 -machine help" | awk '{print $1}' | grep -qx "${v:-none}" ||
       { echo "  DST QEMU lacks machine type ${v:-?} used by SRC guests: live migration cannot work (run without LIVE=1)"; bad=1; }
@@ -299,7 +330,7 @@ precheck() {
   echo "  ok"
 }
 
-KEEP=0; FLV=; FLV2=
+KEEP=0; FLV=; FLV2=; PROBE=; CREATE_OPTS=; CREATE_DRV=
 delete_ours() { # every <PREFIX>-* server, volume, snapshot and flavor
   # Volumes newest first (clones and volumes from snapshots before their sources), then the
   # snapshots: VMstore refuses to delete a snapshot a clone still uses, and drivers before
@@ -341,6 +372,9 @@ write_matrix() { # title -> $OUT/matrix.md (and the run log)
     echo "- Date: $(date -u '+%Y-%m-%d %H:%M') UTC${PCD_RELEASE:+, release: $PCD_RELEASE}"
     echo "- Tintri driver: ${DRV:-unknown}"
     echo "- vmstore_qcow2_volumes on the hosts serving the backend: ${OPTS:-unknown}"
+    echo "- Nova file format probe (PCD-4550) on the compute hosts: ${PROBE:-unknown}"
+    [ -n "$CREATE_DRV" ] && echo "- Kept volumes created with: driver $CREATE_DRV, vmstore_qcow2_volumes $CREATE_OPTS"
+    [ -n "$LABEL" ] && echo "- Label: $LABEL"
     echo "- Result: $NPASS match, $NFAIL failed or drifted, $NNA n/a"
     echo
     echo "Cells: real format of the active file / format Cinder records (none = no record) / format libvirt opens (- = not attached). Result: match, record drift (record differs from the file), libvirt mismatch (libvirt type differs from the file), silent failure (Cinder size and disk size differ after an extend), failed (the operation failed), n/a (the API refused an operation the driver does not support)."
@@ -352,14 +386,16 @@ write_matrix() { # title -> $OUT/matrix.md (and the run log)
   echo "=== matrix ($f)"; cat "$f"; }
 cleanup() {
   echo "=== cleanup $(ts)"
-  if [ "$KEEP" = 1 ]; then
-    echo "  phase create succeeded: objects kept for --flip-phase after (state $STATE)"
+  if [ "$KEEP" = 1 ] && [ "$MODE" = flip-create ]; then
+    echo "  phase create succeeded: objects kept for --flip-phase check or after (state $STATE)"
+  elif [ "$KEEP" = 1 ]; then
+    echo "  objects kept for the next check (state $STATE); delete them with --flip-phase cleanup"
   else
     delete_ours
-    [ -n "${FLIPDIR:-}" ] && [ "$MODE" = flip-after ] && echo "  state $STATE consumed" && mv "$STATE" "$STATE.done" 2>/dev/null
+    case "$MODE" in flip-after | flip-cleanup) echo "  state $STATE consumed"; mv "$STATE" "$STATE.done" 2>/dev/null ;; esac
   fi
   on "$CINDER_SSH" "rm -rf $RDIR"
-  if [ "$KEEP" = 0 ]; then
+  if [ "$MODE" != flip-create ]; then
     others > "$OUT/others-after.txt"
     if diff -q "$BEFORE" "$OUT/others-after.txt" >/dev/null; then echo "  other servers, volumes and snapshots: unchanged"
     else echo "  other servers, volumes or snapshots changed during the run (not by this script; review):"; diff "$BEFORE" "$OUT/others-after.txt" | sed 's/^/    /' | head -20; fi
@@ -369,18 +405,20 @@ cleanup() {
 }
 
 # ---------------------------------------------------------------- setup
-if [ "$MODE" = flip-after ]; then
+case "$MODE" in flip-after | flip-check | flip-cleanup)
   [ -f "$STATE" ] || { echo "no state file $STATE: run --flip-phase create first (same PREFIX and TMPDIR)"; exit 2; }
   # shellcheck disable=SC1090
   . "$STATE"
-fi
+  # Volumes of every earlier phase, in creation order, so cleanup deletes clones first.
+  [ "$MODE" = flip-check ] || cat "$FLIPDIR"/*/created.ids 2>/dev/null > "$OUT/created.ids" ;;
+esac
 precheck
 if [ "$MODE" = flip-after ]; then BEFORE=$FLIPDIR/others-before.txt
 else BEFORE=$OUT/others-before.txt; others > "$BEFORE"; fi
 on "$CINDER_SSH" "mkdir -p $RDIR" && scp -q -o BatchMode=yes "$HERE/volume_record.py" "$CINDER_SSH:$RDIR/volume_record.py" || { echo "helper copy failed"; exit 2; }
 # shellcheck disable=SC2154  # rc is assigned inside the trap string
 trap 'rc=$?; [ $rc = 0 ] && rc=$RC; cleanup; exit $rc' EXIT
-if [ "$MODE" != flip-after ]; then
+if [ "${MODE#flip-}" = "$MODE" ] || [ "$MODE" = flip-create ]; then
   FLV=$(cli "openstack flavor create --ram $FLAVOR_RAM_MB --vcpus 1 --disk 0 --private --project $PROJECT $PREFIX-flavor -f value -c id" | tail -1)
   [[ "$FLV" =~ ^[0-9a-zA-Z-]+$ ]] || { echo "  flavor create failed"; exit 2; }
 fi
@@ -463,7 +501,7 @@ two_host() {
 
 # ---------------------------------------------------------------- flip test
 flip_create() {
-  local B E VM r
+  local B E VM D r i v p f c IMGS="" QS=""
   [ -n "$QON" ] && [ -z "$QOFF" ] || [ "$FORCE" = 1 ] || { echo "  phase create needs vmstore_qcow2_volumes on for $BACKEND (FORCE=1 overrides)"; exit 2; }
   echo "### $(ts) flip phase create (option on)"
   B=$(new_vol "$PREFIX-flip-boot" "--image $IMAGE_ID --size 1 --type $VOLUME_TYPE --bootable"); r=$(op_vol "$B" available)
@@ -476,15 +514,36 @@ flip_create() {
   # Keep the objects whenever the operations worked: a format verdict (C2 drifts on drivers
   # before 3.0.12, which record qcow2 for image volumes) is a finding, not a reason to stop.
   [ "$r" = ok ] || return
+  # For phase check: a data volume from an image on the VM, and spare detached volumes, one
+  # of each kind per check: image volumes (detached extend) and empty volumes holding a data
+  # pattern (move to the other cinder-volume host).
+  D=$(new_vol "$PREFIX-flip-data" "--image $IMAGE_ID --size 1 --type $VOLUME_TYPE"); r=$(op_vol "$D" available)
+  [ "$r" = ok ] && r=$(attach "$VM" "$D")
+  row C4 "Attach a data volume created from an image" "$r" "$D" "$VM"; [ "$r" = ok ] || D=
+  for ((i = 1; i <= FLIP_SPARES; i++)); do
+    v=$(new_vol "$PREFIX-flip-img-$i" "--image $IMAGE_ID --size 1 --type $VOLUME_TYPE")
+    [ "$(op_vol "$v" available)" = ok ] && IMGS="$IMGS $v"
+    v=$(new_vol "$PREFIX-flip-q-$i" "--size 1 --type $VOLUME_TYPE")
+    [ "$(op_vol "$v" available)" = ok ] || continue
+    p=$(fpath "$v"); f=$(fileinfo "$v"); fill "$p" "${f%% *}"; c=$(check_fill "$p" "${f%% *}")
+    if fill_ok "$c"; then QS="$QS $v"; else echo "  $v: pattern did not verify ($c)"; fi
+  done
+  IMGS=${IMGS# }; QS=${QS# }
+  if [ -n "$IMGS" ]; then row C5 "Detached image volumes for the checks ($(wc -w <<<"$IMGS" | tr -d ' '))" ok "${IMGS%% *}"
+  else not_run C5 "Detached image volumes for the checks" "none became available"; fi
+  if [ -n "$QS" ]; then row C6 "Detached empty volumes with a data pattern for the checks ($(wc -w <<<"$QS" | tr -d ' '))" ok "${QS%% *}"
+  else not_run C6 "Detached empty volumes with a data pattern for the checks" "none became available or verified"; fi
   {
-    echo "VM=$VM"; echo "B=$B"; echo "E=$E"; echo "FLV=$FLV"; echo "CREATE_OPTS='$OPTS'"; echo "CREATE_DRV='$DRV'"
+    echo "VM=$VM"; echo "B=$B"; echo "E=$E"; echo "D=$D"; echo "IMGS='$IMGS'"; echo "QS='$QS'"; echo "FLV=$FLV"
+    echo "CREATE_OPTS='$OPTS'"; echo "CREATE_DRV='$DRV'"
     printf 'CREATE_ROWS=(); '; for r in ${ROWS[@]+"${ROWS[@]}"}; do printf 'CREATE_ROWS+=(%q); ' "$r"; done; echo
   } > "$STATE"
   cp "$BEFORE" "$FLIPDIR/others-before.txt"
   KEEP=1
-  echo "  kept: VM $VM, boot volume $B, empty volume $E (state $STATE)"
+  echo "  kept: VM $VM, boot volume $B, empty volume $E, data volume ${D:-none}, spares: $IMGS $QS (state $STATE)"
   echo "  next: switch $BACKEND to vmstore_qcow2_volumes = false on every host serving it and restart cinder-volume"
-  echo "        (test/lab/driver-swap/swap.sh option ...), then: $0 --flip-phase after <lab.env>"
+  echo "        (PCD: the cluster blueprint; elsewhere test/lab/driver-swap/swap.sh option), then:"
+  echo "        $0 --flip-phase check <lab.env> (repeatable, keeps everything) or --flip-phase after (once, then deletes)"
 }
 flip_after() {
   local C V SE NEW r r2
@@ -508,9 +567,115 @@ flip_after() {
   NEW=$(new_vol "$PREFIX-flip-new" "--size 1 --type $VOLUME_TYPE"); row F9 "New empty volume" "$(op_vol "$NEW" available)" "$NEW"
 }
 
+# Phase check: what works while the records of volumes created before the switch are still
+# what phase create left (image volumes: raw file recorded qcow2 on drivers before 3.0.12),
+# for example between a driver swap or a PCD upgrade and the database fix. Repeatable: each
+# run uses one spare volume of each kind and puts the VM back on its host.
+next_spare() { local id; for id in $1; do grep -qx "$id" "$FLIPDIR/used" 2>/dev/null || { echo "$id"; return 0; }; done; }
+reset_if_error() { local s; s=$(vstat "$1")
+  [[ "$s" == error* ]] && { echo "  $1 left $s: reset to available (test volume)"; cli "openstack volume set --state available $1"; }; return 0; }
+recover_vm() { # kept VM not ACTIVE after a row: reset and hard reboot it, so the next check starts from a running VM
+  local s; s=$(cli "openstack server show $1 -f value -c status" | tail -1); [ "$s" = ACTIVE ] && return 0
+  echo "  $1 is $s after K12: reset to active and hard reboot (test VM)"
+  cli "openstack server set --state active $1" | show >&2; cli "openstack server reboot --hard $1" | show >&2
+  [ "$(op_vm "$1" ACTIVE)" = ok ] || echo "  WARNING: $1 did not come back ACTIVE; the next check's K1 to K8 will show it"; }
+vmrows() { # #, operation, op result: one row per volume of the VM
+  row "$1" "$2 (boot volume)" "$3" "$B" "$VM"
+  [ -n "$D" ] && row "${1}b" "$2 (data volume from an image)" "$3" "$D" "$VM"
+  row "${1}c" "$2 (empty volume)" "$3" "$E" "$VM"; }
+flip_check() {
+  local n r m cur other h f t tn v x q p c dst C NEW moved
+  [ -n "$QOFF" ] && [ -z "$QON" ] || [ "$FORCE" = 1 ] || { echo "  phase check needs vmstore_qcow2_volumes off for $BACKEND (FORCE=1 overrides)"; trap - EXIT; on "$CINDER_SSH" "rm -rf $RDIR"; exit 2; }
+  KEEP=1; D=${D:-}; IMGS=${IMGS:-}; QS=${QS:-}
+  n=$(( $(cat "$FLIPDIR/checks" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FLIPDIR/checks"
+  echo "### $(ts) flip check $n${LABEL:+: $LABEL} (kept volumes created with: $CREATE_OPTS, driver $CREATE_DRV)"
+
+  echo "### $(ts) K1 to K4: the VM and the volumes it had before the switch"
+  r=$(op_vm "$VM" ACTIVE); vmrows K1 "VM running at the start of the check" "$r"
+  vmrows K2 "Stop / start" "$(vm_cycle "$VM" stop-start)"
+  vmrows K3 "Soft reboot" "$(vm_cycle "$VM" soft)"
+  vmrows K4 "Hard reboot" "$(vm_cycle "$VM" hard)"
+
+  echo "### $(ts) K5 to K8: move and resize the VM"
+  if uses_dst; then
+    cur=$(sfield "$VM" OS-EXT-SRV-ATTR:host); other=$DST_COMPUTE_ID; [ "$cur" = "$DST_COMPUTE_ID" ] && other=$SRC_COMPUTE_ID
+    if [ "$LIVE" = 1 ]; then r=$(live_migrate "$VM" "$other"); m="Live migrate the VM to the other host"
+    else r=$(cold_migrate "$VM" "$other"); m="Cold migrate the VM to the other host"; fi
+    vmrows K5 "$m" "$r"
+    vmrows K6 "Hard reboot on that host" "$(vm_cycle "$VM" hard)"
+    if [ -z "$FLV2" ]; then
+      FLV2=$(cli "openstack flavor create --ram $FLAVOR_RAM_MB --vcpus 2 --disk 0 --private --project $PROJECT $PREFIX-flavor2 -f value -c id" | tail -1)
+      [[ "$FLV2" =~ ^[0-9a-zA-Z-]+$ ]] && echo "FLV2=$FLV2" >> "$STATE" || FLV2=
+    fi
+    f=$(sfield "$VM" flavor)
+    if [[ "$f" == *"$PREFIX-flavor2"* || ( -n "$FLV2" && "$f" == *"$FLV2"* ) ]]; then t=$FLV; tn=$PREFIX-flavor; else t=$FLV2; tn=$PREFIX-flavor2; fi
+    if [ -n "$t" ]; then r=$(resize_vm "$VM" "$t" "$tn"); else r="failed:flavor $PREFIX-flavor2 not created"; fi
+    vmrows K7 "Resize the VM (vCPUs 1 <-> 2)" "$r"
+    h=$(sfield "$VM" OS-EXT-SRV-ATTR:host)
+    if [ "$h" = "$cur" ]; then r=ok; else r=$(cold_migrate "$VM" "$cur"); fi
+    vmrows K8 "Cold migrate the VM back to its first host" "$r"
+  else
+    for m in "K5 Migrate the VM to the other host" "K6 Hard reboot on that host" "K7 Resize the VM" "K8 Migrate the VM back"; do
+      na_row "${m%% *}" "${m#* }" "one compute host (set DST_COMPUTE_ID and DST_COMPUTE_SSH)"; done
+  fi
+
+  echo "### $(ts) K9: detached extend of an image volume created before the switch"
+  v=$(next_spare "$IMGS")
+  if [ -n "$v" ]; then echo "$v" >> "$FLIPDIR/used"; x=$(( $(vsize "$v") + 1 ))
+    row K9 "Extend an image volume created before the switch, detached (+1 GB)" "$(extend_detached "$v" "$x")" "$v" "" "$x"
+    reset_if_error "$v"
+  else not_run K9 "Extend an image volume created before the switch, detached" "no spare image volume left (FLIP_SPARES)"; fi
+
+  echo "### $(ts) K13 to K15: clone of the data volume, new volume"
+  if [ -n "$D" ]; then
+    C=$(new_vol "$PREFIX-flip-clone-k$n" "--source $D --size 2"); r=$(op_vol "$C" available)
+    row K13 "Clone the data volume from an image (+1 GB)" "$r" "$C" "" 2
+    if [ "$r" = ok ]; then
+      r=$(attach "$VM" "$C"); [ "$r" = ok ] && r=$(vm_cycle "$VM" hard)
+      row K14 "Attach the clone, hard reboot" "$r" "$C" "$VM"; detach "$VM" "$C" >/dev/null
+    else not_run K14 "Attach the clone, hard reboot" "clone failed"; fi
+  else not_run K13 "Clone the data volume from an image" "no data volume (C4 failed)"; not_run K14 "Attach the clone, hard reboot" "no data volume"; fi
+  NEW=$(new_vol "$PREFIX-flip-new-k$n" "--size 1 --type $VOLUME_TYPE"); row K15 "New empty volume" "$(op_vol "$NEW" available)" "$NEW"
+
+  # K10 to K12 run last: an attach of a damaged volume (K11) must not affect K13 to K15.
+  echo "### $(ts) K10 to K12: move an empty volume created before the switch to the other cinder-volume host"
+  q=$(next_spare "$QS")
+  if [ -z "$q" ]; then
+    for m in "K10 Move an empty volume created before the switch to the other cinder-volume host" "K11 Attach it, hard reboot" "K12 Detach it, extend detached"; do
+      not_run "${m%% *}" "${m#* }" "no spare volume left (FLIP_SPARES)"; done
+  elif [ "$(wc -w <<<"${VOLUME_HOSTS:-}" | tr -d ' ')" -lt 2 ]; then
+    for m in "K10 Move an empty volume created before the switch to the other cinder-volume host" "K11 Attach it, hard reboot" "K12 Detach it, extend detached"; do
+      na_row "${m%% *}" "${m#* }" "one cinder-volume host (set VOLUME_HOSTS)"; done
+  else
+    echo "$q" >> "$FLIPDIR/used"; cur=$(vhost "$q"); dst=
+    for h in $VOLUME_HOSTS; do [ "$h" != "${cur%%@*}" ] && dst="$h@${cur#*@}" && break; done
+    echo "  migrate $q: $cur -> $dst"; cli "openstack volume migrate --host '$dst' $q" | show
+    m=$(wait_mig "$q"); r=ok; c=; moved=0
+    if [ "$m" = success ] && [ "$(vstat "$q")" = available ]; then moved=1
+      p=$(fpath "$q"); f=$(fileinfo "$q"); f=${f%% *}; c=$(check_fill "$p" "${f%-overlay}")
+      fill_ok "$c" || r="failed:data damaged by the move"
+    else r="failed:migration $m, volume $(vstat "$q")"; fi
+    row K10 "Move an empty volume created before the switch to the other cinder-volume host" "$r" "$q" "" "" "${c:+data: $c}"
+    # K11 and K12 run whenever the volume moved, even with damaged data: they record what an
+    # attach and a detached extend do with the file as the move left it (Platform9 saw an extend
+    # report the new size without growing a qcow2 file recorded raw).
+    if [ "$moved" = 1 ]; then
+      r=$(attach "$VM" "$q"); [ "$r" = ok ] && r=$(vm_cycle "$VM" hard)
+      row K11 "Attach it, hard reboot" "$r" "$q" "$VM"
+      r=$(detach "$VM" "$q"); x=
+      [ "$r" = ok ] && { x=$(( $(vsize "$q") + 1 )); r=$(extend_detached "$q" "$x"); }
+      row K12 "Detach it, extend detached (+1 GB)" "$r" "$q" "" "$x"; reset_if_error "$q"
+      recover_vm "$VM"
+    else not_run K11 "Attach it, hard reboot" "the move did not complete"; not_run K12 "Detach it, extend detached" "the move did not complete"; fi
+  fi
+}
+flip_cleanup() { echo "### $(ts) flip cleanup: every $PREFIX-* object kept by phase create and the checks"; KEEP=0; }
+
 case "$MODE" in
   single) single; write_matrix "one host, Platform9 steps 1 to 19" ;;
   two-host) two_host; write_matrix "two hosts, volume migrate then move the VM ($([ "$LIVE" = 1 ] && echo live || echo cold) migration)" ;;
   flip-create) flip_create; write_matrix "flip test, phase create (option on)" ;;
   flip-after) flip_after; write_matrix "flip test, created with the option on, then switched off" ;;
+  flip-check) flip_check; write_matrix "flip check $(cat "$FLIPDIR/checks"): volumes created with the option on, used after the switch${LABEL:+ ($LABEL)}" ;;
+  flip-cleanup) flip_cleanup ;;
 esac
