@@ -31,7 +31,9 @@ VOL_API=3.42                                                    # Block Storage 
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 RDIR=/root/$PREFIX-lab
-START=$(date -u '+%Y-%m-%d %H:%M:%S')
+START_EPOCH=$(date +%s); START=$(date -u '+%Y-%m-%d %H:%M:%S')
+# Host logs use the host's local clock: filter them from the same instant in the host's time zone.
+LOG_SINCE="awk -v s=\"\$(date -d @$START_EPOCH '+%Y-%m-%d %H:%M:%S')\" 'substr(\$0,1,19) >= s'"
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/$PREFIX-lab.XXXXXX")
 exec > >(tee "$OUT/run.log") 2>&1
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=15"
@@ -112,7 +114,7 @@ LOG_OK=0
 logs_for() { # volume ID, pattern -> matching cinder-volume log lines since START (no DEBUG)
   [ -n "$LOG_SSH" ] || return 0
   local h; for h in $LOG_SSH; do
-    on "$h" "awk -v s='$START' 'substr(\$0,1,19) >= s' $CINDER_LOG 2>/dev/null | grep -a '$1' | grep -av ' DEBUG ' | grep -aE '$2' | sed -E 's/req-[0-9a-f-]+//' | cut -c1-260 | tail -4" | sed "s|^|$h: |"
+    on "$h" "$LOG_SINCE $CINDER_LOG 2>/dev/null | grep -a '$1' | grep -av ' DEBUG ' | grep -aE '$2' | sed -E 's/req-[0-9a-f-]+//' | cut -c1-260 | tail -4" | sed "s|^|$h: |"
   done; }
 others() { # every server and volume not created by this run
   cli "openstack server list --all-projects -f value -c ID -c Name -c Status" | awk -v p="^$PREFIX-" '$2 !~ p {print "server", $1, $NF}' | sort
