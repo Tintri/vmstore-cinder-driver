@@ -27,7 +27,9 @@ CINDER_LOG=${CINDER_LOG:-/var/log/pf9/cindervolume-base.log}   # cinder-volume l
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 RDIR=/root/$PREFIX-lab
-START=$(date -u '+%Y-%m-%d %H:%M:%S')
+START_EPOCH=$(date +%s); START=$(date -u '+%Y-%m-%d %H:%M:%S')
+# Host logs use the host's local clock: filter them from the same instant in the host's time zone.
+LOG_SINCE="awk -v s=\"\$(date -d @$START_EPOCH '+%Y-%m-%d %H:%M:%S')\" 'substr(\$0,1,19) >= s'"
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/$PREFIX-lab.XXXXXX")
 exec > >(tee "$OUT/run.log") 2>&1
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=15"
@@ -83,7 +85,7 @@ logs_for() { # ID -> cinder-volume log lines (no DEBUG) for it since START, from
   [ -n "$LOG_SSH" ] || return 0
   local h; echo "  cinder-volume log for $1 since $START:"
   for h in $LOG_SSH; do
-    on "$h" "awk -v s='$START' 'substr(\$0,1,19) >= s' $CINDER_LOG 2>/dev/null | grep -a '$1' | grep -av ' DEBUG ' | sed -E 's/req-[0-9a-f-]+//' | cut -c1-260 | tail -6" | sed "s|^|    $h: |"
+    on "$h" "$LOG_SINCE $CINDER_LOG 2>/dev/null | grep -a '$1' | grep -av ' DEBUG ' | sed -E 's/req-[0-9a-f-]+//' | cut -c1-260 | tail -6" | sed "s|^|    $h: |"
   done; }
 running_version() { # driver_version the scheduler reports for pools of BACKEND (needs python-cinderclient)
   cli "cinder get-pools --detail" | awk -F'|' -v b="@$BACKEND#" '

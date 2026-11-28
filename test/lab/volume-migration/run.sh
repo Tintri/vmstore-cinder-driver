@@ -23,7 +23,9 @@ done
 HERE=$(cd "$(dirname "$0")" && pwd)
 RDIR=/root/$PREFIX-lab
 NOVA_LOG=${NOVA_LOG:-/var/log/pf9/ostackhost.log}   # nova-compute log on the compute hosts (PCD path)
-START=$(date -u '+%Y-%m-%d %H:%M:%S')
+START_EPOCH=$(date +%s); START=$(date -u '+%Y-%m-%d %H:%M:%S')
+# Host logs use the host's local clock: filter them from the same instant in the host's time zone.
+LOG_SINCE="awk -v s=\"\$(date -d @$START_EPOCH '+%Y-%m-%d %H:%M:%S')\" 'substr(\$0,1,19) >= s'"
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/$PREFIX-lab.XXXXXX")
 exec > >(tee "$OUT/run.log") 2>&1
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=15"
@@ -134,7 +136,7 @@ cleanup() {
   else echo "  other servers and volumes changed during the run (not by this script; review):"; diff "$OUT/others-before.txt" "$OUT/others-after.txt" | sed 's/^/    /' | head -20; fi
   [ $CINDER_ONLY = 0 ] && echo "  $DST_RP_NAME placement memory free: $(dst_free_mb) MB"
   echo "=== summary"
-  local r; for r in "${RESULTS[@]}"; do echo "  $r"; done
+  local r; for r in ${RESULTS[@]+"${RESULTS[@]}"}; do echo "  $r"; done   # bash 3.2: empty array under set -u
   echo "  log: $OUT/run.log"
 }
 
@@ -205,17 +207,17 @@ if [ $CINDER_ONLY = 0 ]; then
   echo "  disk type on $host: ${dt:-?} (file $ft)"
   # libvirt refuses a live migration to a host whose CPU lacks features the guest uses: a
   # property of the lab's hosts, not of the volume (cold migration is in the format matrix).
-  cpu=$(on "$SRC_COMPUTE_SSH" "awk -v s='$START' 'substr(\$0,1,19) >= s' $NOVA_LOG | grep -a '$VM' | grep -aoE \"guest CPU doesn't match specification: [^:]*: [a-z0-9_,]+\" | tail -1")
+  cpu=$(on "$SRC_COMPUTE_SSH" "$LOG_SINCE $NOVA_LOG | grep -a '$VM' | grep -aoE \"guest CPU doesn't match specification: [^:]*: [a-z0-9_,]+\" | tail -1")
   if [ "$host" = "$DST_COMPUTE_ID" ] && [ "$st" = ACTIVE ] && [ "$dt" = "$ft" ]; then result R3 PASS "VM live migrated to DST, migrated volume opened as $dt"
   elif [ -n "$cpu" ] && [ "$st" = ACTIVE ] && [ "$host" = "$SRC_COMPUTE_ID" ] && [ "$dt" = "$ft" ]; then
     result R3 SKIP "lab hosts cannot live-migrate: libvirt \"$cpu\" (DST CPU lacks features of SRC); VM still ACTIVE on SRC, volume opened as $dt"
   elif [[ "$mig" == *None ]]; then result R3 FAIL "live migration rejected before start (no destination selected; check DST capacity and scheduler)"
   else result R3 FAIL "status=$st host=$host migration=[$mig] disk=${dt:-?} file=$ft"; fi
   state "C. after live migration" $DATA
-  echo "### logs since $START (errors and warnings for the VM and the data volume)"
+  echo "### logs since $START UTC (errors and warnings for the VM and the data volume)"
   for hs in "$SRC_COMPUTE_SSH" "$DST_COMPUTE_SSH"; do
     echo "  -- $hs nova"
-    on "$hs" "awk -v s='$START' 'substr(\$0,1,19) >= s' $NOVA_LOG | grep -aE '$VM|$DATA' | grep -aE 'ERROR|WARNING' | grep -v 'unexpected event' | sed -E 's/req-[0-9a-f-]+//' | cut -c1-260 | tail -10"
+    on "$hs" "$LOG_SINCE $NOVA_LOG | grep -aE '$VM|$DATA' | grep -aE 'ERROR|WARNING' | grep -v 'unexpected event' | sed -E 's/req-[0-9a-f-]+//' | cut -c1-260 | tail -10"
   done
   echo "### $(ts) delete the VM"
   cli "openstack server delete --wait $VM"; VM=
